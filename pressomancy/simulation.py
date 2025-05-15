@@ -1135,3 +1135,4 @@ class Simulation():
                 dataset_val[-1, :, :] = np.array([np.atleast_1d(getattr(part, prop)) for part in self.io_dict['flat_part_view'][grp_typ]], dtype=np.float32)
 
         logging.info(f"Successfully wrote timestep for {self.io_dict['registered_group_type']}.")
+
