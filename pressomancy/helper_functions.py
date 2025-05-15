@@ -107,15 +107,20 @@ class ManagedSimulation:
         Recreates the singleton instance without affecting the shared ESPResSo system object.
 
         This method resets the decorated class instance while preserving the ESPResSo system object.
-        It clears particles, interactions, and thermostat settings in the system, ensuring a clean state.
+        It clears particles, interactions, constraints, actors, and thermostat settings in the system, ensuring a clean state.
+
+        note: it is much faster without reseting non_bonded_interactions. You can do this manually, or you can uncomment the temporary fix for this.
         """
         if self.instance is not None:
             self.instance = self.aClass(*self.init_args, **self.init_kwargs)
             self.instance.sys = self._espressomd_system
             self.instance.sys.part.clear()
-            self.instance.sys.non_bonded_inter.reset()
+            # self.instance.sys.non_bonded_inter.reset() #this method is not working properly
+            # self.instance.reset_non_bonded_inter() # temporary fix (uncomment)
             self.instance.sys.bonded_inter.clear()
             self.instance.sys.thermostat.turn_off()
+            self.instance.sys.constraints.clear()
+            self.instance.sys.actors.clear()
 
     def __getattr__(self, name):
         """
@@ -139,6 +144,32 @@ class ManagedSimulation:
         if self.instance is None:
             raise AttributeError(f"Instance of {self.aClass.__name__} has not been initialized.")
         return getattr(self.instance, name)
+    
+    def __dir__(self):
+        """
+        Returns the list of attributes for the singleton instance and the ManagedSimulation class.
+
+        This method combines the attributes of the singleton instance (if initialized) and the class itself,
+        allowing for introspection of both the wrapped object's methods and the management-related methods
+        provided by the decorator.
+
+        Returns
+        -------
+        list
+            A list of attribute names for the singleton instance and the ManagedSimulation class, including
+            all attributes of both.
+
+        Notes
+        -----
+        - This method is useful for introspection or debugging, providing a full list of methods and attributes
+        available for the object managed by the decorator.
+        - The singleton instance's attributes will be included in the result if it has been initialized; otherwise,
+        only the `ManagedSimulation` class attributes will be returned.
+        """
+        if self.instance is not None:
+            return dir(self.instance)  # Return attributes of the original class
+        return dir(type(self))  # Return attributes of the decorator itself
+
 
 class SimulationExistsException(Exception):
     def __init__(self, message):
@@ -529,6 +560,24 @@ def load_coord_file(file_path):
     return coordinates
 
 def min_img_dist(s, t, box_dim):
+    """
+    Compute minimum image distance between s and t under periodic boundary conditions.
+
+    Parameters
+    ----------
+    s : iterable of float, shape (..., 3)
+        Source points.
+    t : iterable of float, shape (..., 3)
+        Target points.
+    box_dim : interable of float, shape (3,)
+        Cuboid box dimensions [Lx, Ly, Lz].
+
+    Returns
+    -------
+    np.ndarray
+        Minimum image displacement vectors.
+    """
+    box_dim = np.asarray(box_dim)
     box_half = box_dim*0.5
     return np.remainder(s - t + box_half, box_dim) - box_half
 
@@ -539,6 +588,12 @@ def generate_random_unit_vectors(N_PART):
     x = r * np.cos(phi)
     y = r * np.sin(phi)
     return np.column_stack((x, y, z))
+
+def normalize_vectors(array_of_vectors, axis=-1):
+    array_of_vectors= np.asarray(array_of_vectors)
+    norms_array = np.atleast_1d(np.linalg.norm(array_of_vectors, axis=axis))
+    norms_array[norms_array==0] = 1
+    return array_of_vectors / np.expand_dims(norms_array, axis)
 
 def build_grid_and_adjacent(lattice_points, volume_side, cell_size):
     """
@@ -627,40 +682,52 @@ def get_neighbours(lattice_points: np.ndarray, volume_side: float, cuttoff: floa
                         grouped_indices[i].append(j)
     return grouped_indices
 
-def get_neighbours_cross_lattice(lattice1, lattice2, volume_side, cuttoff=1.):
+def get_neighbours_cross_lattice(lattice1, lattice2, box_lenghts, cuttoff=1.):
+    """
+    Get neighbors between two lattices in a cuboid under PBC using minimum image convention.
+
+    Parameters
+    ----------
+    lattice1 : np.ndarray, shape (N1, 3)
+    lattice2 : np.ndarray, shape (N2, 3)
+    box_len : array-like of shape (3,)
+    cutoff : float
+
+    Returns
+    -------
+    dict
+        {index in lattice1: [indices in lattice2 within cutoff]}
+    """
+    box_lenghts = np.asarray(box_lenghts)
     grouped_indices = defaultdict(list)
     points_a = np.atleast_2d(lattice1)
     points_b = np.atleast_2d(lattice2)
     num_b = len(points_b)
     indices_b = np.arange(num_b)
-    box_dim=np.ones(3) * volume_side
     for id,point in enumerate(points_a):
-        distances=np.linalg.norm(min_img_dist(point, points_b, box_dim=box_dim), axis=-1)
+        distances=np.linalg.norm(min_img_dist(point, points_b, box_dim=box_lenghts), axis=-1)
         mask=np.where(distances<=cuttoff)
         grouped_indices[id]=list(indices_b[mask])
     
     return grouped_indices
 
-def calculate_pair_distances(points_a, points_b, box_length):
+def calculate_pair_distances(points_a, points_b, box_lengths):
     """
-    Calculate the pair distances between two sets of points, considering 
-    periodic boundary conditions if provided.
+    Calculate the pairwise distances between two sets of points under periodic boundary conditions.
 
     Parameters
     ----------
-    points_a : np.array of shape (N, 3)
-        An array of points where N is the number of points in the first set.
-    points_b : np.array of shape (M, 3)
-        An array of points where M is the number of points in the second set.
-    box_length : float, optional
-        The length of the cubic box. If provided, periodic boundary conditions
-        are applied.
+    points_a : np.ndarray, shape (N, 3)
+        First set of 3D points.
+    points_b : np.ndarray, shape (M, 3)
+        Second set of 3D points.
+    box_length : float or array-like of shape (3,), optional
+        Applies periodic boundary conditions for a cubic or cuboid box.
 
     Returns
     -------
-    distances : np.array of shape (N, M)
-        A 2D array of pair distances between each point in `points_a` and 
-        each point in `points_b`.
+    distances : np.ndarray, shape (N*M,)
+        1D array of distances between all pairs (a_i, b_j). dist(i,j) = distances[i*M + j]
     """
     
     # Ensure inputs are numpy arrays
@@ -683,21 +750,22 @@ def calculate_pair_distances(points_a, points_b, box_length):
     point_pairs_b = points_b[index_combinations[:, 1]]  # Points from the second set
     
     # Calculate the minimum image distance with periodic boundary conditions
-    distances = np.linalg.norm(min_img_dist(point_pairs_a, point_pairs_b, box_dim=np.ones(3) * box_length), axis=-1)
-    # distances = np.linalg.norm(point_pairs_a-point_pairs_b, axis=-1)
+    distances = np.linalg.norm(min_img_dist(point_pairs_a, point_pairs_b, box_dim=np.ones(3) * box_lengths), axis=-1)
+
+    # displacements = np.linalg.norm(min_img_dist(points_a[:, None, :], points_b[None, :, :], box_dim), axis=-1)
     
     return distances
 
-def fcc_lattice(radius, volume_side, scaling_factor=1., max_points_per_side=100):
+def fcc_lattice(radius, volume_sides, scaling_factor=1., max_points_per_side=100):
     """
-    Generates a face-centered cubic (FCC) lattice of points within a cubic volume. The function creates an FCC crystal structure where spheres of given radius are arranged such that they touch along the face diagonal of the unit lattice.
+    Generates a face-centered cubic (FCC) lattice of points within a cuboid volume. The function creates an FCC crystal structure where spheres of given radius are arranged such that they touch along the face diagonal of the unit lattice.
 
     Parameters
     ----------
     radius : float
         Radius of the spheres in the lattice.
-    volume_side : float
-        Length of the cubic volume's side.
+    volume_side : iterable of float of size 3
+        Length of the cuboid volume's sides.
     scaling_factor : float, optional
         Factor to scale the radius of the spheres. Default is 1.0.
     max_points_per_side : int, optional
@@ -721,17 +789,20 @@ def fcc_lattice(radius, volume_side, scaling_factor=1., max_points_per_side=100)
     - When the lattice constant is increased, a warning message is logged with 
       the new value.
     """
+    assert len(volume_sides)==3, "this metthod assumes volume_sides to be have len of 3"
+    volume_sides = np.asarray(volume_sides)
+
     radius_scaled = radius*scaling_factor
     lattice_constant = 2 * radius_scaled / np.sqrt(2)
     while True:
-        num_points = int(np.ceil(volume_side / lattice_constant))
-        if num_points <= max_points_per_side:
+        num_points = np.ceil(volume_sides / lattice_constant).astype(int)
+        if (num_points <= max_points_per_side).any():
             break
         lattice_constant *= 1.1
         logging.info('lattice_constant increased to %s becaouse %s bigger than %s', lattice_constant,num_points,max_points_per_side)
    
-    indices = np.arange(num_points-1)
-    x, y, z = np.meshgrid(indices, indices, indices, indexing='ij')
+    indices = [np.arange(num-1) for num in num_points ]
+    x, y, z = np.meshgrid(indices[0], indices[1], indices[2], indexing='ij')
     sum_indices = x + y + z
     mask = sum_indices % 2 == 0
     lattice_points = np.column_stack(
@@ -786,16 +857,15 @@ def make_centered_rand_orient_point_array(center=np.array([0,0,0]), sphere_radiu
     orientation_vector = direction_vector / np.linalg.norm(direction_vector)
     return orientation_vector,points
 
-def partition_cubic_volume(box_length, num_spheres, sphere_diameter, routine_per_volume=RoutineWithArgs(), flag='rand'):
+def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_per_volume=RoutineWithArgs(), flag='rand'):
     """
-    Partitions a cubic volume into spherical regions and generates points within them.
-    This function creates a face-centered cubic (FCC) lattice of spheres within a cubic volume and optionally
-    generates points within each sphere according to a specified routine.
+    Partitions a cuboid volume into spherical regions and generates points within them.
+    This function creates a face-centered cubic (FCC) lattice of spheres within a cubic volume; and optionally, generates points within each sphere according to a specified routine.
     
     Parameters
     ----------
-    box_length : float
-        The length of the cubic volume's side.
+    box_lengths : iterable of float of len 3
+        The length of the cuboid volume's sides.
     num_spheres : int
         The desired number of spherical regions to create.
     sphere_diameter : float
@@ -818,13 +888,16 @@ def partition_cubic_volume(box_length, num_spheres, sphere_diameter, routine_per
     
     # Adjust scaling until we have enough sphere centers
     while True:
-        sphere_centers = fcc_lattice(radius=sphere_radius, volume_side=box_length, scaling_factor=scaling)
+        sphere_centers = fcc_lattice(radius=sphere_radius, volume_sides=box_lengths, scaling_factor=scaling)
         volumes_to_fill=len(sphere_centers)
         logging.info('num_spheres_needed, num_spheres_got: %s', (num_spheres, volumes_to_fill))
         if  volumes_to_fill>= num_spheres:
             break
         scaling -= 0.1
     logging.info('scaling used: %s', scaling)
+
+    # Center point distribution in box
+    sphere_centers += box_lengths/2 - np.mean(sphere_centers, axis=0)
 
     # Randomly shuffle the available centers and select the required number of centers
     take_index = np.arange(len(sphere_centers))
@@ -837,6 +910,8 @@ def partition_cubic_volume(box_length, num_spheres, sphere_diameter, routine_per
     orientations=np.empty((num_spheres,3))
     # Perform the point generation routine if `num_monomers` not 0
     if routine_per_volume.num_monomers>1:
+        assert np.all(box_lengths==box_lengths[0]), "this methods assumes cubic box for num_monomers > 1"
+        box_length = box_lengths[0]
         grouped_positions = defaultdict(list)
         #grouped_volumes is a dictionary that contains all neighouring lattice sites sphere_diameter  
         grouped_volumes=get_neighbours(sphere_centers,volume_side=box_length,cuttoff=sphere_diameter)
@@ -851,7 +926,7 @@ def partition_cubic_volume(box_length, num_spheres, sphere_diameter, routine_per
                 # Check for overlaps with points in neighboring spheres
                 for volume_id in grouped_volumes[i]:
                     if grouped_positions[volume_id]:
-                        distances = calculate_pair_distances(points, grouped_positions[volume_id], box_length=box_length)
+                        distances = calculate_pair_distances(points, grouped_positions[volume_id], box_lengths=box_length)
                         if np.any(distances <= routine_per_volume.monomer_size):
                             should_proceed = False
                             break
@@ -912,7 +987,7 @@ def partition_cubic_volume_oriented_rectangles(big_box_dim, num_spheres, small_b
     >>> small_box_dim = np.array([2.0, 2.0, 2.0])
     >>> num_spheres = 10
     >>> num_monomers = 5
-    >>> centers, points = partition_cubic_volume_oriented_rectangles(big_box_dim, num_spheres, small_box_dim, num_monomers)
+    >>> centers, points = partition_cuboid_volume_oriented_rectangles(big_box_dim, num_spheres, small_box_dim, num_monomers)
     """
     _, _, sphere_diameter = small_box_dim
     sphere_radius = sphere_diameter * 0.5
@@ -1025,7 +1100,7 @@ def get_orientation_vec(pos):
     pr_comp /= np.linalg.norm(pr_comp)
     return np.array(pr_comp, float)
 
-def get_cross_lattice_nonintersecting_volumes(current_lattice_centers, current_lattice_grouped_part_pos, current_lattice_diam,other_lattice_centers, other_lattice_grouped_part_pos,other_lattice_diam,box_len, mode='cross_volumes'):
+def get_cross_lattice_nonintersecting_volumes(current_lattice_centers, current_lattice_grouped_part_pos, current_lattice_diam,other_lattice_centers, other_lattice_grouped_part_pos,other_lattice_diam,box_lenghts, mode='cross_volumes'):
     """
     Calculate non-intersecting volumes between particles in two different lattices. This function determines which volumes from one lattice do not intersect with volumes from another lattice,
     considering periodic boundary conditions.
@@ -1044,7 +1119,7 @@ def get_cross_lattice_nonintersecting_volumes(current_lattice_centers, current_l
         Particle positions grouped by volume for the second lattice.
     other_lattice_diam : float
         Diameter of particles in the second lattice.
-    box_len : float
+    box_lenghts : float
         Length of the periodic box.
     mode : str, optional
         Mode of calculation, either 'cross_parts' or 'cross_volumes'. Default is 'cross_volumes'.
@@ -1065,7 +1140,7 @@ def get_cross_lattice_nonintersecting_volumes(current_lattice_centers, current_l
     """
     
     neigh=get_neighbours_cross_lattice(current_lattice_centers,other_lattice_centers,
-    box_len, cuttoff=(current_lattice_diam+other_lattice_diam)*0.5)
+    box_lenghts, cuttoff=(current_lattice_diam+other_lattice_diam)*0.5)
     aranged_cross_lattice_options={}
     if mode=='cross_parts':
         fact=pow(2,1/6)
@@ -1083,7 +1158,7 @@ def get_cross_lattice_nonintersecting_volumes(current_lattice_centers, current_l
         mask=[]
         if associated_vol_ids:
             for as_vol_id in associated_vol_ids:
-                res=calculate_pair_distances(current_lattice_dat[vol_id], other_lattice_dat[as_vol_id], box_length=box_len)
+                res=calculate_pair_distances(current_lattice_dat[vol_id], other_lattice_dat[as_vol_id], box_lengths=box_lenghts)
                 mask.append(all([x>=new_crit for x in res if not np.isclose(x,0.)])) 
         aranged_cross_lattice_options[vol_id]=mask
     return aranged_cross_lattice_options
@@ -1124,6 +1199,11 @@ def align_vectors(v1, v2):
         (np.dot(cross_prod_matrix, cross_prod_matrix) * ((1 - cos_theta) / (sin_theta ** 2)))
     )
     return rotation_matrix
+
+def str_to_bool(string):
+    if string not in ['True', 'true', '1', 'False', 'false', '0']:
+        raise TypeError(f" '{string}' is not convertible to bool")
+    return string in ['True', 'true', '1']
 
 class BondWrapper:
     def __init__(self, bond_handle):
