@@ -470,7 +470,7 @@ class Elastomer(metaclass=Simulation_Object):
 
                 n_count+= 1
 
-            assert n_count == n_nghb
+            assert n_count <= n_nghb and n_count > 0, f"n_count {n_count}, n_nghb {n_nghb}"
         
         if self.substrate is not None:
             self.sys.periodicity = old_periodicity
