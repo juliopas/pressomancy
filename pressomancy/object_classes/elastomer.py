@@ -470,7 +470,8 @@ class Elastomer(metaclass=Simulation_Object):
 
                 n_count+= 1
 
-            assert n_count <= n_nghb and n_count > 0, f"n_count {n_count}, n_nghb {n_nghb}"
+            if not (n_count <= n_nghb and n_count > 0):
+                warnings.warn(f"n_count {n_count}, n_nghb {n_nghb}. Particle id {id1} was not able to bound to any neighbors. If this happened only for a negligible portion of the particles, closely monitor the simulation and it should be fine. If this happened for a significant portion of the particles, consider increasing r_catch or n_nghb parameters.")
         
         if self.substrate is not None:
             self.sys.periodicity = old_periodicity
