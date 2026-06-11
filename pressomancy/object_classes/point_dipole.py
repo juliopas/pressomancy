@@ -58,7 +58,8 @@ class PointDipoleSuperpara(metaclass=Simulation_Object):
     config = ObjectConfigParams(
          dipm=1.,
          Xi_0=0.1,
-         mag_func=0
+         mag_func=0,
+         multidomain_sig=None
     )
 
     def __init__(self, config: ObjectConfigParams):
@@ -91,6 +92,8 @@ class PointDipoleSuperpara(metaclass=Simulation_Object):
         particl_virt.magnetize_func = self.params["mag_func"]
         particl_virt.dipm_sat = self.params["dipm"]
         particl_virt.mag_susc_0 = self.params["Xi_0"]
+        if self.params["multidomain_sig"] is not None:
+            particl_virt.multidomain_mag_response = self.params["multidomain_sig"]
 
         # Very Important Particle. To use to bond, calculate distances, and other Very Important Things. Usually at the center of mass, and usually a real particle
         self.vip = particl_real

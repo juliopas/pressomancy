@@ -24,7 +24,7 @@ class Simulation():
     """
     A singleton class designed to manage and simulate a suspension of objects within the ESPResSo molecular dynamics framework.
 
-    The `Simulation` class encapsulates the ESPResSo system and provides methods to configure the simulation, manage objects, and apply various interactions and constraints. It maintains a dictionary of simulation objects, tracks their properties, and delegates object-specific operations to the appropriate methods. 
+    The `Simulation` class encapsulates the ESPResSo system and provides methods to configure the simulation, manage objects, and apply various interactions and constraints. It maintains a dictionary of simulation objects, tracks their properties, and delegates object-specific operations to the appropriate methods.
 
     Key features include:
     - Managing particle types and their properties.
@@ -154,12 +154,12 @@ class Simulation():
         if not hasattr(self, name):
             object.__setattr__(self, name, value)
             return
-        
+
         # allow internal properties (start with "_")
         if name.startswith('_'):
             object.__setattr__(self, name, value)
             return
-            
+
         # Block protected and important attributes
         protected_attrs = {
             'no_objects': "Object count is managed automatically",
@@ -167,7 +167,7 @@ class Simulation():
             'objects': "Object list is managed automatically. Use store_objects() or other Simulation method to store objects.",
             'sys': "System is read-only. Use rebind_sys() - only should be used after loading an espresso checkpoint."
         }
-        
+
         if name in self._allowed_direct_set:
             object.__setattr__(self, name, value)
         elif name in protected_attrs:
@@ -175,8 +175,8 @@ class Simulation():
         else:
             raise AttributeError(
                 f"Cannot set '{name}' directly. Use appropriate methods."
-            )    
-    
+            )
+
     def set_init_src(self, path, pos_ori_src_type=['real',], type_to_type_map=[], prop_to_prop_map=[], declare_types=[]):
         self._src_path_h5=path
         self._pos_ori_src_type=pos_ori_src_type
@@ -186,7 +186,7 @@ class Simulation():
         for typ_decl in declare_types:
             for x,y in typ_decl.items():
                 self._part_types[x]=y
-    
+
     def set_sys(self, time_step=0.01, min_global_cut=3.0, have_quaternion=False):
         '''
         Set espresso cellsystem params, and import virtual particle scheme. Run automatically on initialisation of the System class.
@@ -220,7 +220,7 @@ class Simulation():
     def reset_non_bonded_inter(self):
         """
         Resets wca interactions (uncomment to add more). Removes only interactions between types from pressomancy objects.
-        
+
         Workaround until espressomd.BondedInteractions.reset() is fixed.
         """
         for (type1, type2) in combinations_with_replacement(tuple(self._part_types.values()), 2):
@@ -247,7 +247,7 @@ class Simulation():
         '''
         Method that checks if the object has the required features to be stored in the simulation. If the object has the required features it is stored in the self.objects list.
         '''
-        
+
         missing_features = set(object.required_features) - set(espressomd.features())
         if missing_features:
             raise MissingFeature(f"Missing required features: {', '.join(missing_features)}")
@@ -306,7 +306,7 @@ class Simulation():
         -----
         The current implementation supports placing objects either in an empty system or in a system with exactly one previous partition. The method uses partition_cuboid_volume to generate positions and orientations, and for subsequent placements, ensures no overlaps with existing objects through get_cross_lattice_nonintersecting_volumes. The method automatically adjusts the search space (by increasing the factor) if it cannot find enough non-overlapping positions in subsequent placements.
         """
-        
+
         # Ensure all objects are of the same type.
         assert all(isinstance(item, type(objects[0])) for item in objects), "Not all items have the same type!"
         if mode=="INIT_SRC":
@@ -353,7 +353,7 @@ class Simulation():
                         logging.info('Failed to find enough space; (found, needed): (%d, %d). Will retry by requesting %d times the number of parts', len(positions), len(objects),factor)
             else:
                 raise NotImplementedError('The repartitioning scheme can currently handle only the case where one previos partition exists. More than than is still not supported')
-        
+
         self.place_objects(objects, positions, orientations)
 
     def place_objects(self, objects, positions, orientations=None):
@@ -432,7 +432,7 @@ class Simulation():
         """
         Configures custom Weeks-Chandler-Andersen (WCA) interactions for specified particle type pairs.
 
-        This method explicitly sets the WCA interaction parameters (epsilon and sigma) for each pair of particle types provided. 
+        This method explicitly sets the WCA interaction parameters (epsilon and sigma) for each pair of particle types provided.
         It ensures that each interaction pair has corresponding epsilon and sigma values.
 
         :param pairs: list of tuples | List of particle type pairs (keys from `self.part_types`) for which interactions are defined. Defaults to [(None, None)].
@@ -452,7 +452,7 @@ class Simulation():
         """
         Configures Lennard-Jones (LJ) interactions for specified particle types.
 
-        This method sets the LJ interaction parameters (epsilon and sigma) for particle types listed in the `key` parameter. 
+        This method sets the LJ interaction parameters (epsilon and sigma) for particle types listed in the `key` parameter.
         The interaction cutoff is automatically set to 2.5 times the LJ size (sigma).
 
         :param key: tuple of str | Particle type keys from `self.part_types` for which interactions are defined. Defaults to ('nonmagn',).
@@ -537,7 +537,7 @@ class Simulation():
         wall_constraints = add_box_constraints_func(self.sys, wall_type=wall_type, sides=sides, inter=inter, types_=types_, object_types=object_types, bottom=bottom, top=top, left=left, right=right, back=back, front=front)
 
         return wall_constraints
-    
+
     def remove_box_constraints(self, wall_constraints=None, part_types=None, object_types=None):
         """ Removes wall_constraints from system. Default: removes all espressomd.shapes.Wall constraints.
             If part_types is not None, remove only interactions with those particle types.
@@ -548,7 +548,7 @@ class Simulation():
         list of particles types to stop interactoin with box part_types
         """
         remove_box_constraints_func(self.sys, wall_constraints=wall_constraints, part_types=part_types, object_types=object_types)
-        
+
 
     def init_lb(self, kT, agrid, dens, visc, gamma, timestep=0.01):
         """
@@ -601,7 +601,7 @@ class Simulation():
             LB_fluid=lbf, gamma=gamma_MD, seed=self.seed)
         logging.info(f'LBM is set with the params {lbf.get_params()}.')
         return lbf
-    
+
     def create_flow_channel(self, slip_vel=(0, 0, 0)):
         """
         Sets up LB boundaries for a flow channel.
@@ -769,7 +769,7 @@ class Simulation():
     def get_H_ext(self):
         """
         Retrieves the current external magnetic field.
-        
+
         Sums over all applied homogeneus magnetic fields.
 
         :return: tuple | The external magnetic field vector.
@@ -829,7 +829,7 @@ class Simulation():
         f = gzip.open(path_to_dump, 'wb')
         pickle.dump(dict_of_god, f, pickle.HIGHEST_PROTOCOL)
         f.close()
-    
+
     def collect_instances_recursively(self, roots):
         """
         Traverse each root in `roots` and return a flat preorder list
@@ -871,7 +871,7 @@ class Simulation():
             Path to the HDF5 file to write (mode='NEW') or append (mode='LOAD').
         mode : {'NEW', 'LOAD'}, optional
             - 'NEW' : create a fresh file structure (default).
-            - 'LOAD': open existing file and resume writing.  
+            - 'LOAD': open existing file and resume writing.
 
         Returns
         -------
@@ -918,7 +918,7 @@ class Simulation():
                 connect_grp = self.io_dict['h5_file'].require_group(f"connectivity").require_group(grp_typ.__name__)
                 logging.info(f"Inscribe: Creating group {grp_typ.__name__} in HDF5 file.")
                 objects_to_register=[obj for obj in self._objects if isinstance(obj,grp_typ)]
-            
+
                 coordination_indices=[]
                 for cr in objects_to_register:
                     part,coord=cr.get_owned_part()
@@ -943,7 +943,7 @@ class Simulation():
                     )
                 # Create the connectivity for objects that own each other
                 pair_buckets = defaultdict(list)
-                
+
                 for obj in self.collect_instances_recursively(objects_to_register):
                     if not obj.associated_objects:
                         continue
@@ -960,7 +960,7 @@ class Simulation():
                         dtype=np.int32,
                         maxshape=(arr.shape)
                     )
-                # Create the datasets for each property           
+                # Create the datasets for each property
                 for prop,dim in self.io_dict['properties']:
                     prop_group = data_grp.require_group(prop)
                     prop_group.create_dataset("step", shape=(0,), maxshape=(None,), dtype=np.int32)
@@ -1002,7 +1002,7 @@ class Simulation():
                     )
                 else:
                     raise NotImplemented("Currently only saves no bonds or 'all' bonds.")
-                
+
             GLOBAL_COUNTER=0
 
         elif mode=='LOAD_NEW':
@@ -1049,7 +1049,7 @@ class Simulation():
                     logging.info(f'Force resized all datasets from {GLOBAL_COUNTER} to size {force_resize_to_size}')
                     GLOBAL_COUNTER=force_resize_to_size
             logging.info(f"Loaded h5 file with GLOBAL_COUNTER={GLOBAL_COUNTER} ")
-        
+
         elif mode=='LOAD':
             self.io_dict['h5_file'] = h5py.File(h5_data_path, "a")
             particles_group = self.io_dict['h5_file']["particles"]
@@ -1070,7 +1070,7 @@ class Simulation():
             logging.info(f"Loading h5 file with GLOBAL_COUNTER={GLOBAL_COUNTER} ")
 
         return GLOBAL_COUNTER
-        
+
     def write_part_group_to_h5(self, step=None, time=None, unique_time=False, bonds_once=True):
         assert self.io_dict['h5_file']!=None,'storage file has not been inscribed!'
         if unique_time:
@@ -1098,7 +1098,7 @@ class Simulation():
                         # (steps equal to existing ones naturally land here too)
                         idx = idx_attempt
                         step = step_dataset[idx]
-                         
+
                 else:
                     # Duplicate steps allowed OR dataset empty -> append
                     step_dataset.resize((dataset_size + 1,))
@@ -1111,7 +1111,7 @@ class Simulation():
                 step_dataset[idx] = step
                 time_dataset[idx] = time if time is not None else step
                 dataset_val[idx, :, :] = np.array([np.atleast_1d(getattr(part, prop)) for part in self.io_dict['flat_part_view'][grp_typ]], dtype=np.float32) # TO IMPLEMENT make this type see the rpious and copy. Change the initial type to match type of saved prop
-            
+
             # skip if not saving bonds OR ( if bond_once is True AND there are already bonds saved )
             if self.io_dict.get('bonds') is None or (bonds_once and data_grp["bonds/value"].shape[0] > 0):
                 pass
@@ -1136,7 +1136,7 @@ class Simulation():
                         # (steps equal to existing ones naturally land here too)
                         idx = idx_attempt
                         step = step_dataset[idx]
-                         
+
                 else:
                     # Duplicate steps allowed OR dataset empty -> append
                     step_dataset.resize((dataset_size + 1,))
@@ -1177,21 +1177,21 @@ class Simulation():
 
         The operation runs in two phases:
 
-        1) **Copy & shrink to one frame**  
+        1) **Copy & shrink to one frame**
         The file at ``original_data_file_path`` is copied to ``dest_h5_file_path``.
         For every group under ``/particles/<Group>/<Prop>``, the datasets
         ``value``, ``step``, and ``time`` are sliced at ``time_step`` and then
         **resized to length 1** (T=1), preserving the chosen frame as the only
         frame in the destination file.
 
-        2) **Optionally create new properties (single frame)**  
+        2) **Optionally create new properties (single frame)**
         If ``prop_dim`` is provided, for each group name in
         ``self.io_dict['registered_group_type']`` this function creates a new
         property group ``/particles/<Group>/<prop>`` with the standard layout:
         - ``step`` : int32, shape ``(T,)`` (created empty, then resized to 1)
         - ``time`` : float32, shape ``(T,)`` (created empty, then resized to 1)
         - ``value``: float32, shape ``(T, N, D)`` (gzip, chunked as ``(1, N, D)``)
-        
+
         It then appends **one** frame (T=1), setting both ``step[-1]`` and
         ``time[-1]`` to ``time_step``, and fills ``value[-1, :, :]`` from the
         in-memory list ``self.io_dict['flat_part_view'][<Group>]`` using
@@ -1247,7 +1247,7 @@ class Simulation():
         ...     time_step=0,
         ... )
         """
-        
+
         dst_path=Path(dest_h5_file_path)
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(original_data_file_path, dst_path)
@@ -1273,9 +1273,9 @@ class Simulation():
                     ds[0] = time_val
 
         print(f"✔ Shrunk to single timestep at: {dst_path}")
-        
+
         if prop_dim != None:
-            with h5py.File(dst_path, "a") as h5_file_handle: 
+            with h5py.File(dst_path, "a") as h5_file_handle:
                 for grp_typ in self.io_dict['registered_group_type']:
                     particles_group = h5_file_handle["particles"]
                     data_grp = particles_group[grp_typ]
@@ -1302,7 +1302,7 @@ class Simulation():
                         src_data_grp = H5DataSelector(h5_file_handle, particle_group=grp_typ)
                         assert len(src_data_grp.timestep)==1,'dataset is ragged!!!'
                         logging.info(f'appended {prop} to {dst_path}')
-            
+
     def set_prop_from_src(
     self,
     registered_objs=None,
@@ -1525,7 +1525,7 @@ class Simulation():
                     connectivity_value=loc_obj.who_am_i,
                     predicate=lambda subset: np.isin(subset.type, allowed_types),
                 )
-                positions_per_obj.append(part_slice.pos)    
+                positions_per_obj.append(part_slice.pos)
                 try:
                     ori_per_obj.append(part_slice.director)
                 except KeyError:
@@ -1540,6 +1540,6 @@ class Simulation():
                     ori_per_obj.append(val)
                     continue
         return positions_per_obj,ori_per_obj
-    
+
     def test_set_attr(self, name):
         return self.__getattribute__(name)

@@ -5,3 +5,8 @@ tests.ipynb
 technical_description.txt
 .coverage
 doc/sphinx/build
+
+# coding agents
+CLAUDE.md
+.claude/
+.claudeignore
