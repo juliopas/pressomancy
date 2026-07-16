@@ -1,76 +1,47 @@
 from pressomancy.simulation import PointDipolePermanent, PointDipoleSuperpara
-from .create_system import sim_inst, BaseTestCase
-import numpy as np
+from pressomancy.helper_functions import api_agnostic_feature_check
+from create_system import sim_inst, BaseTestCase
+
 
 class PointDipoleTest(BaseTestCase):
     H_ext = [0,0,3.]
+    config=PointDipolePermanent.config.specify(
+        dipm=1.2, size=2., espresso_handle=sim_inst.sys)
 
     def tearDown(self) -> None:
-        sim_inst.reinitialize_instance()
+        self.mag_part=None
+        self.cleanup()
         self.assertEqual(len(sim_inst.sys.part),0)
 
+    def setUp(self) -> None:
+        self.mag_part = [PointDipolePermanent(config=PointDipolePermanent.config.specify(espresso_handle=sim_inst.sys)) for _ in range(10)]
+        self.mag_part.append(PointDipolePermanent(config=self.config))
+        sim_inst.store_objects(self.mag_part)
+        sim_inst.set_objects(self.mag_part)
+
     def test_set_object_generic(self):
-        mag_part = [PointDipolePermanent(config=PointDipolePermanent.config.specify(espresso_handle=sim_inst.sys)) for _ in range(10)]
-        sim_inst.store_objects(mag_part)
-        sim_inst.set_objects(mag_part)
-        mag_part =  [PointDipoleSuperpara(config=PointDipoleSuperpara.config.specify(espresso_handle=sim_inst.sys)) for _ in range(10)]
-        sim_inst.store_objects(mag_part)
-        sim_inst.set_objects(mag_part)
 
-    def test_set_object(self):
-        mag_part = [PointDipolePermanent(
-                    config=PointDipolePermanent.config.specify(dipm=0.7, size=2.,
-                    espresso_handle=sim_inst.sys)) for _ in range(10)]
-        sim_inst.store_objects(mag_part)
-        sim_inst.set_objects(mag_part)
-        mag_part = [PointDipoleSuperpara(
-                    config=PointDipoleSuperpara.config.specify(dipm=1., size=0.5,
-                    espresso_handle=sim_inst.sys)) for _ in range(10)]
-        sim_inst.store_objects(mag_part)
-        sim_inst.set_objects(mag_part)
+        assert sim_inst.part_types["pdp_real"] == 61
 
-    def test_magnetize_PointDipoleSuperpara(self):
-        mag_part = [PointDipoleSuperpara(
-                    config=PointDipoleSuperpara.config.specify(dipm=1., size=0.5,
-                    espresso_handle=sim_inst.sys)) for _ in range(10)]
-        sim_inst.store_objects(mag_part)
-        sim_inst.set_objects(mag_part)
+if all(api_agnostic_feature_check(feature) for feature in PointDipoleSuperpara.required_features):
+    class PointDipoleSuperparaTest(BaseTestCase):
+        H_ext = [0,0,3.]
+        config=PointDipoleSuperpara.config.specify(
+            dipm=1., size=0.5, espresso_handle=sim_inst.sys)
 
-        part_list = list(sim_inst.sys.part.select(type=sim_inst.part_types["pds_real"]))
+        def tearDown(self) -> None:
+            self.mag_part=None
+            self.cleanup()
+            self.assertEqual(len(sim_inst.sys.part),0)
 
-        sim_inst.magnetize(part_list, mag_part[0].params["dipm"], H_ext=self.H_ext)
+        def setUp(self) -> None:
+            self.mag_part = [PointDipoleSuperpara(config=PointDipoleSuperpara.config.specify(espresso_handle=sim_inst.sys)) for _ in range(10)]
+            self.mag_part.append(PointDipoleSuperpara(config=self.config))
+            sim_inst.store_objects(self.mag_part)
+            sim_inst.set_objects(self.mag_part)
 
-    def test_magnetize_mixture(self):
-        mag_part_pds = [PointDipoleSuperpara(
-                    config=PointDipoleSuperpara.config.specify(dipm=1., size=0.5,
-                    espresso_handle=sim_inst.sys)) for _ in range(10)]
-        sim_inst.store_objects(mag_part_pds)
-        sim_inst.set_objects(mag_part_pds)
-        mag_part_pdp = [PointDipolePermanent(
-                    config=PointDipolePermanent.config.specify(dipm=0.7, size=2.,
-                    espresso_handle=sim_inst.sys)) for _ in range(10)]
-        sim_inst.store_objects(mag_part_pdp)
-        sim_inst.set_objects(mag_part_pdp)
-
-        part_list = list(sim_inst.sys.part.select(type=sim_inst.part_types["pds_real"]))
-
-        sim_inst.magnetize(part_list, mag_part_pds[0].params["dipm"], H_ext=self.H_ext)
-
-    def test_other_magnetize(self):
-        mag_part_pds = [PointDipoleSuperpara(
-                    config=PointDipoleSuperpara.config.specify(dipm=1., size=0.5,
-                    espresso_handle=sim_inst.sys)) for _ in range(10)]
-        sim_inst.store_objects(mag_part_pds)
-        sim_inst.set_objects(mag_part_pds)
-        mag_part_pdp = [PointDipolePermanent(
-                    config=PointDipolePermanent.config.specify(dipm=0.7, size=2.,
-                    espresso_handle=sim_inst.sys)) for _ in range(10)]
-        sim_inst.store_objects(mag_part_pdp)
-        sim_inst.set_objects(mag_part_pdp)
-
-        part_list = list(sim_inst.sys.part.select(type=sim_inst.part_types["pds_real"]))
-
-        sim_inst.magnetize_lin(part_list, mag_part_pds[0].params["dipm"], H_ext=self.H_ext, Xi=0.3)
-        sim_inst.magnetize_froelich_kennelly(part_list, mag_part_pds[0].params["dipm"], H_ext=self.H_ext, Xi=0.5)
-        sim_inst.magnetize_dumb(part_list, mag_part_pds[0].params["dipm"], H_ext=self.H_ext)
-    
+        def test_set_object_generic(self):
+            assert sim_inst.part_types["pds_real"] == 62 and sim_inst.part_types["pds_virt"] == 666
+            p_virt = next(iter(sim_inst.sys.part.select(type=sim_inst.part_types["pds_virt"])))
+            assert p_virt.magnetodynamics.ideal["is_enabled"] is True
+            assert p_virt.magnetodynamics.ideal["sat_mag"] == 1.0

@@ -1,8 +1,13 @@
 from pressomancy.simulation import Simulation
 import logging
 import unittest
+import gc
 
 class BaseTestCase(unittest.TestCase):
+
+    box_dim=(50,50,50)
+    min_global_cut=1
+    
     @classmethod
     def setUpClass(cls):
         # Configure logging for tests
@@ -19,5 +24,14 @@ class BaseTestCase(unittest.TestCase):
 
         logger.addHandler(console_handler)
 
+    @staticmethod
+    def cleanup():
+        # Reset the simulation instance after each test
+        sim_inst.reinitialize_instance()
+        sim_inst.sys.box_l=BaseTestCase.box_dim
+        sim_inst.sys.min_global_cut=BaseTestCase.min_global_cut
+        gc.collect()
 
-sim_inst = Simulation(box_dim=(100,100,100))
+
+sim_inst = Simulation(box_dim=BaseTestCase.box_dim)
+sim_inst.set_sys(min_global_cut=BaseTestCase.min_global_cut)

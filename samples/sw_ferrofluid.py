@@ -23,7 +23,7 @@ tau0_inv=735412234.8230474
 
 sim_inst = Simulation(box_dim=box_l)
 sim_inst.set_sys()
-configuration=SWPart.config.specify(sigma=LJ_SIGMA, size=LJ_SIGMA, kT_KVm_inv=kT_KVm_inv, dipm=dipole_moment, dt_incr=t_*tstp, tau0_inv=tau0_inv, HK_inv=HK_inv, espresso_handle=sim_inst.sys)
+configuration=SWPart.config.specify(sigma=LJ_SIGMA, size=LJ_SIGMA, anisotropy_energy=kT_KVm_inv, sat_mag=dipole_moment, sw_dt_incr=t_*tstp, sw_tau0_inv=tau0_inv, anisotropy_field_inv=HK_inv, espresso_handle=sim_inst.sys)
 
 sw_parts=[SWPart(config=configuration) for _ in range(n_part)]
 sim_inst.store_objects(sw_parts)
@@ -31,7 +31,7 @@ sim_inst.set_objects(sw_parts)
 
 sim_inst.set_steric(key=('sw_real', ), wca_eps=LJ_EPSILON)
 sim_inst.set_H_ext(H=(0, 0, H_reduced))
-
+sim_inst.sys.thermostat.turn_off()
 sim_inst.sys.thermostat.set_langevin(kT=temperature, gamma=gamma_T,
                                gamma_rotation=gamma_R, seed=sim_inst.seed)
 

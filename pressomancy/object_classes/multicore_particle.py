@@ -1,9 +1,13 @@
 import inspect
 import numpy as np
+import espressomd
 from pressomancy.object_classes.object_class import ObjectConfigParams
 from pressomancy.object_classes.rigid_obj import GenericRigidObj
-from pressomancy.helper_functions import PartDictSafe
+from pressomancy.helper_functions import PartDictSafe, api_agnostic_feature_check
 from pressomancy.helper_functions import MissingFeature
+if espressomd.version.major() == 5:
+    import espressomd.propagation
+    Propagation = espressomd.propagation.Propagation
 
 class MulticorePart(GenericRigidObj):
 
@@ -85,14 +89,34 @@ class MulticorePart(GenericRigidObj):
             for x,dip_mom_per_part in zip(part_handles, dip_moments):
                 x.dip = dip_mom_per_part
         if anisotropy['kind']=='finite_egg':
-            if  not self.sys.api_agnostic_feature_check('EGG_MODEL'):
+            if  not api_agnostic_feature_check('EGG_MODEL'):
                 name = f"{type(self).__name__}.{inspect.currentframe().f_code.co_name}"
                 raise MissingFeature(f"{name} requires EGG_MODEL. Please enable it in your ESPResSo installation.") 
             MulticorePart.part_types.update({'yolk': 11})
-            assert ['egg_gamma','aniso_energy'] in anisotropy['params'], "Finite anisotropy is realised with the Egg model, which requires 'egg_gamma' and 'aniso_energy' parameters to be specified"
+            missing = [key for key in ['egg_gamma', 'aniso_energy'] if key not in anisotropy['params']]
+            if missing:
+                raise ValueError(
+                    f"Finite anisotropy via the Egg model requires parameters: {', '.join(missing)}"
+                )
             for x,dip_mom_per_part in zip(part_handles, dip_moments):
                 x.dip = dip_mom_per_part
-                x.egg_model_params = (True, anisotropy['params']['egg_gamma'], anisotropy['params']['aniso_energy'])
+                if espressomd.version.major() == 5:
+                    x.rotation = (True, True, True)
+                    x.magnetodynamics.egg = {
+                        "is_enabled": True,
+                        "gamma": anisotropy['params']['egg_gamma'],
+                        "anisotropy_energy": anisotropy['params']['aniso_energy'],
+                    }
+                    x.propagation = (Propagation.TRANS_VS_RELATIVE |
+                                     Propagation.ROT_VS_INDEPENDENT)
+                elif espressomd.version.major() == 4:
+                    x.egg_model_params = {
+                        "use_egg_model": True,
+                        "egg_gamma": anisotropy['params']['egg_gamma'],
+                        "aniso_energy": anisotropy['params']['aniso_energy'],
+                    }
+                else:
+                    raise ImportError(f"Unsupported espressomd version: {espressomd.version.major()}")
                 self.change_part_type(x,'yolk')
     
     

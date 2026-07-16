@@ -8,6 +8,8 @@ import espressomd.version
 import sys as sysos
 import h5py
 import warnings
+import subprocess
+from pathlib import Path
 
 class MissingFeature(Exception):
     pass
@@ -115,22 +117,28 @@ class ManagedSimulation:
         Recreates the singleton instance without affecting the shared ESPResSo system object.
 
         This method resets the decorated class instance while preserving the ESPResSo system object.
-        It clears particles, interactions, constraints, actors, and thermostat settings in the system, ensuring a clean state.
-
-        note: it is much faster without reseting non_bonded_interactions. You can do this manually, or you can uncomment the temporary fix for this.
+        It releases registered simulation objects and clears particles,
+        interactions, and thermostat settings in the system, ensuring a clean state.
         """
         if self.instance is not None:
+            for obj in self.instance.objects:
+                obj.delete_owned_parts()
+            self.instance.objects = []
+            self.instance.no_objects = 0
+            self.instance.part_types.clear()
+            self.instance.part_positions = []
+            self.instance.volume_centers = []
+            self.instance.volume_size = None
+            self.instance.partitioned = None
             self.instance = self.aClass(*self.init_args, **self.init_kwargs)
             self.instance.sys = self._espressomd_system
             self.instance.sys.part.clear()
-            # self.instance.sys.non_bonded_inter.reset() #this method is not working properly
-            # self.instance.reset_non_bonded_inter() # temporary fix (uncomment)
+            self.instance.sys.non_bonded_inter.reset()
             self.instance.sys.bonded_inter.clear()
             self.instance.sys.constraints.clear()
             self.instance.sys.thermostat.turn_off()
-            self.instance.sys.constraints.clear()
-            # self.instance.sys.actors.clear()
-            self.instance.sys.magnetostatics.clear()
+            self.instance.sys.integrator.set_vv()
+
 
     def __getattr__(self, name):
         """
@@ -154,7 +162,7 @@ class ManagedSimulation:
         if self.instance is None:
             raise AttributeError(f"Instance of {self.aClass.__name__} has not been initialized.")
         return getattr(self.instance, name)
-    
+
     def __setattr__(self, name, value):
         """
         Forwards attribute setting to the singleton instance.
@@ -171,7 +179,7 @@ class ManagedSimulation:
         ------
         AttributeError
             If the singleton instance has not been initialized.
-        """       
+        """
         if name in self.internal_attrs:
             object.__setattr__(self, name, value)
         elif self.instance is None:
@@ -179,7 +187,7 @@ class ManagedSimulation:
         else:
             # Forward to Simulation instance
             setattr(self.instance, name, value)
-    
+
     def __dir__(self):
         """
         Returns the list of attributes for the singleton instance and the ManagedSimulation class.
@@ -351,7 +359,7 @@ class SinglePairDict(dict):
             A string representation in the format `SinglePairDict(key: value)`.
         """
         return f"SinglePairDict({self.key!r}: {self.value!r})"
-    
+
 class PartDictSafe(dict):
     """
     A safe dictionary wrapper to enforce consistency and uniqueness of keys and values.
@@ -361,7 +369,7 @@ class PartDictSafe(dict):
     - Values are unique and cannot be associated with multiple keys.
     - A default value is provided for missing keys using a customizable default factory.
 
-    This is especially useful for managing mappings where both the keys and values must remain consistent, 
+    This is especially useful for managing mappings where both the keys and values must remain consistent,
     such as particle types and their properties in simulations.
 
     Attributes
@@ -602,7 +610,7 @@ class RoutineWithArgs:
 
 def load_coord_file(file_path):
     '''
-    load coordinates from a text file. the function allways staples a (0,0,0) as the first row! 
+    load coordinates from a text file. the function allways staples a (0,0,0) as the first row!
     '''
     coordinates = np.zeros((1, 3), dtype=float)
     with open(file_path, mode='r') as source:
@@ -657,7 +665,7 @@ def normalize_vectors(vectors, axis=-1):
         return array_of_vectors / np.expand_dims(norms_array, axis)
     else: # if only one vector return an array of shape (dims,)Z
         return array_of_vectors / np.linalg.norm(array_of_vectors)
-    
+
 def random_nested_3d_vectors_like(item, rng=None):
     """
     Recursively generate random 3D unit vectors,
@@ -669,18 +677,18 @@ def random_nested_3d_vectors_like(item, rng=None):
     """
     if rng is None:
         rng = np.random.default_rng()
-    
+
     if isinstance(item, (list, tuple)):
         # Check if it is a 3D vector (leaf)
         if len(item) == 3 and all(isinstance(x, (float, int)) for x in item):
             return generate_random_unit_vectors(1).flatten().tolist()
         else:
             return [random_nested_3d_vectors_like(sub, rng) for sub in item]
-    
+
     elif isinstance(item, np.ndarray):
         if item.shape[-1] != 3:
             raise ValueError(f"Expected last dimension to be 3 for 3D vectors, got shape {item.shape}")
-        
+
         n_vectors = np.prod(item.shape[:-1])
         vectors = generate_random_unit_vectors(n_vectors)
         vectors = vectors.reshape(item.shape)
@@ -727,14 +735,14 @@ def build_grid_and_adjacent(lattice_points, volume_side, cell_size):
         grid[tuple(cell)].append(idx)
     # Precompute neighbor offsets (all combinations of -1, 0, 1 in 3 dimensions).
     neighbor_offsets = list(product([-1, 0, 1], repeat=3))
-    
+
     # Build the adjacent cells dictionary only for the occupied cells.
     adjacent = {}
     for cell in grid.keys():
         cell_arr = np.array(cell)
         # For each offset, compute the neighboring cell id with periodic wrapping.
         adjacent[cell] = [tuple((cell_arr + np.array(offset)) % num_cells) for offset in neighbor_offsets]
-    
+
     return grid, adjacent
 
 def get_neighbours(lattice_points: np.ndarray, volume_side: float, cuttoff: float = 1.) -> defaultdict:
@@ -742,7 +750,7 @@ def get_neighbours(lattice_points: np.ndarray, volume_side: float, cuttoff: floa
     Returns grouped_indices, where grouped_indices is a dictionary that maps each particle index
     to a list of neighbor indices within the cuttoff distance. Uses a grid-based method for efficiency,
     and reuses the min_img_dist function for distance calculations.
-    
+
     Parameters
     ----------
     lattice_points : np.ndarray of shape (N, 3)
@@ -754,7 +762,7 @@ def get_neighbours(lattice_points: np.ndarray, volume_side: float, cuttoff: floa
 
     Note:
         - particle index is taken from 0 to number of particles.
-    
+
     Returns
     -------
     grouped_indices : defaultdict[int, list[int]]
@@ -763,14 +771,14 @@ def get_neighbours(lattice_points: np.ndarray, volume_side: float, cuttoff: floa
     # Use cuttoff as the grid cell size.
     cell_size = cuttoff
     grid, adjacent_cells = build_grid_and_adjacent(lattice_points, volume_side, cell_size)
-    
+
     grouped_indices = defaultdict(list)
     volume_side = np.asarray(volume_side)
     if volume_side.ndim == 0:
         box_dim = np.ones(3) * volume_side
     else:
         box_dim = volume_side
-    
+
     # For each occupied cell in the grid...
     for cell, indices in grid.items():
         # Get the list of adjacent cells (neighbors) for this cell.
@@ -808,7 +816,7 @@ def get_neighbours_cross_lattice(lattice1, lattice2, box_lengths, cuttoff=1.):
     if isinstance(box_lengths, float):
         box_lengths = box_lengths * np.ones(3)
     box_lengths = np.asarray(box_lengths)
-    
+
     grouped_indices = defaultdict(list)
     points_a = np.atleast_2d(lattice1)
     points_b = np.atleast_2d(lattice2)
@@ -819,7 +827,7 @@ def get_neighbours_cross_lattice(lattice1, lattice2, box_lengths, cuttoff=1.):
         distances=np.linalg.norm(min_img_dist(point, points_b, box_dim=box_lengths), axis=-1)
         mask=np.where(distances<=cuttoff)
         grouped_indices[id]=list(indices_b[mask])
-    
+
     return grouped_indices
 
 def calculate_pair_distances(points_a, points_b, box_lengths):
@@ -847,28 +855,28 @@ def calculate_pair_distances(points_a, points_b, box_lengths):
     # Ensure inputs are numpy arrays
     points_a = np.atleast_2d(points_a)
     points_b = np.atleast_2d(points_b)
-    
+
     # Get the number of points in each set
     num_a = len(points_a)
     num_b = len(points_b)
-    
+
     # Create index combinations for pair comparisons
     indices_a = np.arange(num_a)
     indices_b = np.arange(num_b)
-    
+
     # Create a grid of all pair combinations of indices
     index_combinations = np.array(list(product(indices_a, indices_b)))
-    
+
     # Extract corresponding points for each pair
     point_pairs_a = points_a[index_combinations[:, 0]]  # Points from the first set
     point_pairs_b = points_b[index_combinations[:, 1]]  # Points from the second set
-    
+
     box_lengths = np.asarray(box_lengths)
     assert box_lengths.shape == (3,), "box_lengths must be an array-like of shape (3,)"
     # Calculate the minimum image distance with periodic boundary conditions
     distances = np.linalg.norm(min_img_dist(point_pairs_a, point_pairs_b, box_dim=box_lengths), axis=-1)
     # distances = np.linalg.norm(point_pairs_a-point_pairs_b, axis=-1)
-    
+
     return distances
 
 def fcc_lattice(radius, volume_sides, scaling_factor=1., max_points_per_side=100):
@@ -895,13 +903,13 @@ def fcc_lattice(radius, volume_sides, scaling_factor=1., max_points_per_side=100
 
     Notes
     -----
-    - The lattice constant is calculated as 2*radius_scaled/sqrt(2), where 
+    - The lattice constant is calculated as 2*radius_scaled/sqrt(2), where
       radius_scaled = radius*scaling_factor.
     - If the number of points per side exceeds max_points_per_side, the lattice
       constant is gradually increased until the constraint is satisfied.
-    - The function ensures the lattice fits within the given volume by removing 
+    - The function ensures the lattice fits within the given volume by removing
       the last row of points to avoid periodic boundary condition overlaps.
-    - When the lattice constant is increased, a warning message is logged with 
+    - When the lattice constant is increased, a warning message is logged with
       the new value.
     """
     assert len(volume_sides)==3, "this metthod assumes volume_sides to be have len of 3"
@@ -915,7 +923,7 @@ def fcc_lattice(radius, volume_sides, scaling_factor=1., max_points_per_side=100
             break
         lattice_constant *= 1.1
         logging.info('lattice_constant increased to %s becaouse %s bigger than %s', lattice_constant,num_points,max_points_per_side)
-   
+
     indices = [np.arange(num-1) for num in num_points ]
     x, y, z = np.meshgrid(indices[0], indices[1], indices[2], indexing='ij')
     sum_indices = x + y + z
@@ -951,13 +959,13 @@ def make_centered_rand_orient_point_array(center=np.array([0,0,0]), sphere_radiu
     Notes
     -----
     When spacing is provided, the positions along the line are given by:
-    
+
         positions = spacing * (np.arange(num_monomers) - (num_monomers - 1)/2)
-    
+
     ensuring that the distance between consecutive points is exactly 'spacing' and that the center of mass is at 0.
     The points are then rotated by a random orientation (given by theta and phi) and shifted by 'center'.
     """
-    
+
     if spacing is not None:
         positions = spacing * (np.arange(num_monomers) - (num_monomers - 1) / 2)
     else:
@@ -978,8 +986,9 @@ def make_centered_rand_orient_point_array(center=np.array([0,0,0]), sphere_radiu
 def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_per_volume=RoutineWithArgs(), flag='rand'):
     """
     Partitions a cuboid volume into spherical regions and generates points within them.
-    This function creates a face-centered cubic (FCC) lattice of spheres within a cubic volume; and optionally, generates points within each sphere according to a specified routine.
-    
+    This function creates a face-centered cubic (FCC) lattice of spheres within a cuboid volume and optionally
+    generates points within each sphere according to a specified routine.
+
     Parameters
     ----------
     box_lengths : array-like of shape (3,)
@@ -992,7 +1001,7 @@ def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_p
         A callable object that generates points within each sphere. Default is empty RoutineWithArgs.
     flag : str, optional
         Determines the arrangement of sphere centers. 'rand' for random shuffling. Default is 'rand'.
-    
+
     Returns
     -------
     list of tuples
@@ -1003,9 +1012,9 @@ def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_p
     """
     box_lengths = np.asarray(box_lengths)
     assert box_lengths.shape == (3,), "box_lengths must be an array-like of shape (3,)"
-    sphere_radius = sphere_diameter * 0.5    
+    sphere_radius = sphere_diameter * 0.5
     scaling = 1.0
-    
+
     # Adjust scaling until we have enough sphere centers
     while True:
         sphere_centers = fcc_lattice(radius=sphere_radius, volume_sides=box_lengths, scaling_factor=scaling)
@@ -1026,7 +1035,7 @@ def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_p
     if flag=='rand':
         np.random.shuffle(take_index)
     take_index = take_index[:num_spheres]
-    sphere_centers=sphere_centers[take_index]  
+    sphere_centers=sphere_centers[take_index]
     # Initialize an array to store the generated points inside each spherical region
     results = [None] * num_spheres
     res_orientations = [None] * num_spheres
@@ -1036,7 +1045,7 @@ def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_p
             warnings.warn("this methods assumes cubic system box for num_monomers > 1")
         box_length = box_lengths[0]
         grouped_positions = defaultdict(list)
-        #grouped_volumes is a dictionary that contains all neighouring lattice sites sphere_diameter  
+        #grouped_volumes is a dictionary that contains all neighouring lattice sites sphere_diameter
         grouped_volumes=get_neighbours(sphere_centers,volume_side=box_lengths,cuttoff=sphere_diameter)
         for i, center in enumerate(sphere_centers):
             valid_placement = False
@@ -1045,7 +1054,7 @@ def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_p
                     center=center, num_monomers=routine_per_volume.num_monomers, sphere_radius=sphere_radius, spacing=routine_per_volume.spacing,
                     box_lengths=box_lengths)
                 should_proceed = True
-                
+
                 # Check for overlaps with points in neighboring spheres
                 for volume_id in grouped_volumes[i]:
                     if grouped_positions[volume_id]:
@@ -1053,7 +1062,7 @@ def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_p
                         if np.any(distances <= routine_per_volume.monomer_size):
                             should_proceed = False
                             break
-                
+
                 if should_proceed:
                     grouped_positions[i].extend(points)
                     results[i] = points
@@ -1068,8 +1077,8 @@ def partition_cubic_volume_oriented_rectangles(big_box_dim, num_spheres, small_b
     """
     Partition a cubic volume into smaller rectangular regions and generate oriented points within each region.
 
-    This function divides a larger cubic box into smaller rectangular volumes based on the dimensions of the 
-    smaller boxes provided. It then generates a specified number of points within each smaller volume, ensuring 
+    This function divides a larger cubic box into smaller rectangular volumes based on the dimensions of the
+    smaller boxes provided. It then generates a specified number of points within each smaller volume, ensuring
     they are oriented along a random direction.
 
     Parameters
@@ -1098,7 +1107,7 @@ def partition_cubic_volume_oriented_rectangles(big_box_dim, num_spheres, small_b
     Notes
     -----
     - The function uses the dimensions of `small_box_dim` to determine the number of partitions along each axis.
-    - When there are fewer partitions along an axis (e.g., one partition), alternate boxes along that axis are 
+    - When there are fewer partitions along an axis (e.g., one partition), alternate boxes along that axis are
       adjusted to ensure even distribution.
     - The generated points within each smaller box are spaced along a single direction determined by a random angle.
 
@@ -1162,40 +1171,6 @@ def partition_cubic_volume_oriented_rectangles(big_box_dim, num_spheres, small_b
 
     return sphere_centers[take_index], result
 
-def generate_positions(self, min_distance):
-    """
-    Generates random positions for objects in the simulation box, ensuring minimum distance between positions. Completely naive implementation
-
-    :param min_distance: float | The minimum allowed distance between objects.
-    :return: np.ndarray | Array of generated positions.
-    """
-    object_positions = []
-    while len(object_positions) < self.no_objects:
-        new_position = np.random.random(3) * self.sys.box_l
-        if all(np.linalg.norm(new_position - pos) >= min_distance for pos in self.sys.part.all().pos):
-            if all(np.linalg.norm(new_position - existing_position) >= min_distance for existing_position in object_positions):
-                object_positions.append(new_position)
-        logging.info(f'position casing progress: {len(object_positions)/self.no_objects}')
-
-    return np.array(object_positions)
-
-def generate_positions_directed_triples(no_objects, box_l, min_distance, director_list):
-    assert len(
-        director_list) == no_objects // 3, "Length of directorors must be one-third of no_objects"
-    quadriplex_positions = []
-    index = 0
-    while len(quadriplex_positions) < no_objects:
-        center = box_l/2.
-        factor = 1-min_distance/box_l
-        new_position = center + factor*box_l*(np.random.random(3) - 0.5)
-        if all(np.linalg.norm(new_position - existing_position) >= min_distance
-                for existing_position in quadriplex_positions):
-            quadriplex_positions.append(new_position)
-            quadriplex_positions.append(new_position+2.*director_list[index])
-            quadriplex_positions.append(new_position-2.*director_list[index])
-            index += 1
-    return np.array(quadriplex_positions)
-
 def get_orientation_vec(pos):
     '''
     Calculates the principal gyration axis of a filement as the orientation of a filament. Sometimes the np.linalg.eig() returns a complex number with 0 complex part wich confuses espresso. Therefore the ret values is cast to float explicitly
@@ -1235,7 +1210,7 @@ def get_cross_lattice_nonintersecting_volumes(current_lattice_centers, current_l
     ----------
     current_lattice_centers : array-like
         Centers of volumes in the first lattice.
-    current_lattice_grouped_part_pos : array-like 
+    current_lattice_grouped_part_pos : array-like
         Particle positions grouped by volume for the first lattice.
     current_lattice_diam : float
         Diameter of particles in the first lattice.
@@ -1259,12 +1234,12 @@ def get_cross_lattice_nonintersecting_volumes(current_lattice_centers, current_l
 
     Notes
     -----
-    The function uses a cutoff distance of (d1 + d2)/2 where d1, d2 are the 
+    The function uses a cutoff distance of (d1 + d2)/2 where d1, d2 are the
     diameters of particles in respective lattices. Particle pairs are considered
     non-intersecting if their separation is greater than (d1/n1 + d2/n2)/2,
     where n1, n2 are the number of particles in respective volumes.
     """
-    
+
     box_lengths = np.asarray(box_lengths)
     assert box_lengths.shape == (3,), "box_lengths must be an array-like of shape (3,)"
     neigh=get_neighbours_cross_lattice(current_lattice_centers,other_lattice_centers,
@@ -1287,7 +1262,7 @@ def get_cross_lattice_nonintersecting_volumes(current_lattice_centers, current_l
         if associated_vol_ids:
             for as_vol_id in associated_vol_ids:
                 res=calculate_pair_distances(current_lattice_dat[vol_id], other_lattice_dat[as_vol_id], box_lengths=box_lengths)
-                mask.append(all([x>=new_crit for x in res if not np.isclose(x,0.)])) 
+                mask.append(all([x>=new_crit for x in res if not np.isclose(x,0.)]))
         aranged_cross_lattice_options[vol_id]=mask
     return aranged_cross_lattice_options
 
@@ -1323,23 +1298,33 @@ def align_vectors(v1, v2):
         [-cross_prod[1], cross_prod[0], 0]
     ])
     rotation_matrix = (
-        np.eye(3) + cross_prod_matrix + 
+        np.eye(3) + cross_prod_matrix +
         (np.dot(cross_prod_matrix, cross_prod_matrix) * ((1 - cos_theta) / (sin_theta ** 2)))
     )
     return rotation_matrix
 
-def str_to_bool(string):
-    if string not in ['True', 'true', '1', 'False', 'false', '0']:
-        raise TypeError(f" '{string}' is not convertible to bool")
-    return string in ['True', 'true', '1']
+def get_perpendicular(vec, phi=None):
+    vec = np.asarray(vec, dtype=float)
+    norm = np.linalg.norm(vec)
+    if np.isclose(norm, 0.0):
+        raise ValueError("input vector must be non-zero")
+    unit_vec = vec / norm
 
-def broadcast_to_len(target_len, arg):
-    arg_arr = np.asarray(arg, dtype=object)
-    if arg_arr.ndim > 0 and len(arg_arr) == target_len: # target lenght
-        return arg
-    else: # lenghts missmatch
-        return [arg] * target_len
-      
+    ref = np.array([1.0, 0.0, 0.0])
+    if np.isclose(np.abs(np.dot(ref, unit_vec)), 1.0):
+        ref = np.array([0.0, 1.0, 0.0])
+    base_perp = ref - np.dot(ref, unit_vec) * unit_vec
+    base_perp /= np.linalg.norm(base_perp)
+    phi_val = np.random.uniform(0.0, 2.0 * np.pi) if phi is None else float(phi)
+    # Rodrigues rotation of base_perp around the input axis by phi.
+    perp = (
+        base_perp * np.cos(phi_val)
+        + np.cross(unit_vec, base_perp) * np.sin(phi_val)
+        + unit_vec * np.dot(unit_vec, base_perp) * (1.0 - np.cos(phi_val))
+    )
+    perp /= np.linalg.norm(perp)
+    return perp
+
 def api_agnostic_feature_check(feature_name):
     ret_val=None
     espresso_major_version=espressomd.version.major()
@@ -1354,7 +1339,7 @@ def api_agnostic_feature_check(feature_name):
         logging.warning(f'feature check for {feature_name}, espresso version {espresso_major_version} failed with exception {sysos.exc_info()}')
         return False
     return ret_val
-    
+
 def particle_attribute_check(part_hndl, attribute_name):
     try:
         getattr(part_hndl,attribute_name)
@@ -1519,7 +1504,7 @@ def remove_box_constraints_func(sys, wall_type=0, wall_constraints=None, part_ty
     else:
         wall_constraints = np.array([wall_constraints]).ravel()
 
-        
+
     if part_types is None and object_types is None: #removes actual cosntraints (removes interactions, if no more walls of that type)
         part_types= set([type_ for type_ in sys.part.all().type])
 
@@ -1540,7 +1525,6 @@ def remove_box_constraints_func(sys, wall_type=0, wall_constraints=None, part_ty
         for type_ in part_types:
             sys.non_bonded_inter[box_type, type_].reset()
 
-
 def check_free_cuboid(sys, cuboid_l, cuboid_l_shift=None):
     if cuboid_l_shift is None:
         cuboid_l_shift = np.zeros((3))
@@ -1549,27 +1533,13 @@ def check_free_cuboid(sys, cuboid_l, cuboid_l_shift=None):
         return True
     else:
         return np.all(np.any((pos < cuboid_l_shift) | (pos > cuboid_l_shift + cuboid_l), axis=1))
-    
-def normalize_vectors(vectors, axis=-1):
-    array_of_vectors= np.asarray(vectors)
-    if len(array_of_vectors.shape) > 1: # if multiple vectors return an array of shape (number_of_vectors, dims)
-        norms_array = np.atleast_1d(np.linalg.norm(array_of_vectors, axis=axis))
-        norms_array[norms_array==0] = 1
-        return array_of_vectors / np.expand_dims(norms_array, axis)
-    else: # if only one vector return an array of shape (dims,)Z
-        return array_of_vectors / np.linalg.norm(array_of_vectors)
-    
-def str_to_bool(string):
-    if string not in ['True', 'true', '1', 'False', 'false', '0']:
-        raise TypeError(f" '{string}' is not convertible to bool")
-    return string in ['True', 'true', '1']
 
 class BondWrapper:
     def __init__(self, bond_handle):
         # Store the bond_handle instance
         self._bond_handle = bond_handle
         self.name = bond_handle.__class__.__name__
-        
+
         if isinstance(bond_handle, espressomd.interactions.FeneBond):
             self.dtype = np.dtype([
                         ("partner_id", np.int32),
@@ -1603,9 +1573,77 @@ class BondWrapper:
     def __repr__(self):
         # Customize how the wrapper is printed
         return f"BondWrapper({repr(self._bond_handle)})"
-    
+
     def get_raw_handle(self):
         """
         Returns the raw object being wrapped.
         """
         return self._bond_handle
+
+def get_repo_context(path):
+    """Return the enclosing git repository root and a provenance version string.
+
+    The version string stores the current branch and commit hash and appends ``-dirty`` when
+    the repository has uncommitted changes. If the path is not inside a git
+    repository, or if the git query fails, the version falls back to ``unknown``.
+    """
+    path = Path(path).resolve()
+    search_root = path if path.is_dir() else path.parent
+    repo_root = None
+    for candidate in (search_root, *search_root.parents):
+        if (candidate / ".git").exists():
+            repo_root = candidate
+            break
+    if repo_root is None:
+        return None, "unknown"
+    try:
+        branch = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--abbrev-ref", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        commit = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--short", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "-C", str(repo_root), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except Exception:
+        return repo_root, "unknown"
+    suffix = "-dirty" if dirty else ""
+    return repo_root, f"{branch}@{commit}{suffix}"
+
+def get_submission_creator_info():
+    """Return H5MD creator metadata for the active submission script.
+
+    The creator name is reported as ``repo_name/repo_relative_path`` when the
+    script belongs to a git repository, and as ``unknown/<script_name>``
+    otherwise. The accompanying version string follows :func:`get_repo_context`.
+    """
+    package_root = Path(__file__).resolve().parent
+    current_file = Path(__file__).resolve()
+    frame = inspect.currentframe()
+    script_path = None
+    while frame is not None:
+        filename = frame.f_code.co_filename
+        if filename:
+            candidate = Path(filename).resolve()
+            if candidate != current_file and package_root not in candidate.parents:
+                script_path = candidate
+                break
+        frame = frame.f_back
+
+    if script_path is None:
+        return "unknown/unknown", "unknown"
+    repo_root, version = get_repo_context(script_path)
+    if repo_root is None:
+        return f"unknown/{script_path.name}", "unknown"
+    relpath = script_path.relative_to(repo_root).as_posix()
+    return f"{repo_root.name}/{relpath}", version

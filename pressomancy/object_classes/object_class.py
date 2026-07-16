@@ -4,6 +4,7 @@ from functools import partial
 import logging
 import espressomd
 import itertools
+import sys
 
 def _generic_type_exception(scope, name, attribute_name, expected_type):
     raise NotImplementedError(
@@ -117,9 +118,14 @@ class Simulation_Object(type):
             )
         super().__init__(name, bases, class_dict)
         # Assign class-level __iter__, __eq__, and __hash__ to make them work consistently
-        cls.__iter__ = Simulation_Object._cusiter
-        cls.__eq__ = Simulation_Object._eq
-        cls.__hash__ = Simulation_Object._hash
+        if "__iter__" not in class_dict:
+            cls.__iter__ = Simulation_Object._cusiter
+        if "__eq__" not in class_dict:
+            cls.__eq__ = Simulation_Object._eq
+        if "__hash__" not in class_dict:
+            cls.__hash__ = Simulation_Object._hash
+        if "__del__" not in class_dict:
+            cls.__del__ = Simulation_Object._del
         required_attributes = {
             "required_features": list,
             "numInstances": int,
@@ -146,8 +152,8 @@ class Simulation_Object(type):
             merged_config_data.update(base.part_types)
         merged_config_data.update(class_dict["part_types"])
         cls.part_types = PartDictSafe(**merged_config_data)
-        
-    
+
+
     def __call__(cls, *args, **kwargs):
         """
         Creates a new instance and assigns default methods and attributes.
@@ -221,6 +227,23 @@ class Simulation_Object(type):
         return hash((self.__class__, getattr(self, "who_am_i", None)))
 
     @staticmethod
+    def _del(self):
+        """
+        Best-effort owned-particle and live-instance cleanup.
+
+        The simulation lifecycle explicitly releases stored objects. During
+        interpreter shutdown we avoid calling back into ESPResSo from Python
+        finalizers, because the underlying script interface may already be
+        tearing down.
+        """
+        if sys.is_finalizing():
+            return
+        self.delete_owned_parts()
+        for cls in self.__class__.mro():
+            if hasattr(cls, "numInstances") and cls.numInstances > 0:
+                cls.numInstances -= 1
+
+    @staticmethod
     def _cusiter(self):
         """
         Returns an iterator for the object, enabling it to be used in loops.
@@ -244,7 +267,7 @@ class Simulation_Object(type):
         """
         logging.info(f"Self is: {self}")
         raise NotImplementedError("The 'set_object' method must be implemented in subclasses.")
-    
+
     def delete_owned_parts(self):
         """
         Deletes all particles owned by the object and any associated objects.
@@ -258,6 +281,7 @@ class Simulation_Object(type):
         for key,elem in self.type_part_dict.items():
             for prt in elem:
                 prt.remove()
+            elem.clear()
 
     def get_owned_part(self):
         """
@@ -284,10 +308,10 @@ class Simulation_Object(type):
             if obj.associated_objects is not None:
                 for sub_obj in obj.associated_objects:
                     worker(sub_obj, new_chain)
-                    
+
         worker(self, [])
         return tot_part, particle_chains
-        
+
     def add_particle(self, type_name, pos, **kwargs):
         """
         Adds a particle to the simulation box.
@@ -322,7 +346,7 @@ class Simulation_Object(type):
         self.type_part_dict[type_name].append(part_hndl)
         self.modify_system_attribute(self,'part_types', lambda current_value: current_value.update({type_name: part_params['type']}))
         return part_hndl
-    
+
     def bond_owned_part_pair(self,p1,p2, bond_handle=None):
         """
         Bonds the particle pair (p1,p2).
@@ -345,7 +369,7 @@ class Simulation_Object(type):
             self.sys.bonded_inter.add(bond)
             logging.info(f'bond handle added to system for Object {self.__class__,self.who_am_i}')
         p1.add_bond((bond, p2))
-    
+
     def change_part_type(self, particle, new_type_name):
         """
         Changes the type of an existing particle.
@@ -433,7 +457,7 @@ class ObjectConfigParams(dict):
         for key, value in overrides.items():
             new_config[key] = value
         return new_config
-        
+
     def __repr__(self):
         """
         Returns a string representation of the ObjectConfigParams instance.
@@ -444,6 +468,3 @@ class ObjectConfigParams(dict):
             String representation of the instance.
         """
         return f"ObjectConfigParams({super().__repr__()})"
-    
-
-

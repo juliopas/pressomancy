@@ -5,7 +5,7 @@ import warnings
 class H5DataSelector:
     """
     A simplified interface to access simulation data stored in an HDF5 file. The H5DataSelector maintains internal slice information for timesteps (axis 0) and particles (axis 1) and supports chaining via its accessor properties:
-    
+
       - .timestep: Provides an interface for slicing/iterating over timesteps.
       - .particles: Provides an interface for slicing/iterating over particles.
 
@@ -23,14 +23,28 @@ class H5DataSelector:
       # Retrieve property data (e.g., positions):
       pos = data.pos  # This calls get_property("pos")
 
+      # Retrieve saved frame counters and physical times:
+      step = data.step
+      time = data.time
+
       # Connectivity-based particle selection:
       filament_particles = data.select_particles_by_object("Filament", connectivity_value=0)
       monomer_subset = filament_particles.particles[10:20].timestep[5]
 
+      # Predicate-based particle selection:
+      final_type = data.select_particles_by_object(
+          "Filament",
+          connectivity_value=0,
+          predicate=lambda subset: subset.type == 1,
+      )
+
     **Notes:**
       - Direct indexing on a top-level H5DataSelector is disallowed to ensure explicit axis selection. Use the accessor properties (.timestep or .particles) for slicing.
+      - `.timestep[...]` slices by frame index on axis 0. It does not query the stored HDF5 `step` or `time` datasets.
+      - `.step` and `.time` read from the particle group's `pos/step` and `pos/time` datasets. These are treated as the canonical particle timeline; the writer stores the same step/time values for every particle property in a frame.
       - Iteration and len() are only defined on the accessor objects.
-    
+      - Connectivity predicates are evaluated on the current H5DataSelector view. They select particles, not timesteps: the returned selector preserves the current timestep slice and only narrows the particle slice.
+
     **Raises:**
       - ValueError if the dimensions of the stored property datasets are inconsistent.
     """
@@ -47,7 +61,7 @@ class H5DataSelector:
 
         # Get step array (from particle 0)
         self._times_array = h5_file[f"particles/{particle_group}/id/time"][self.ts_slice]
-        
+
         # Set sys group in its little wrapper to be nicer and more seperate from the rest of the suspicious looking groups - like connectivity, for real, what is that supossed to mean. We are indeed all connected, in a way, I guess, so why separate connections based on some set and arbitrary rule. And I stopped there. Long day of coding.
         # TO IMPLEMENT
 
@@ -65,6 +79,7 @@ class H5DataSelector:
             Returns a dict with keys for each member, and a '_meta' key containing:
               - type: 'Group'
               - members: list of member names
+              - attributes: dict of group attributes
 
         For datasets:
             Returns a dict containing:
@@ -83,7 +98,8 @@ class H5DataSelector:
         if isinstance(obj, h5py.Group):
             tree['_meta'] = {
                 'type': 'Group',
-                'members': list(obj.keys())
+                'members': list(obj.keys()),
+                'attributes': {attr: obj.attrs[attr] for attr in obj.attrs}
             }
             for key, item in obj.items():
                 tree[key] = self._build_h5_tree(item)
@@ -147,7 +163,7 @@ class H5DataSelector:
 
     def __len__(self):
         raise TypeError("len() is ambiguous on H5DataSelector objects. Use '.timestep' or '.particles' accessor to get the length of the relevant axis.")
-    
+
     def __add__(self, ds):
         return self._join_with(ds)
 
@@ -174,7 +190,7 @@ class H5DataSelector:
                 process(t)
         """
         return TimestepAccessor(self)
-        
+
     def time(self, time):
         """
         Accessor for slicing/iterating over the timestep axis, with the simulation step values, insted of indexes.
@@ -199,6 +215,14 @@ class H5DataSelector:
             return self.timestep[int(matches[0])] # get tuple if many, or int if only one match
         else:
             return self.timestep[list(matches)]
+
+    def _with_timestep(self, ts_slice):
+        return H5DataSelector(
+            self.h5_file,
+            self.particle_group,
+            ts_slice=ts_slice,
+            pt_slice=self.pt_slice,
+        )
 
     @property
     def particles(self):
@@ -235,7 +259,7 @@ class H5DataSelector:
                 return np.asarray(ds[:,:,:])[self.ts_slice, self.pt_slice, 0]
             else:
                 return np.asarray(ds[:,:,:])[self.ts_slice, self.pt_slice, :]
-        
+
         else: # for bonds (special case, because of vlen arrays)
             if hasattr(self.ts_slice, '__iter__'):
                 ts_slice_flag=False
@@ -261,40 +285,90 @@ class H5DataSelector:
                         bond_list_single_ts.append([])
                 bond_list_all_ts_slice.append(bond_list_single_ts[0] if pt_slice_flag else bond_list_single_ts)
             return bond_list_all_ts_slice[0] if ts_slice_flag else np.asarray(bond_list_all_ts_slice, dtype=object)
-    
+
     @property
-    def times_array(self):
-        return self._times_array
-    
+    def step(self):
+        """Return saved frame counters from the particle group's canonical `pos/step` dataset."""
+        ds = self.h5_file[f"particles/{self.particle_group}/pos/step"]
+        return ds[self.ts_slice]
+
+    @property
+    def time(self):
+        """Return saved physical times from the particle group's canonical `pos/time` dataset."""
+        ds = self.h5_file[f"particles/{self.particle_group}/pos/time"]
+        return ds[self.ts_slice]
+
+    def get_box(self):
+        """Return fixed-box metadata for the current particle group."""
+        box_path = f"particles/{self.particle_group}/box"
+        box_group = self.h5_file[box_path]
+        dimension = int(box_group.attrs["dimension"])
+        boundary_raw = np.atleast_1d(box_group.attrs["boundary"]).tolist()
+        boundary = tuple(
+            item.decode("ascii") if isinstance(item, bytes) else str(item)
+            for item in boundary_raw
+        )
+        edges = np.asarray(box_group["edges"][:], dtype=np.float64)
+        return {
+            "dimension": dimension,
+            "boundary": boundary,
+            "edges": edges,
+        }
+
     def get_connectivity_values(self, object_name, predicate=None, fast=False):
         """
-        Return the raw connectivity pairs for a given object, using the
-        ParticleHandle_to_<object_name> dataset.
+        Return object IDs present in ``ParticleHandle_to_<object_name>``.
+
+        When a predicate is provided, each candidate object ID is first mapped
+        to the particle indices of the current particle group. This keeps the
+        returned per-object subset aligned with ``particles/<particle_group>``
+        even when ``ParticleHandle_to_<object_name>`` is not in that particle
+        group's storage order.
+
+        Connectivity IDs are static. The predicate is therefore an object-ID
+        filter: it may inspect particle properties on the per-object subset, but
+        it must return one scalar truth value for the candidate object ID. If it
+        inspects time-dependent arrays, reduce them explicitly with ``any``,
+        ``all``, or an explicit timestep selection.
 
         Parameters
         ----------
         object_name : str
             Name of the connected object type (e.g. "Filament").
+        predicate : callable, optional
+            Function that accepts a per-object H5DataSelector subset and returns
+            True when that object ID should be kept. The subset is provided only
+            for inspection and preserves the current selector's timestep slice.
+        fast : bool, optional
+            If True, assume the predicate is prefix-monotone over the sorted
+            object IDs and use a divide-and-conquer search for the cutoff.
 
         Returns
         -------
-        ndarray of shape (N, 2)
-            Array of [particle_id, object_index] pairs.
+        ndarray of shape (N,)
+            Array of object IDs.
         """
         ds_path = f"connectivity/{self.particle_group}/ParticleHandle_to_{object_name}"
-        obj_ids=self.h5_file[ds_path][:,-1]
+        ds_father_path = f"connectivity/{self.particle_group}/ParticleHandle_to_{self.particle_group}"
+        obj_connectivity = self.h5_file[ds_path][:]
+        obj_ids = obj_connectivity[:,-1]
+        father_particle_handles = self.h5_file[ds_father_path][:,0]
         ids=np.unique(obj_ids)
         ret_ids=[]
+
+        def subset_for_object_id(object_id):
+            object_particle_handles = obj_connectivity[obj_ids == object_id, 0]
+            filter_mask = np.isin(father_particle_handles, object_particle_handles)
+            particle_indices = np.flatnonzero(filter_mask).tolist()
+            return H5DataSelector(self.h5_file, self.particle_group, ts_slice=self.ts_slice, pt_slice=particle_indices)
+
         def divide_and_conquer():
             nonlocal obj_ids, ids, predicate
             left=0
             right=len(ids)
             while left<right:
                 mid = (left+right) // 2
-                filter_mask = obj_ids==ids[mid]
-                particle_indices = np.flatnonzero(filter_mask)
-                particle_indices = particle_indices.tolist()
-                subset = H5DataSelector(self.h5_file, self.particle_group, ts_slice=self.ts_slice, pt_slice=particle_indices)
+                subset = subset_for_object_id(ids[mid])
                 if predicate(subset):
                     left=mid+1
                 else:
@@ -306,30 +380,49 @@ class H5DataSelector:
                 ret_ids=ids[:up_from_me]
             else:
                 for i in ids:
-                    filter_mask = obj_ids==i
-                    particle_indices = np.flatnonzero(filter_mask)
-                    particle_indices = particle_indices.tolist()
-                    subset = H5DataSelector(self.h5_file, self.particle_group, ts_slice=self.ts_slice, pt_slice=particle_indices)
+                    subset = subset_for_object_id(i)
                     if predicate(subset):
                         ret_ids.append(i)
                 ret_ids=np.array(ret_ids)
-                
+
         else:
             ret_ids=ids
         return ret_ids
 
     def select_particles_by_object(self, object_name, connectivity_value=None,predicate=None):
         """
-        Select a subset of particles based on a connectivity dataset. The indices are sorted and stored as a list (for correct slicing behavior).
-        A predicate can be aplied to further specify the selection criteria.
+        Select a subset of particles based on a connectivity dataset.
+
+        The connectivity table stores particle handles, so this method maps
+        those handles back to indices in ``particles/<particle_group>`` before
+        composing a new particle slice. The current timestep slice is preserved.
+
+        A predicate can further narrow the selected particles. It is evaluated on
+        the current H5DataSelector subset, not on individual particle objects.
+        Predicate masks select particles only:
+
+        - a 1D mask must have shape ``(n_particles,)``;
+        - a 2D mask must have shape ``(n_timesteps, n_particles)`` and is
+          reduced with ``all`` over the current timestep context.
+
+        This means ``predicate=lambda subset: subset.type == value`` keeps
+        particles matching the value at every timestep in the current view,
+        while ``predicate=lambda subset: subset.timestep[-1].type == value``
+        classifies particles by the last timestep of the current view and then
+        returns those particles across the original timestep slice.
 
         Args:
-            object_name (str): Name of the connectivity object (e.g., "Filament").
-            connectivity_value ([int, float or None], optional): The value to match in the connectivity map. Defaults to all values: None.
-            predicate (callable): Function taking an H5DataSelector and returning a boolean mask.
+            object_name (str):
+                Name of the connectivity object (e.g., "Filament").
+            connectivity_value (int or float or array-like or None):
+                Object ID value or values to match in the connectivity map.
+                Defaults to None (all values).
+            predicate (callable):
+                Function taking an H5DataSelector and returning a particle mask as described above.
 
         Returns:
-            H5DataSelector: A new selector with the particle slice set to the selected indices.
+            H5DataSelector: A new selector with the same timestep slice and the
+            particle slice set to the selected particle indices.
         """
         # Get particles' ids from connectivity of object_name
         ds_name = f"connectivity/{self.particle_group}/ParticleHandle_to_{object_name}"
@@ -345,7 +438,6 @@ class H5DataSelector:
             connectivity_value=np.atleast_1d(connectivity_value)
             filter_mask = np.isin(connectivity_map, connectivity_value)
             object_particle_indices = np.ravel(self.h5_file[ds_name][:,0][filter_mask])
-        
         # Get the correct indices for the selected particles from the parent's particle list
         father_particles_indices = self.h5_file[ds_father_name][:,0]
         filter_mask = np.isin(father_particles_indices, object_particle_indices)
@@ -353,75 +445,16 @@ class H5DataSelector:
         subset=H5DataSelector(self.h5_file, self.particle_group, ts_slice=self.ts_slice, pt_slice=particle_indices.tolist())
 
         if predicate is not None:
-            # apply a predicate funtion to the subset
-            mask=predicate(subset).flatten()
+            mask = np.asarray(predicate(subset))
+            while mask.ndim > 1 and mask.shape[-1] == 1:
+                mask = np.squeeze(mask, axis=-1)
+            if mask.ndim == 2:
+                mask = np.all(mask, axis=0)
+            elif mask.ndim != 1:
+                raise ValueError("Predicate must resolve to a particle mask.")
             particle_indices=particle_indices[mask]
             subset=H5DataSelector(self.h5_file, self.particle_group, ts_slice=self.ts_slice, pt_slice=particle_indices.tolist())
         return subset
-    
-    def select_particles_by_predicate(self, predicate):
-        """
-        Select particles by applying a predicate, without pre-filtering by a connectivity value.
-
-        Args:
-            predicate (callable): Function taking an H5DataSelector and returning a boolean mask.
-
-        Returns:
-            H5DataSelector: Selector with particle slice set to the indices passing the predicate.
-        """
-        
-        # Apply predicate to the H5DataSelector
-        mask = np.asarray(predicate(self)).flatten()
-
-        # Keep only the particle indices where the predicate is True.
-        if isinstance(self.pt_slice, slice):
-            try:
-                new_pt_slice = np.asarray(_slice_to_list(self.pt_slice), dtype=int)[mask].tolist()
-            except:
-                # Get number of particles from the parent group of the particle group
-                ds_name = f"connectivity/{self.particle_group}/ParticleHandle_to_{self.particle_group}"
-                # Take ALL particles represented by rows of the connectivity dataset (row index == particle index).
-                n_rows = self.h5_file[ds_name].shape[0]
-                new_pt_slice = np.arange(n_rows, dtype=int)[mask].tolist()
-        elif isinstance(self.pt_slice, list):
-            new_pt_slice = np.asarray(self.pt_slice, dtype=int)[mask].tolist()
-        elif isinstance(self.pt_slice, int):
-            new_pt_slice = self.pt_slice if mask.all() else []
-
-        return H5DataSelector(self.h5_file, self.particle_group,
-                            ts_slice=self.ts_slice, pt_slice=new_pt_slice)
-    
-    def select_particles_by_type(self, type):
-        """
-        Select particles by type.
-        
-        If slice has multiple time steps, assume that particles cannot change type and connects them to the time of the first time step.
-
-        Args:
-            type (int or tuple of int): The espresso particle type.
-
-        Returns:
-            H5DataSelector: Selector with particle slice set to the indices of the particles of type type.
-        """
-        return self.select_particles_by_predicate(lambda ds: np.isin(ds.timestep[0].get_property("type"), type))
-    
-    def by_id(self, id):
-        """
-        Select particles by type.
-        
-        If slice has multiple time steps, assume that particles cannot change type and connects them to the time of the first time step.
-
-        Args:
-            type (int): The espresso particle type.
-
-        Returns:
-            H5DataSelector: Selector with particle slice set to the indices of the particles of type type.
-        """
-        particles = self.select_particles_by_predicate(lambda ds: np.asarray(ds.timestep[0].get_property("id")) == id)
-        assert len(particles.pt_slice) == 1
-        return H5DataSelector(particles.h5_file, particles.particle_group,
-                            ts_slice=particles.ts_slice, pt_slice=particles.pt_slice[0])
-
 
     def get_connectivity_map(self, parent_key, child_key):
         """
@@ -503,7 +536,7 @@ class H5DataSelector:
         conn = self.get_connectivity_map(parent_key, child_key)
         parent_ids = conn[conn[:, 1] == child_id, 0]
         return sorted(int(pid) for pid in parent_ids)
-    
+
     def _join_with(self, ds):
         """
         Joins two H5DataSelector objects by joining their time slices and particle slices.
@@ -538,7 +571,7 @@ class H5DataSelector:
             return self.__dict__[attr]
         except KeyError:
             return self.get_property(attr)
-        
+
     # def __setattr__(self, name, value): # does this make sense here? It seems much more convinient to use the funcitons, anyway
     #     """
     #     Block direct mutation of properties.
@@ -564,19 +597,117 @@ class H5DataSelector:
                 f"ts_slice={self.ts_slice}, pt_slice={self.pt_slice})>")
 
 
+class H5ObservableSelector:
+    """
+    A simplified interface to access observable data stored in an HDF5 file.
+
+    The selector maintains internal slice information for the timestep axis only
+    and exposes direct access to the stored ``step``, ``time``, and ``value``
+    datasets under ``/observables/<name>``.
+    """
+    def __init__(self, h5_file, observable_name, ts_slice=None):
+        self.h5_file = h5_file
+        self.observable_name = observable_name
+        self.metadata = self._build_h5_tree(h5_file)
+        self.common_dims = self.sanity_check(self.metadata, self.observable_name)
+        self.ts_slice = ts_slice if ts_slice is not None else slice(None)
+
+    def __getitem__(self, key):
+        raise TypeError(
+            "Direct indexing on a H5ObservableSelector is not allowed. "
+            "Use the 'timestep' accessor for slicing instead."
+        )
+
+    def _build_h5_tree(self, obj):
+        tree = {}
+        if isinstance(obj, h5py.Group):
+            tree['_meta'] = {
+                'type': 'Group',
+                'members': list(obj.keys())
+            }
+            for key, item in obj.items():
+                tree[key] = self._build_h5_tree(item)
+        elif isinstance(obj, h5py.Dataset):
+            tree = {
+                'type': 'Dataset',
+                'shape': obj.shape,
+                'dtype': str(obj.dtype),
+                'attributes': {attr: obj.attrs[attr] for attr in obj.attrs}
+            }
+        return tree
+
+    def sanity_check(self, metadata, observable_name):
+        try:
+            observable_meta = metadata['observables'][observable_name]
+        except KeyError:
+            raise ValueError(f"Observable '{observable_name}' not found in metadata.")
+
+        try:
+            step_shape = observable_meta['step']['shape']
+            time_shape = observable_meta['time']['shape']
+            value_shape = observable_meta['value']['shape']
+        except KeyError as exc:
+            raise ValueError(
+                f"Observable '{observable_name}' must contain step, time, and value datasets."
+            ) from exc
+
+        common_dims = (step_shape[0], time_shape[0], value_shape[0])
+        if len(set(common_dims)) != 1:
+            raise ValueError(
+                f"Observable '{observable_name}' has inconsistent step/time/value lengths: {common_dims}"
+            )
+        return (value_shape[0],)
+
+    def __iter__(self):
+        raise TypeError("H5ObservableSelector objects are not iterable. Use the '.timestep' accessor for iteration.")
+
+    def __len__(self):
+        raise TypeError("len() is ambiguous on H5ObservableSelector objects. Use '.timestep' to get the number of selected frames.")
+
+    @property
+    def timestep(self):
+        return TimestepAccessor(self)
+
+    def _with_timestep(self, ts_slice):
+        return H5ObservableSelector(
+            self.h5_file,
+            self.observable_name,
+            ts_slice=ts_slice,
+        )
+
+    @property
+    def value(self):
+        ds = self.h5_file[f"observables/{self.observable_name}/value"]
+        return ds[self.ts_slice, ...]
+
+    @property
+    def step(self):
+        ds = self.h5_file[f"observables/{self.observable_name}/step"]
+        return ds[self.ts_slice]
+
+    @property
+    def time(self):
+        ds = self.h5_file[f"observables/{self.observable_name}/time"]
+        return ds[self.ts_slice]
+
+    def __repr__(self):
+        return (f"<H5ObservableSelector(observable_name={self.observable_name}, "
+                f"ts_slice={self.ts_slice})>")
+
+
 class TimestepAccessor:
     """
-    An accessor for slicing and iterating over timesteps of a H5DataSelector.
+    An accessor for slicing and iterating over timesteps of an HDF5 selector.
 
-    It composes new timestep slices with any existing slice and enables iteration
-    where each iteration yields a H5DataSelector corresponding to a single timestep.
+    It composes new timestep slices with any existing slice and delegates selector
+    reconstruction to the parent selector.
     """
     def __init__(self, sim_data):
         """
         Initialize the TimestepAccessor.
 
         Args:
-            sim_data (H5DataSelector): The parent data selector instance.
+            sim_data (H5DataSelector or H5ObservableSelector): The parent selector.
         """
         self.sim_data = sim_data
 
@@ -588,21 +719,23 @@ class TimestepAccessor:
             key (int, slice, or list/tuple): The new timestep index or slice.
 
         Returns:
-            H5DataSelector: A new selector with the updated timestep slice.
+            H5DataSelector or H5ObservableSelector: A new selector with the
+            updated timestep slice.
 
         Raises:
             IndexError: If the new index is out of bounds relative to the effective timestep indices.
         """
         total_timesteps = self.sim_data.common_dims[0]
         composed = _compose_index(self.sim_data.ts_slice, key, total_timesteps)
-        return H5DataSelector(self.sim_data.h5_file, self.sim_data.particle_group, ts_slice=composed, pt_slice=self.sim_data.pt_slice)
+        return self.sim_data._with_timestep(composed)
 
     def __iter__(self):
         """
         Iterate over the effective timestep indices.
 
         Yields:
-            H5DataSelector: Each selector has ts_slice set to a single timestep.
+            H5DataSelector or H5ObservableSelector: Each selector has ts_slice set
+            to a single timestep.
         """
         total_timesteps = self.sim_data.common_dims[0]
         ts_slice = self.sim_data.ts_slice
@@ -613,7 +746,7 @@ class TimestepAccessor:
         else:
             indices = [ts_slice]
         for idx in indices:
-            yield H5DataSelector(self.sim_data.h5_file, self.sim_data.particle_group, ts_slice=idx, pt_slice=self.sim_data.pt_slice)
+            yield self.sim_data._with_timestep(idx)
 
     def __len__(self):
         """
@@ -781,20 +914,20 @@ def _join_index(index_1, index_2):
         slice_test = index_2
     else:
         slice_test = None
-    
+
     if isinstance(slice_test, slice) and slice_test.start is None and slice_test.stop is None and slice_test.step is None:
         return slice_test
-    
+
     if isinstance(index_1, int) and isinstance(index_2, int) and index_1 == index_2:
         # if both indexes tha were joined are of type int and of equal value
         return index_1
-        
+
     list_1 = _convert_index_to_list(index_1)
     list_2 = _convert_index_to_list(index_2)
 
     return list(set(list_1 + list_2))
 
-def _convert_index_to_list(index):    
+def _convert_index_to_list(index):
     # Convert the existing index to an explicit list.
     if isinstance(index, slice):
         list_index = _slice_to_list(index)
@@ -809,7 +942,7 @@ def _convert_index_to_list(index):
 def _slice_to_list(slice_, len_=None):
         if not isinstance(slice_, slice):
             raise TypeError(f"Funciton expected a slice as an input: {type(slice_)}")
-        
+
         if len_ is not None:
             # if the lenght of the final list is know
             return list(range(*slice_.indices(len_)))

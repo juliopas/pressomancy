@@ -10,3 +10,4 @@ doc/sphinx/build
 CLAUDE.md
 .claude/
 .claudeignore
+AGENT.md
