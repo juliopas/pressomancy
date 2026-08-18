@@ -10,7 +10,7 @@ class SimulationTest(BaseTestCase):
 
     sph_diam=1
     sph_rad=0.5*sph_diam
-    
+
     def tearDown(self) -> None:
         self.cleanup()
 
@@ -38,7 +38,7 @@ class SimulationTest(BaseTestCase):
 
     def test_set_private_attr(self):
         try:
-            sim_inst._no_objects = 3
+            sim_inst.no_objects = 3
             success = False
         except:
             success = True

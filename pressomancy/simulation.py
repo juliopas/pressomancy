@@ -12,6 +12,7 @@ import pickle
 from itertools import combinations_with_replacement
 from pressomancy.object_classes import *
 from pressomancy.helper_functions import *
+from pressomancy.magnetodynamics import configure_magnetization, contraction_ratio
 import logging
 import h5py
 from collections import Counter
@@ -95,8 +96,11 @@ class Simulation():
         avoid_explosion(F_TOL, MAX_STEPS, F_incr, I_incr):
             Caps forces iteratively to avoid simulation instabilities due to initial overlaps.
 
-        magnetize(part_list, dip_magnitude, H_ext):
-            Applies Langevin magnetization to compute dipole moments of particles.
+        set_magnetization_model(part_list, model, dipm_sat, mag_susc_0):
+            Makes virtual particles magnetizable under one of espresso's native magnetization models.
+
+        probe_magnetization_convergence(part_list, n_iter):
+            Measures how fast the mutual magnetization contracts, without advancing the simulation.
 
         set_H_ext(H):
             Configures an external homogeneous magnetic field in the simulation.
@@ -122,46 +126,42 @@ class Simulation():
     object_permissions=['part_types']
     _sys=espressomd.System
     def __init__(self, box_dim, use_espresso_checkpoint_system=None):
-        # Private attributes (# with public properties)
-        self._no_objects = 0 # .no_objects
-        self._objects = [] # .objects
-        self._part_types = PartDictSafe({}) # .part_types
-        self._partitioned=None
-        self._part_positions=[]
-        self._volume_size=None
-        self._volume_centers=[]
+        # Object bookkeeping
+        self.no_objects = 0
+        self.objects = []
+        self.part_types = PartDictSafe({})
 
-        # Public attributes
-        # espresso system is accessed by .sys, e.g. self.sys.part.all()
-        # I/O
-        self.io_dict={'h5_file': None,'properties':[('id',1), ('type',1), ('pos',3),('pos_folded',3), ('director',3),('image_box',3), ('f',3),('dip',3)], 'bonds':None,'flat_part_view':defaultdict(list),'registered_group_type': None}
-        self._src_params_set=False
-
-        # System numbers stuff
-        self.seed = int.from_bytes(os.urandom(2), sysos.byteorder)
-        self.kT = 1.
+        # Partitioning stuff
         self.partitioned=None
         self.part_positions=[]
         self.volume_size=None
         self.volume_centers=[]
+
+        # espresso system is accessed by .sys, e.g. self.sys.part.all()
+        # I/O
         self.io_dict={
             'h5_file': None,
             'properties':[('id',1), ('type',1), ('pos',3),('pos_folded',3), ('director',3),('image_box',3), ('f',3),('dip',3)],
+            'bonds':None,
             'flat_part_view':defaultdict(list),
             'registered_group_type': None,
             'registered_observables': {},
         }
         self.src_params_set=False
+
+        # System numbers stuff
+        self.seed = int.from_bytes(os.urandom(2), sysos.byteorder)
+        self.kT = 1.
         self.author_name="unknown"
         self.author_email="unknown"
         # self.sys=espressomd.System(box_l=box_dim) is added and managed by the singleton decrator!
 
     def set_init_src(self, path, pos_ori_src_type=['real',], type_to_type_map=[], prop_to_prop_map=[], declare_types=[]):
-        self._src_path_h5=path
-        self._pos_ori_src_type=pos_ori_src_type
-        self._type_to_type_map=type_to_type_map
-        self._prop_to_prop_map=prop_to_prop_map
-        self._src_params_set=True
+        self.src_path_h5=path
+        self.pos_ori_src_type=pos_ori_src_type
+        self.type_to_type_map=type_to_type_map
+        self.prop_to_prop_map=prop_to_prop_map
+        self.src_params_set=True
         for typ_decl in declare_types:
             for x,y in typ_decl.items():
                 self.part_types[x]=y
@@ -173,7 +173,7 @@ class Simulation():
         np.random.seed(seed=self.seed)
         logging.info(f'core.seed: {self.seed}')
         self.sys.periodicity = (True, True, True)
-        self.sys.time_step = time_step
+        self.sys.time_step = timestep
         self.sys.cell_system.skin = 0.5
         self.sys.min_global_cut = min_global_cut
         if espressomd.version.major()==4:
@@ -190,7 +190,7 @@ class Simulation():
         :param action: callable | A function that takes the current attribute value as input and modifies it.
         :return: None
         """
-        if hasattr(self, attribute_name) and attribute_name in self._object_permissions:
+        if hasattr(self, attribute_name) and attribute_name in self.object_permissions:
             action(getattr(self,attribute_name))
 
         else:
@@ -202,7 +202,7 @@ class Simulation():
 
         Workaround until espressomd.BondedInteractions.reset() is fixed.
         """
-        for (type1, type2) in combinations_with_replacement(tuple(self._part_types.values()), 2):
+        for (type1, type2) in combinations_with_replacement(tuple(self.part_types.values()), 2):
             self.sys.non_bonded_inter[type1,type2].wca.deactivate()
 
             # self.sys.non_bonded_inter[type1,type2].tabulated.deactivate()
@@ -241,23 +241,23 @@ class Simulation():
         temp_dict={}
         for element in iterable_list:
             if element.params['associated_objects'] != None:
-                check_any=any(associated in self._objects for associated in element.params['associated_objects'])
+                check_any=any(associated in self.objects for associated in element.params['associated_objects'])
                 if check_any:
-                    check_all=all(associated in self._objects for associated in element.params['associated_objects'])
+                    check_all=all(associated in self.objects for associated in element.params['associated_objects'])
                     if not check_all:
                         raise ValueError(f"Some associated objects {element.params['associated_objects']} but not all associated objects are stored in the simulation. This is a sign that smth major is fucked...Suffer in silence.")
                 else:
                     self.store_objects(element.params['associated_objects'],report=False)
-            assert element not in self._objects, "Lists have common elements!"
+            assert element not in self.objects, "Lists have common elements!"
             self.sanity_check(element)
             element.modify_system_attribute = self.modify_system_attribute
-            self._objects.append(element)
+            self.objects.append(element)
             for key, val in element.part_types.items():
                 temp_dict[key]=val
-            self._no_objects += 1
-        self._part_types.update(temp_dict)
+            self.no_objects += 1
+        self.part_types.update(temp_dict)
         if report:
-            names = [element.__class__.__name__ for element in self._objects]
+            names = [element.__class__.__name__ for element in self.objects]
             counts = Counter(names)
             formatted = ", ".join(f"{count} {name}" for name, count in counts.items())
             logging.info(f"{formatted} stored")
@@ -292,7 +292,7 @@ class Simulation():
             positions, orientations=self._get_pos_ori_from_src(objects)
         else:
             # centeres, polymer_positions = partition_cuboid_volume_oriented_rectangles(big_box_dim=self.sys.box_l, num_spheres=len(filaments), small_box_dim=np.array([filaments[0].sigma, filaments[0].sigma, filaments[0].size]), num_monomers=filaments[0].n_parts)
-            if len(self._part_positions)== 0:
+            if len(self.part_positions)== 0:
                 # First placement: generate exactly len(objects) positions.
                 centeres, positions, orientations = partition_cuboid_volume(
                     box_lengths=self.sys.box_l,
@@ -300,10 +300,10 @@ class Simulation():
                     sphere_diameter=objects[0].params['size'],
                     routine_per_volume=objects[0].build_function
                 )
-                self._volume_centers.append(centeres)
-                self._part_positions.append(positions)
-                self._volume_size = objects[0].params['size']
-            elif len(self._part_positions) == 1:
+                self.volume_centers.append(centeres)
+                self.part_positions.append(positions)
+                self.volume_size = objects[0].params['size']
+            elif len(self.part_positions) == 1:
                 # Subsequent placements: search for positions without overlaps.
                 factor = 1
                 while True:
@@ -317,9 +317,9 @@ class Simulation():
                         current_lattice_centers=centeres,
                         current_lattice_grouped_part_pos=positions,
                         current_lattice_diam=objects[0].params['size'],
-                        other_lattice_centers=self._volume_centers[0],
-                        other_lattice_grouped_part_pos=self._part_positions[0],
-                        other_lattice_diam=self._volume_size,
+                        other_lattice_centers=self.volume_centers[0],
+                        other_lattice_grouped_part_pos=self.part_positions[0],
+                        other_lattice_diam=self.volume_size,
                         box_lengths=self.sys.box_l
                         )
                     mask=[key for key,val in res.items() if all(val)]
@@ -368,10 +368,10 @@ class Simulation():
         logging.info(f"{formatted} set!!!")
 
     def mark_for_collision_detection(self, object_type=Quadriplex, part_type=666):
-        assert any(isinstance(ele, object_type) for ele in self._objects), "method assumes simulation holds correct type object"
+        assert any(isinstance(ele, object_type) for ele in self.objects), "method assumes simulation holds correct type object"
 
-        self._part_types['marked'] = 666
-        objects_iter = [ele for ele in self._objects if isinstance(ele, object_type)]
+        self.part_types['marked'] = 666
+        objects_iter = [ele for ele in self.objects if isinstance(ele, object_type)]
         assert all((hasattr(ob, 'mark_covalent_bonds') and callable(getattr(ob, 'mark_covalent_bonds')))
                    for ob in objects_iter), "method requires that stored objects have mark_covalent_bonds() method"
         for obj_el in objects_iter:
@@ -400,7 +400,7 @@ class Simulation():
 
         Interaction length is allways determined from sigma.
         '''
-        logging.info(f'part types available {self._part_types.keys()} ')
+        logging.info(f'part types available {self.part_types.keys()} ')
         logging.info(f'WCA interactions initiated for keys: {key}')
         for key_el, key_el2 in combinations_with_replacement(key, 2):
             self.sys.non_bonded_inter[
@@ -424,7 +424,7 @@ class Simulation():
             sigma), 'epsilon and sigma must be specified explicitly for each type pair'
         logging.info('WCA interactions initiated')
         for (key_el, key_el2), eps, sgm in zip(pairs, wca_eps, sigma):
-            self.sys.non_bonded_inter[self._part_types[key_el], self._part_types[key_el2]
+            self.sys.non_bonded_inter[self.part_types[key_el], self.part_types[key_el2]
                                       ].wca.set_params(epsilon=eps, sigma=sgm)
 
     def set_vdW(self, key=('nonmagn',), lj_eps=1., lj_sigma=1.):
@@ -646,96 +646,43 @@ class Simulation():
         self.sys.time_step=timestep_og
         logging.info('explosions avoided sucessfully!')
 
-    def magnetize(self, part_list, dip_magnitude, H_ext):
+    def set_magnetization_model(self, part_list, model, dipm_sat, mag_susc_0):
         '''
-        Apply the langevin magnetisation law to determine the magnitude of the dipole moment of each particle in part_list, projected along H_tot=H_ext+tot_dip_fld. part_list should be a iterable that contains espresso particleHandle objects.
+        Makes every particle in part_list magnetizable under one of espresso's magnetization models. The particles are expected to be virtual sites already bound to a real anchor, which is the case for virtuals created by object methods such as Filament.add_dipole_to_embedded_virt. Objects that own their magnetizable particles, such as PointDipoleMagnetizable, configure them at construction instead and do not need this method.
+
+        The model is evaluated natively by espresso every timestep, from the total field H_tot=H_ext+dip_fld, so this method is called once at setup and not inside the integration loop.
 
         :param part_list: iterable(ParticleHandle) | ParticleSlice could work but prefer to wrap with the list() constructor.
-        :param dip_magnitude: float
-        :param H_ext: float
+        :param model: str | magnetization model name, see pressomancy.magnetodynamics.MAGNETIZATION_MODELS
+        :param dipm_sat: float | saturation moment, must be > 0
+        :param mag_susc_0: float | initial susceptibility, must be >= 0
 
         :return: None
 
         '''
-        if not api_agnostic_feature_check('DIPOLE_FIELD_TRACKING'):
-            name = f"{type(self).__name__}.{inspect.currentframe().f_code.co_name}"
-            raise MissingFeature(f"{name} requires DIPOLE_FIELD_TRACKING. Please enable it in your ESPResSo installation.")
+        count = 0
         for part in part_list:
-            H_tot = part.dip_fld+H_ext
-            tri = np.linalg.norm(H_tot)
-            if tri < 1e-5:
-                part.dipm = 0.
-            else:
-                dip_tri = dip_magnitude*tri #/ self.kT
-                inv_dip_tri = 1.0/(dip_tri)
-                inv_tanh_dip_tri = 1.0/np.tanh(dip_tri)
-                part.dip = dip_magnitude/tri*(inv_tanh_dip_tri-inv_dip_tri)*H_tot
-            logging.info(part.dip)
+            configure_magnetization(part, model=model, dipm_sat=dipm_sat,
+                                    mag_susc_0=mag_susc_0)
+            count += 1
+        logging.info(f"magnetization model '{model}' set on {count} particles "
+                     f"with dipm_sat={dipm_sat}, mag_susc_0={mag_susc_0}")
 
-    def magnetize_lin(self, part_list, dip_magnitude, H_ext, Xi=1.):
+    def probe_magnetization_convergence(self, part_list, n_iter=50, tol=1e-12):
         '''
-        Apply a linear magnetisation law to determine the magnitude of the dipole moment of each particle in part_list, projected along H_tot=H_ext+tot_dip_fld. part_list should be a iterable that contains espresso particleHandle objects.
+        Measures how fast the mutual magnetization of part_list contracts, without advancing the simulation. Thin wrapper over pressomancy.magnetodynamics.contraction_ratio, see that function for what the numbers mean and for the saturation caveat.
 
-        :param part_list: iterable(ParticleHandle) | ParticleSlice could work but prefer to wrap with the list() constructor.
-        :param dip_magnitude: float
-        :param H_ext: float
+        :param part_list: iterable(ParticleHandle) | the magnetizable particles to watch
+        :param n_iter: int (=50) | number of fixed point iterates, must be at least 2
+        :param tol: float (=1e-12) | increments at or below this count as converged
 
-        :return: None
+        :return: np.ndarray | successive contraction ratios
 
         '''
-        for part in part_list:
-            H_tot = part.dip_fld+H_ext
-            tri = np.linalg.norm(H_tot)
-            if Xi * tri >= 1.:
-                part.dip = H_tot / tri
-            elif tri < 1e-5:
-                part.dip = H_tot/tri * 1e-6
-            else:
-                part.dip = dip_magnitude*H_tot*Xi
-            logging.info(part.dip)
-
-    def magnetize_froelich_kennelly(self, part_list, dip_magnitude, H_ext, Xi=0.5):
-        '''
-        Apply the empirical Frölich-Kennelly magnetisation law to determine the magnitude of the dipole moment of each particle in part_list, projected along H_tot=H_ext+tot_dip_fld. part_list should be a iterable that contains espresso particleHandle objects.
-
-        :param part_list: iterable(ParticleHandle) | ParticleSlice could work but prefer to wrap with the list() constructor.
-        :param dip_magnitude: float
-        :param H_ext: float
-        :param Xi: float (=0.5) | Susceptibility
-
-        :return: None
-
-        '''
-        for part in part_list:
-            H_tot = part.dip_fld+H_ext
-            tri = np.linalg.norm(H_tot)
-            if tri < 1e-5:
-                part.dip = H_tot/tri * 1e-6
-            else:
-                part.dip = Xi*dip_magnitude / (dip_magnitude + Xi*tri) * H_tot
-            logging.info(part.dip)
-
-    def magnetize_dumb(self, part_list, dip_magnitude, H_ext):
-        '''
-        Apply the langevin magnetisation law to determine the magnitude of the dipole moment of each particle in part_list, projected along H_ext. part_list should be a iterable that contains espresso particleHandle objects.
-
-        :param part_list: iterable(ParticleHandle) | ParticleSlice could work but prefer to wrap with the list() constructor.
-        :param dip_magnitude: float
-        :param H_ext: float
-
-        :return: None
-
-        note: This function does not take into account dipolar fields.
-
-        '''
-        H_ext = np.asarray(H_ext)
-        for part in part_list:
-            tri = np.linalg.norm(H_ext)
-            dip_tri = dip_magnitude*tri #/ self.kT
-            inv_dip_tri = 1.0/(dip_tri)
-            inv_tanh_dip_tri = 1.0/np.tanh(dip_tri)
-            part.dip = dip_magnitude/tri*(inv_tanh_dip_tri-inv_dip_tri)*H_ext
-            logging.info(part.dip)
+        ratios = contraction_ratio(self.sys, part_list, n_iter=n_iter, tol=tol)
+        if len(ratios):
+            logging.info(f'magnetization contraction ratio settled at {ratios[-1]:.4g}')
+        return ratios
 
     def set_H_ext(self, H=(0, 0, 1.)):
         """
@@ -744,10 +691,11 @@ class Simulation():
         :param H: tuple | The external magnetic field vector. Default is (0, 0, 1).
         :return: None
         """
-        for x in self.sys.constraints:
-            if isinstance(x,espressomd.constraints.HomogeneousMagneticField):
-                logging.info(f'Removed old H: {x}')
-                self.sys.constraints.remove(x)
+        stale = [x for x in self.sys.constraints
+                 if isinstance(x, espressomd.constraints.HomogeneousMagneticField)]
+        for x in stale:
+            self.sys.constraints.remove(x)
+            logging.info(f'Removed old H: {x}')
         ExtH = espressomd.constraints.HomogeneousMagneticField(H=list(H))
         self.sys.constraints.add(ExtH)
         logging.info(f'External field set: {ExtH.H}')
@@ -758,13 +706,13 @@ class Simulation():
 
         Sums over all applied homogeneus magnetic fields.
 
-        :return: tuple | The external magnetic field vector.
+        :return: np.ndarray | The external magnetic field vector. Zero vector if no homogeneous magnetic field is applied.
         """
-        HFld=np.asarray(
-            [ele.H for ele in list(self.sys.constraints)
-             if isinstance(ele, espressomd.constraints.HomogeneousMagneticField)]
-                        ).sum(axis=0)
-        return HFld
+        fields = [ele.H for ele in list(self.sys.constraints)
+                  if isinstance(ele, espressomd.constraints.HomogeneousMagneticField)]
+        if not fields:
+            return np.zeros(3)
+        return np.asarray(fields).sum(axis=0)
 
     def init_pickle_dump(self, path_to_dump):
         """
@@ -1139,7 +1087,7 @@ class Simulation():
             particles_group = self.io_dict['h5_file']["particles"]
             candidate_lens=[]
             for grp_typ in group_type:
-                objects_to_register=[obj for obj in self._objects if isinstance(obj,grp_typ)]
+                objects_to_register=[obj for obj in self.objects if isinstance(obj,grp_typ)]
                 for cr in objects_to_register:
                     part,_=cr.get_owned_part()
                     self.io_dict['flat_part_view'][grp_typ.__name__].extend(part)
@@ -1650,30 +1598,30 @@ class Simulation():
         """
 
         # Open the source HDF5 and select the data group matching the requested type.
-        assert self._src_params_set==True, 'src_params_set must be set before calling this method'
-        with h5py.File(self._src_path_h5, "r") as src_file:
+        assert self.src_params_set==True, 'src_params_set must be set before calling this method'
+        with h5py.File(self.src_path_h5, "r") as src_file:
             src_data_grp = H5DataSelector(src_file, particle_group=registered_objs[0].__class__.__name__)
 
             # Discover the set of numeric type IDs present in the source for this group.
             all_src_types_numeric = np.unique(src_data_grp.type)
 
             # Validate that each requested (src_type -> local_type) exists both locally and in the source file.
-            for src_typ, loc_typ in self._type_to_type_map:
+            for src_typ, loc_typ in self.type_to_type_map:
                 assert (
-                    loc_typ in self._part_types or src_typ in self._part_types
+                    loc_typ in self.part_types or src_typ in self.part_types
                 ), (
                     f"local type {loc_typ} or source type {src_typ} not found in "
-                    f"simulation part types {self._part_types}"
+                    f"simulation part types {self.part_types}"
                 )
                 assert (
-                    self._part_types[src_typ] in all_src_types_numeric
+                    self.part_types[src_typ] in all_src_types_numeric
                 ), (
-                    f"source type {src_typ} with numeric id {self._part_types[src_typ]} "
+                    f"source type {src_typ} with numeric id {self.part_types[src_typ]} "
                     f"not found in source data part types {all_src_types_numeric}"
                 )
-            logging.info(f"simulation contains types: {self._part_types}")
+            logging.info(f"simulation contains types: {self.part_types}")
             logging.info(
-                f"src datafile contains types: {self._part_types.key_for(all_src_types_numeric)}"
+                f"src datafile contains types: {self.part_types.key_for(all_src_types_numeric)}"
             )
 
             # Iterate over each connectivity group (i.e., each distinct instance of the group).
@@ -1681,7 +1629,7 @@ class Simulation():
 
                 # Apply each aligned (type mapping, property mapping) pair.
                 for (src_typ, loc_typ), (prop_src, prop_loc) in zip(
-                    self._type_to_type_map, self._prop_to_prop_map
+                    self.type_to_type_map, self.prop_to_prop_map
                 ):
                     logging.info(
                         f"Working on {loc_obj.__class__.__name__}: {loc_obj.who_am_i} type {src_typ}->{loc_typ} prop {prop_src}->{prop_loc}"
@@ -1691,13 +1639,13 @@ class Simulation():
                     part_slice = src_data_grp.timestep[time_step].select_particles_by_object(
                         object_name=loc_obj.__class__.__name__,
                         connectivity_value=loc_obj.who_am_i,
-                        predicate=lambda subset: subset.type == self._part_types[src_typ],
+                        predicate=lambda subset: subset.type == self.part_types[src_typ],
                     )
 
                     # Filter local particle handles to those of the destination type.
                     part_hndls = [
                         x for x in loc_obj.get_owned_part()[0]
-                        if x.type == self._part_types[loc_typ]
+                        if x.type == self.part_types[loc_typ]
                     ]
                     # Copy properties from source to local, element-wise.
                     for local, src in zip(part_hndls, part_slice.particles):
@@ -1795,14 +1743,14 @@ class Simulation():
         """
 
         # Open the source HDF5 and select the data group matching the requested type.
-        assert self._src_params_set==True, 'src_params_set must be set before calling this method'
-        with  h5py.File(self._src_path_h5, "r") as src_file:
+        assert self.src_params_set==True, 'src_params_set must be set before calling this method'
+        with  h5py.File(self.src_path_h5, "r") as src_file:
             src_data_grp = H5DataSelector(src_file, particle_group=registered_objs[0].__class__.__name__)
 
             # Discover the set of numeric type IDs present in the source for this group.
             all_src_types_numeric = np.unique(src_data_grp.type)
-            requested_names = set(self._pos_ori_src_type)
-            available_names = set(self._part_types.keys())
+            requested_names = set(self.pos_ori_src_type)
+            available_names = set(self.part_types.keys())
 
             # 1) every requested name must exist
             missing_names = requested_names - available_names
@@ -1811,25 +1759,25 @@ class Simulation():
                 f"simulation part types {sorted(available_names)}"
             )
             # 2) the numeric ids for those names must exist in the source data
-            requested_ids = {self._part_types[name] for name in requested_names}
+            requested_ids = {self.part_types[name] for name in requested_names}
             available_ids = set(all_src_types_numeric)
 
             missing_ids = requested_ids - available_ids
             assert not missing_ids, (
                 "source data is missing type id(s): "
                 f"{sorted(missing_ids)} "
-                f"({[self._part_types.key_for(i) for i in sorted(missing_ids)]} by name) "
+                f"({[self.part_types.key_for(i) for i in sorted(missing_ids)]} by name) "
                 f"not found in source data part types {sorted(available_ids)}"
             )
-            logging.info(f"simulation contains types: {dict(self._part_types)}")
+            logging.info(f"simulation contains types: {dict(self.part_types)}")
 
             positions_per_obj,ori_per_obj=[],[]
             for loc_obj in registered_objs:
                 logging.info(
-                    f"Loading data for {loc_obj.__class__.__name__}: {loc_obj.who_am_i} from SRC part type {self._pos_ori_src_type}."
+                    f"Loading data for {loc_obj.__class__.__name__}: {loc_obj.who_am_i} from SRC part type {self.pos_ori_src_type}."
                 )
                 # Select source particles at the requested time step that belong to this group instance (connectivity == loc_obj.who_am_i), with the correct pos_ori_src_type.
-                allowed_types=[self._part_types[x] for x in self._pos_ori_src_type]
+                allowed_types=[self.part_types[x] for x in self.pos_ori_src_type]
                 part_slice = src_data_grp.timestep[time_step].select_particles_by_object(
                     object_name=loc_obj.__class__.__name__,
                     connectivity_value=loc_obj.who_am_i,

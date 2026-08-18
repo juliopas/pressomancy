@@ -1,5 +1,6 @@
 import espressomd
 from pressomancy.helper_functions import BondWrapper, api_agnostic_feature_check
+from pressomancy.magnetodynamics import required_features_for, susceptibility_from_kT
 from pressomancy.simulation import Simulation, Filament
 import numpy as np
 import logging
@@ -31,13 +32,11 @@ for filament in filaments:
 
 sim_inst.set_vdW(key=('real',),lj_eps=3.)
 
-sim_inst.sys.thermostat.set_langevin(kT=1.0, gamma=1.0, seed=sim_inst.seed)
+kT = 1.0
+sim_inst.sys.thermostat.set_langevin(kT=kT, gamma=1.0, seed=sim_inst.seed)
 sim_inst.set_H_ext()
 sim_inst.set_H_ext(H=(0,0,6.66))
-sim_inst.get_H_ext()
 
-# part_list, dip_magnitude, H_ext
-H_ext=sim_inst.get_H_ext()
 pats_to_magnetize=sim_inst.sys.part.select(lambda p:p.type==sim_inst.part_types['to_be_magnetized'])
 sim_inst.sys.integrator.run(0)
 sim_inst.avoid_explosion(F_TOL=1e-2)
@@ -45,6 +44,21 @@ if espressomd.version.major()==5:
     sim_inst.init_magnetic_inter(DipolarDirectSum(prefactor=1))
 else:
     sim_inst.init_magnetic_inter(DipolarDirectSumCpu(prefactor=1))
-if api_agnostic_feature_check('DIPOLE_FIELD_TRACKING'):
-    sim_inst.magnetize(pats_to_magnetize,1.732,H_ext=H_ext)
+
+DIPM_SAT = 1.732
+MAG_SUSC_0 = susceptibility_from_kT(DIPM_SAT, kT)
+if all(api_agnostic_feature_check(f) for f in required_features_for('langevin')):
+    sim_inst.set_magnetization_model(pats_to_magnetize, 'langevin',
+                                     dipm_sat=DIPM_SAT,
+                                     mag_susc_0=MAG_SUSC_0)
+    # Check that the explicit mutual magnetization actually converges here. A
+    # ratio below 1 means the one iterate per timestep scheme resolves the
+    # physics; see pressomancy.magnetodynamics.contraction_ratio for the
+    # saturation caveat that goes with this diagnostic.
+    ratios = sim_inst.probe_magnetization_convergence(pats_to_magnetize, n_iter=20)
+    if len(ratios):
+        logging.info(f'mutual magnetization contraction ratio: {ratios[-1]:.3g}')
+        assert ratios[-1] < 1., (
+            f'magnetization iteration is not contracting (ratio {ratios[-1]:.3g}); '
+            f'lower mag_susc_0 or the dipolar prefactor')
 sim_inst.sys.integrator.run(1)

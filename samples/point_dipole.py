@@ -3,7 +3,8 @@ import espressomd.version
 import numpy as np
 
 from pressomancy.helper_functions import api_agnostic_feature_check
-from pressomancy.simulation import Simulation, PointDipolePermanent, PointDipoleSuperpara
+from pressomancy.magnetodynamics import required_features_for
+from pressomancy.simulation import Simulation, PointDipolePermanent, PointDipoleMagnetizable
 
 if espressomd.version.major() == 5:
     from espressomd.magnetostatics import DipolarDirectSum
@@ -12,9 +13,10 @@ elif espressomd.version.major() == 4:
 else:
     raise RuntimeError(f"Unsupported ESPResSo version {espressomd.version}")
 
-HAS_SUPERPARA_FEATURES = all(
+MODEL = 'langevin'
+HAS_MAGNETIZABLE_FEATURES = all(
     api_agnostic_feature_check(feature)
-    for feature in PointDipoleSuperpara.required_features
+    for feature in required_features_for(MODEL)
 )
 
 box_l = [10, 10, 10]
@@ -53,18 +55,20 @@ assert np.array_equal(sim_inst.sys.part.all().dip, dip), f"{sim_inst.sys.part.al
 sim_inst.reinitialize_instance()
 sim_inst.set_sys(timestep=0.0001)
 
-if HAS_SUPERPARA_FEATURES:
-    config_pds = PointDipoleSuperpara.config.specify(
-        dipm=SM_dipm,
+if HAS_MAGNETIZABLE_FEATURES:
+    config_pdm = PointDipoleMagnetizable.config.specify(
+        magnetization_model=MODEL,
+        dipm_sat=SM_dipm,
+        mag_susc_0=SM_Xi_0,
         espresso_handle=sim_inst.sys,
     )
 
-    # Test two superparamagnetic point dipoles aligned in the same direction as the field.
-    pds_list = [PointDipoleSuperpara(config=config_pds) for _ in range(2)]
-    sim_inst.store_objects(pds_list)
-    sim_inst.set_objects(pds_list)
+    # Test two magnetizable point dipoles aligned in the same direction as the field.
+    pdm_list = [PointDipoleMagnetizable(config=config_pdm) for _ in range(2)]
+    sim_inst.store_objects(pdm_list)
+    sim_inst.set_objects(pdm_list)
 
-    for i, part in enumerate(sim_inst.sys.part.select(type=sim_inst.part_types["pds_virt"])):
+    for i, part in enumerate(sim_inst.sys.part.select(type=sim_inst.part_types["pdm_virt"])):
         part_real = sim_inst.sys.part.by_id(part.vs_relative[0])
         part_real.pos = pos[i]
         part.pos = pos[i]
@@ -79,15 +83,25 @@ if HAS_SUPERPARA_FEATURES:
     sim_inst.set_H_ext(H=[0, 0, H])
     sim_inst.sys.integrator.run(10)
 
-    dip_assert = np.array(dip, copy=True)
-    dip_assert[:, 2] = 0.55632929
+    virts = sim_inst.sys.part.select(type=sim_inst.part_types["pdm_virt"])
 
-    assert np.array_equal(sim_inst.sys.part.select(type=sim_inst.part_types["pds_real"]).pos, pos), f"{sim_inst.sys.part.select(type=sim_inst.part_types['pds_real']).pos},\n{pos}"
-    assert np.array_equal(sim_inst.sys.part.select(type=sim_inst.part_types["pds_virt"]).pos, pos), f"{sim_inst.sys.part.select(type=sim_inst.part_types['pds_virt']).pos},\n{pos}"
-    assert np.array_equal(sim_inst.sys.part.select(type=sim_inst.part_types["pds_real"]).dip, dip * 0.), f"{sim_inst.sys.part.select(type=sim_inst.part_types['pds_real']).dip},\n{dip * 0.}"
-    assert np.allclose(sim_inst.sys.part.select(type=sim_inst.part_types["pds_virt"]).dip, dip_assert, atol=0.00005, rtol=0), f"{sim_inst.sys.part.select(type=sim_inst.part_types['pds_virt']).dip},\n{dip_assert}"
+    def langevin_moment(field_magnitude):
+        '''m_sat * L(alpha), alpha = 3 * chi_0 * |H| / m_sat, as espresso defines it.'''
+        alpha = 3. * SM_Xi_0 * field_magnitude / SM_dipm
+        return SM_dipm * (1. / np.tanh(alpha) - 1. / alpha)
 
-    poss_for_next_test = sim_inst.sys.part.select(type=sim_inst.part_types['pds_virt']).pos
-    dips_for_next_test = sim_inst.sys.part.select(type=sim_inst.part_types['pds_virt']).dip
+    # Each moment must be the Langevin response to the total field it actually sees.
+    H_tot = np.linalg.norm(np.asarray(virts.dip_fld) + np.asarray([0, 0, H]), axis=1)
+    expected_dipm = langevin_moment(H_tot)
+
+    assert np.array_equal(sim_inst.sys.part.select(type=sim_inst.part_types["pdm_real"]).pos, pos), f"{sim_inst.sys.part.select(type=sim_inst.part_types['pdm_real']).pos},\n{pos}"
+    assert np.array_equal(virts.pos, pos), f"{virts.pos},\n{pos}"
+    assert np.array_equal(sim_inst.sys.part.select(type=sim_inst.part_types["pdm_real"]).dip, dip * 0.), f"{sim_inst.sys.part.select(type=sim_inst.part_types['pdm_real']).dip},\n{dip * 0.}"
+    assert np.allclose(virts.dipm, expected_dipm, rtol=1e-6), f"{virts.dipm},\n{expected_dipm}"
+    # the moments align with the field, which points along z
+    assert np.allclose(np.asarray(virts.dip)[:, :2], 0.), f"{virts.dip}"
+
+    poss_for_next_test = virts.pos
+    dips_for_next_test = virts.dip
 
     sim_inst.reinitialize_instance()

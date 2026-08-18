@@ -16,13 +16,15 @@ import logging
 logging.basicConfig(level=logging.INFO)
 from espressomd.io.writer import vtf
 
-from pressomancy.simulation import Simulation, Elastomer, PointDipolePermanent, PointDipoleSuperpara
+from pressomancy.magnetodynamics import required_features_for
+from pressomancy.simulation import Simulation, Elastomer, PointDipolePermanent, PointDipoleMagnetizable
 
 import numpy as np
 
-HAS_SUPERPARA_FEATURES = all(
+MODEL = 'langevin'
+HAS_MAGNETIZABLE_FEATURES = all(
     api_agnostic_feature_check(feature)
-    for feature in PointDipoleSuperpara.required_features
+    for feature in required_features_for(MODEL)
 )
 
 # Simulation parameters
@@ -71,12 +73,14 @@ associated_objects=[]
 steric_keys = []
 config_pdp = PointDipolePermanent.config.specify(dipm=1., espresso_handle=sim_inst.sys)
 n_pdp = N_PART
-if HAS_SUPERPARA_FEATURES:
-    config_pds = PointDipoleSuperpara.config.specify(dipm=1.,espresso_handle=sim_inst.sys)
+if HAS_MAGNETIZABLE_FEATURES:
+    config_pdm = PointDipoleMagnetizable.config.specify(
+        magnetization_model=MODEL, dipm_sat=1., mag_susc_0=1.,
+        espresso_handle=sim_inst.sys)
     n_pdp = int(N_PART/2)
-    n_pds = N_PART - n_pdp
-    associated_objects.extend([PointDipoleSuperpara(config=config_pds) for _ in range(n_pds)])
-    steric_keys.append("pds_real")
+    n_pdm = N_PART - n_pdp
+    associated_objects.extend([PointDipoleMagnetizable(config=config_pdm) for _ in range(n_pdm)])
+    steric_keys.append("pdm_real")
 associated_objects.extend([PointDipolePermanent(config=config_pdp) for _ in range(n_pdp)])
 steric_keys.append("pdp_real")
 assert len(associated_objects) == N_PART
