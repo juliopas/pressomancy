@@ -13,6 +13,7 @@ from itertools import combinations_with_replacement
 from pressomancy.object_classes import *
 from pressomancy.helper_functions import *
 from pressomancy.magnetodynamics import configure_magnetization, contraction_ratio
+from pressomancy.io.bonds import write_bonds, verify_bond_params, check_bond_count
 import logging
 import h5py
 from collections import Counter
@@ -135,9 +136,9 @@ class Simulation():
         # I/O
         self.io_dict={
             'h5_file': None,
-            'properties':[('id',1), ('type',1), ('pos',3),('pos_folded',3), ('director',3),('image_box',3), ('f',3),('dip',3)],
-            'bonds':None,
-            'flat_part_view':defaultdict(list),
+            'properties': [('id',1,np.int32), ('type',1,np.int16), ('pos',3,np.float64),('pos_folded',3,np.float64), ('director',3,np.float64),('image_box',3,np.int32), ('f',3,np.float64),('dip',3,np.float64)],
+            'bonds': False,
+            'flat_part_view': defaultdict(list),
             'registered_group_type': None,
             'registered_observables': {},
         }
@@ -1017,48 +1018,29 @@ class Simulation():
                         dtype=np.int32,
                         maxshape=(arr.shape)
                     )
-                # Create the datasets for each property
-                for prop,dim in self.io_dict['properties']:
-                    prop_group = data_grp.require_group(prop)
-                    prop_group.create_dataset("step", shape=(0,), maxshape=(None,), dtype=np.int32)
-                    prop_group.create_dataset("time", shape=(0,), maxshape=(None,), dtype=np.float64)
-                    prop_group.create_dataset(
-                        "value",
-                        shape=(0, total_part_num, dim),  # Store all particles in a single dataset
-                        maxshape=(None, total_part_num, dim),
-                        dtype=np.float32,
-                        chunks=(1, total_part_num, dim),
-                        compression="gzip",
-                        compression_opts=4
+                # Bond topology: static, written once
+                # into the connectivity group
+                if self.io_dict.get('bonds', False):
+                    self.io_dict['_n_bond_links'][grp_typ.__name__] = write_bonds(
+                        connect_grp,
+                        particles=self.io_dict['flat_part_view'][grp_typ.__name__],
+                        sys=self.sys,
+                        step=0
                     )
-                # Create the datasets for bonds (special case, but same structure)
-                if self.io_dict.get('bonds') is None:
-                    pass
-                elif self.io_dict.get('bonds') == "all":
-                    # Define bond structure
-                    bond_dtype = np.dtype([
-                        ("bond_type", h5py.string_dtype(encoding="utf-8")),
-                        ("k", np.float32),
-                        ("r_0", np.float32),
-                        ("r_cut", np.float32),
-                        ("partner_id", np.int32),
-                    ])
-                    vlen_bond_dtype = h5py.vlen_dtype(bond_dtype)
-
-                    prop_group = data_grp.require_group("bonds")
+                # Create the datasets for each property
+                for prop,dim,_dtype in self.io_dict['properties']:
+                    prop_group = data_grp.require_group(prop)
                     prop_group.create_dataset("step", shape=(0,), maxshape=(None,), dtype=np.int32)
                     prop_group.create_dataset("time", shape=(0,), maxshape=(None,), dtype=np.float32)
                     prop_group.create_dataset(
                         "value",
-                        shape=(0, total_part_num),            # same pattern: timestep × particle
-                        maxshape=(None, total_part_num),
-                        dtype=vlen_bond_dtype,
-                        chunks=(1, total_part_num),
+                        shape=(0, total_part_num, dim),  # Store all particles in a single dataset
+                        maxshape=(None, total_part_num, dim),
+                        dtype=_dtype,
+                        chunks=(1, total_part_num, dim),
                         compression="gzip",
                         compression_opts=4
                     )
-                else:
-                    raise NotImplementedError("Currently only saves no bonds or 'all' bonds.")
 
             GLOBAL_COUNTER=0
             return 0
@@ -1078,6 +1060,12 @@ class Simulation():
                 self.io_dict['flat_part_view'][grp_typ.__name__].extend(self.sys.part.by_ids(part_ids))
                 data_grp = particles_group[grp_typ.__name__]
                 dataset_val = data_grp["pos/value"]
+                if self.io_dict.get('bonds', False):
+                    connect_grp = self.io_dict['h5_file']["connectivity"][grp_typ.__name__]
+                    verify_bond_params(connect_grp, self.sys)
+                    n_bond_links = connect_grp["bonds"].attrs.get("n_links")
+                    if n_bond_links is not None:
+                        self.io_dict['bond_links'][grp_typ.__name__] = int(n_bond_links)
                 candidate_lens.append(dataset_val.shape[0])
             if len(set(candidate_lens)) != 1:
                 raise ValueError(
@@ -1095,6 +1083,12 @@ class Simulation():
                     self.io_dict['flat_part_view'][grp_typ.__name__].extend(part)
                 data_grp = particles_group[grp_typ.__name__]
                 dataset_val = data_grp["pos/value"]
+                if self.io_dict.get('bonds', False):
+                    connect_grp = self.io_dict['h5_file']["connectivity"][grp_typ.__name__]
+                    verify_bond_params(connect_grp, self.sys)
+                    n_bond_links = connect_grp["bonds"].attrs.get("n_links")
+                    if n_bond_links is not None:
+                        self.io_dict['bond_links'][grp_typ.__name__] = int(n_bond_links)
                 candidate_lens.append(dataset_val.shape[0])
             if len(set(candidate_lens)) != 1:
                 raise ValueError(
@@ -1103,12 +1097,10 @@ class Simulation():
             return candidate_lens[0]
 
         def resize_kernel(force_resize_to_size):
-            if self.io_dict['bonds'] is not None:
-                raise NotImplementedError
             particles_group = self.io_dict['h5_file']["particles"]
             for grp_typ in group_type:
                 data_grp = particles_group[grp_typ.__name__]
-                for prop,_ in self.io_dict['properties']:
+                for prop,_,_ in self.io_dict['properties']:
                     dataset_val = data_grp[f"{prop}/value"]
                     step_dataset = data_grp[f"{prop}/step"]
                     time_dataset = data_grp[f"{prop}/time"]
@@ -1223,7 +1215,7 @@ class Simulation():
                 if any(key in obs_group for key in ('step', 'time', 'value')):
                     raise ValueError(f"Observable '{name}' already exists in HDF5 file.")
                 obs_group.create_dataset("step", shape=(0,), maxshape=(None,), dtype=np.int32)
-                obs_group.create_dataset("time", shape=(0,), maxshape=(None,), dtype=np.float64)
+                obs_group.create_dataset("time", shape=(0,), maxshape=(None,), dtype=np.float32)
                 obs_group.create_dataset(
                     "value",
                     shape=(0, *shape),
@@ -1266,7 +1258,7 @@ class Simulation():
         GLOBAL_COUNTER = self._inscribe_h5_stream(mode, force_resize_to_size, setup, new_kernel, load_kernel, load_kernel, resize_kernel)
         return GLOBAL_COUNTER
 
-    def write_part_group_to_h5(self, step, unique=False, bonds_once=True):
+    def write_part_group_to_h5(self, step, unique=False):
         """Append one frame using an integer step counter and current ESPResSo time.
 
         step : int
@@ -1293,11 +1285,12 @@ class Simulation():
         if not isinstance(step, Integral):
             raise TypeError("step must be provided as an integer frame counter.")
         physical_time = float(self.sys.time)
+        particles_group = self.io_dict['h5_file']["particles"]
 
         if not unique:
             for grp_typ in self.io_dict['registered_group_type']:
                 data_grp = particles_group[grp_typ]
-                for prop, _ in self.io_dict['properties']:
+                for prop,_,_ in self.io_dict['properties']:
                     step_dataset = data_grp[f"{prop}/step"]
                     if step_dataset.shape[0] > 0 and step <= step_dataset[-1]:
                         raise ValueError(
@@ -1306,7 +1299,7 @@ class Simulation():
 
         for grp_typ in self.io_dict['registered_group_type']:
             data_grp = particles_group[grp_typ]
-            for prop,_ in self.io_dict['properties']:
+            for prop,_,_dtype in self.io_dict['properties']:
                 dataset_val = data_grp[f"{prop}/value"]
                 step_dataset = data_grp[f"{prop}/step"]
                 time_dataset = data_grp[f"{prop}/time"]
@@ -1321,46 +1314,15 @@ class Simulation():
                     raise ValueError("Something went horribly wrong when looking for the right spot to save this data.")
                 step_dataset[idx] = step
                 time_dataset[idx] = physical_time
-                dataset_val[idx, :, :] = np.array([np.atleast_1d(getattr(part, prop)) for part in self.io_dict['flat_part_view'][grp_typ]], dtype=np.float32)
+                dataset_val[idx, :, :] = np.array([np.atleast_1d(getattr(part, prop)) for part in self.io_dict['flat_part_view'][grp_typ]], dtype=_dtype)
 
-            if self.io_dict.get('bonds') is None or (bonds_once and data_grp["bonds/value"].shape[0] > 0):
-                pass
-            elif self.io_dict['bonds'] == "all":
-                dataset_val = data_grp["bonds/value"]
-                step_dataset = data_grp["bonds/step"]
-                time_dataset = data_grp["bonds/time"]
-
-                dataset_size = dataset_val.shape[0]
-                idx = int(np.searchsorted(step_dataset[:], step)) if (unique and dataset_size > 0) else dataset_size
-                if idx == dataset_size:
-                    step_dataset.resize((dataset_size + 1,))
-                    time_dataset.resize((dataset_size + 1,))
-                    dataset_val.resize((dataset_size + 1, dataset_val.shape[1]))
-                elif idx > dataset_size:
-                    raise ValueError("Something went horribly wrong when looking for the right spot to save this data.")
-                step_dataset[idx] = step
-                time_dataset[idx] = physical_time
-                bond_dtype = np.dtype([
-                    ("bond_type", h5py.string_dtype(encoding="utf-8")),
-                    ("k", np.float32),
-                    ("r_0", np.float32),
-                    ("r_cut", np.float32),
-                    ("partner_id", np.int32),
-                ])
-                for i, part in enumerate(self.io_dict['flat_part_view'][grp_typ]):
-                    bond_list = []
-                    for bond_obj, partner_id in getattr(part, 'bonds', []):
-                        bond_list.append((
-                            type(bond_obj).__name__,
-                            bond_obj.k,
-                            bond_obj.r_0,
-                            bond_obj.r_cut,
-                            partner_id
-                        ))
-                    if len(bond_list) > 0:
-                        dataset_val[idx, i] = np.asarray(bond_list, dtype=bond_dtype)
-            else:
-                raise NotImplementedError("Currently only saves no bonds or 'all' bonds.")
+            if self.io_dict.get('bonds', False):
+                check_bond_count(
+                    self.io_dict['bond_links'].get(grp_typ),
+                    self.io_dict['flat_part_view'][grp_typ],
+                    group_name=grp_typ,
+                    policy="raise"
+                )
 
         logging.debug(f"Successfully wrote timestep for {self.io_dict['registered_group_type']}.")
         return step
@@ -1425,7 +1387,7 @@ class Simulation():
             raise ValueError("No particle groups or observables have been inscribed in HDF5.")
 
         if registered_groups:
-            self.write_part_group_to_h5(time_step=time_step)
+            self.write_part_group_to_h5(step=time_step)
         if registered_observables:
             self.write_observable_group_to_h5(time_step=time_step)
 
@@ -1448,7 +1410,7 @@ class Simulation():
         property group ``/particles/<Group>/<prop>`` with the standard layout:
         - ``step`` : int32, shape ``(T,)`` (created empty, then resized to 1)
         - ``time`` : float32, shape ``(T,)`` (created empty, then resized to 1)
-        - ``value``: float32, shape ``(T, N, D)`` (gzip, chunked as ``(1, N, D)``)
+        - ``value``: float32 (int32 for ``id``/``type``), shape ``(T, N, D)`` (gzip, chunked as ``(1, N, D)``)
 
         It then appends **one** frame (T=1), reusing the preserved
         ``step[-1]`` and ``time[-1]`` values from the kept frame, and fills ``value[-1, :, :]`` from the
@@ -1545,7 +1507,7 @@ class Simulation():
                     kept_step = int(reference_prop["step"][0])
                     kept_time = float(reference_prop["time"][0])
                     total_part_num=len(self.io_dict['flat_part_view'][grp_typ])
-                    for prop,dim in prop_dim:
+                    for prop,dim,_dtype in prop_dim:
                         prop_group = data_grp.require_group(prop)
                         step_dataset=prop_group.create_dataset("step", shape=(0,), maxshape=(None,), dtype=np.int32)
                         time_dataset=prop_group.create_dataset("time", shape=(0,), maxshape=(None,), dtype=np.float64)
@@ -1553,7 +1515,7 @@ class Simulation():
                             "value",
                             shape=(0, total_part_num, dim),  # Store all particles in a single dataset
                             maxshape=(None, total_part_num, dim),
-                            dtype=np.float32,
+                            dtype=_dtype,
                             chunks=(1, total_part_num, dim),
                             compression="gzip",
                             compression_opts=4
@@ -1563,7 +1525,7 @@ class Simulation():
                         dataset_val.resize((dataset_val.shape[0] + 1, dataset_val.shape[1], dataset_val.shape[2]))
                         step_dataset[-1] = kept_step
                         time_dataset[-1] = kept_time
-                        dataset_val[-1, :, :] = np.array([np.atleast_1d(getattr(part, prop)) for part in self.io_dict['flat_part_view'][grp_typ]], dtype=np.float32)
+                        dataset_val[-1, :, :] = np.array([np.atleast_1d(getattr(part, prop)) for part in self.io_dict['flat_part_view'][grp_typ]], dtype=_dtype)
                         src_data_grp = H5DataSelector(h5_file_handle, particle_group=grp_typ)
                         assert len(src_data_grp.timestep)==1,'dataset is ragged!!!'
                         logging.info(f'appended {prop} to {dst_path}')
@@ -1610,7 +1572,7 @@ class Simulation():
             # Validate that each requested (src_type -> local_type) exists both locally and in the source file.
             for src_typ, loc_typ in self.type_to_type_map:
                 assert (
-                    loc_typ in self.part_types or src_typ in self.part_types
+                    loc_typ in self.part_types and src_typ in self.part_types
                 ), (
                     f"local type {loc_typ} or source type {src_typ} not found in "
                     f"simulation part types {self.part_types}"

@@ -2,6 +2,8 @@ import h5py
 import numpy as np
 import warnings
 
+from .h5_helper_functions import read_h5_selection, positions_for_axis, BondSelection
+
 class H5DataSelector:
     """
     A simplified interface to access simulation data stored in an HDF5 file. The H5DataSelector maintains internal slice information for timesteps (axis 0) and particles (axis 1) and supports chaining via its accessor properties:
@@ -43,6 +45,9 @@ class H5DataSelector:
       - `.timestep[...]` slices by frame index on axis 0. It does not query the stored HDF5 `step` or `time` datasets.
       - `.step` and `.time` read from the particle group's `pos/step` and `pos/time` datasets. These are treated as the canonical particle timeline; the writer stores the same step/time values for every particle property in a frame.
       - Iteration and len() are only defined on the accessor objects.
+      - Property data keeps the trailing property axis of the stored dataset, so scalar
+        properties come back with shape (..., 1) (e.g. `data.id.squeeze(axis=-1)`), and the
+        timestep/particle selections compose as an outer product, never pairwise.
       - Connectivity predicates are evaluated on the current H5DataSelector view. They select particles, not timesteps: the returned selector preserves the current timestep slice and only narrows the particle slice.
 
     **Raises:**
@@ -60,7 +65,7 @@ class H5DataSelector:
         self.pt_slice = pt_slice if pt_slice is not None else slice(None)
 
         # Get step array (from particle 0)
-        self._times_array = h5_file[f"particles/{particle_group}/id/time"][self.ts_slice]
+        self._times_array = read_h5_selection(h5_file[f"particles/{particle_group}/id/time"], self.ts_slice)
 
         # Set sys group in its little wrapper to be nicer and more seperate from the rest of the suspicious looking groups - like connectivity, for real, what is that supossed to mean. We are indeed all connected, in a way, I guess, so why separate connections based on some set and arbitrary rule. And I stopped there. Long day of coding.
         # TO IMPLEMENT
@@ -138,9 +143,6 @@ class H5DataSelector:
             if not (isinstance(prop_info, dict) and "value" in prop_info):
                 continue
 
-            if prop == "bonds":
-                continue
-
             value_info = prop_info["value"]
             shape = value_info.get("shape")
             if shape is None or len(shape) < 2:
@@ -170,7 +172,7 @@ class H5DataSelector:
     def join_with(self, *args):
         joinned_ds = self
         for ds in args:
-            joinned_ds._join_with(ds)
+            joinned_ds = joinned_ds._join_with(ds)
         return joinned_ds
 
     @property
@@ -191,7 +193,7 @@ class H5DataSelector:
         """
         return TimestepAccessor(self)
 
-    def time(self, time):
+    def at_time(self, time):
         """
         Accessor for slicing/iterating over the timestep axis, with the simulation step values, insted of indexes.
 
@@ -203,10 +205,10 @@ class H5DataSelector:
 
         Usage:
             # Getting timestep corresponding to step 1E6
-            data.timestep(1000000)
+            data.at_time(1000000)
 
             # Slicing timesteps from simulation steps (0,100,500,1000):
-            data.timestep((0,100,500,1000))
+            data.at_time((0,100,500,1000))
 
 
         """
@@ -254,49 +256,60 @@ class H5DataSelector:
         """
         ds_path = f"particles/{self.particle_group}/{prop}/value"
         ds = self.h5_file[ds_path]
-        if prop != "bonds": # most properties have shape (_,_,3 or 1)
-            if ds.shape[2] == 1: # properly ouput things like id or type, in their correct type, not in a list
-                return np.asarray(ds[:,:,:])[self.ts_slice, self.pt_slice, 0]
-            else:
-                return np.asarray(ds[:,:,:])[self.ts_slice, self.pt_slice, :]
+        if prop == "bonds":
+            return self.bonds
+        return read_h5_selection(ds, self.ts_slice, self.pt_slice)
 
-        else: # for bonds (special case, because of vlen arrays)
-            if hasattr(self.ts_slice, '__iter__'):
-                ts_slice_flag=False
-                ts_slice = self.ts_slice
-            else:
-                ts_slice_flag=True
-                ts_slice = [self.ts_slice]
-            if hasattr(self.pt_slice, '__iter__'):
-                pt_slice_flag=False
-                pt_slice = self.pt_slice
-            else:
-                pt_slice_flag=True
-                pt_slice = [self.pt_slice]
+    @property
+    def bonds(self):
+        """Bonds owned by the currently selected particles.
 
-            bond_list_all_ts_slice=[]
-            for ts in ts_slice:
-                bond_list_single_ts=[]
-                for pt in pt_slice:
-                    try:
-                        assert len(ds[ts, pt]) > 0
-                        bond_list_single_ts.append(ds[ts, pt])
-                    except:
-                        bond_list_single_ts.append([])
-                bond_list_all_ts_slice.append(bond_list_single_ts[0] if pt_slice_flag else bond_list_single_ts)
-            return bond_list_all_ts_slice[0] if ts_slice_flag else np.asarray(bond_list_all_ts_slice, dtype=object)
+        Returns:
+            BondSelection: See that class for the slicing semantics.
+
+        Raises:
+            AttributeError: If the file was written without bond storage.
+        """
+        grp = self.h5_file.get(f"connectivity/{self.particle_group}/bonds")
+        if grp is None:
+            raise AttributeError(
+                f"No bond topology stored for group '{self.particle_group}'. "
+                "The run was inscribed with io_dict['bonds'] disabled."
+            )
+        rows, _ = positions_for_axis(self.pt_slice, self.common_dims[1])
+        # offsets[i] and offsets[i+1] bracket particle i's links. Read the union
+        # of both position sets in one go, then map back with searchsorted.
+        wanted = np.union1d(rows, rows + 1)
+        offsets = read_h5_selection(grp["offsets"], wanted)
+        starts = offsets[np.searchsorted(wanted, rows)]
+        stops = offsets[np.searchsorted(wanted, rows + 1)]
+        counts = (stops - starts).astype(np.intp)
+        link_rows = (np.concatenate([np.arange(a, b) for a, b in zip(starts, stops)])
+                     if counts.any() else np.empty(0, dtype=np.intp))
+        # One fancy axis: read_h5_selection sorts, dedups and restores order,
+        # and touches only the selected rows of a dataset that is O(all bonds).
+        links = read_h5_selection(grp["links"], link_rows)
+        particle_ids = read_h5_selection(grp["particle_ids"], rows)
+        return BondSelection(
+            grp,
+            particle_ids=particle_ids,
+            owner=np.repeat(particle_ids, counts),
+            bond_id=links[:, 0],
+            n_partners=links[:, 1],
+            partners=links[:, 2:],
+        )
 
     @property
     def step(self):
         """Return saved frame counters from the particle group's canonical `pos/step` dataset."""
         ds = self.h5_file[f"particles/{self.particle_group}/pos/step"]
-        return ds[self.ts_slice]
+        return read_h5_selection(ds, self.ts_slice)
 
     @property
     def time(self):
         """Return saved physical times from the particle group's canonical `pos/time` dataset."""
         ds = self.h5_file[f"particles/{self.particle_group}/pos/time"]
-        return ds[self.ts_slice]
+        return read_h5_selection(ds, self.ts_slice)
 
     def get_box(self):
         """Return fixed-box metadata for the current particle group."""
@@ -530,12 +543,18 @@ class H5DataSelector:
 
         Returns
         -------
-        List[int]
+        List[int] or None
             Sorted list of parent who_am_i IDs that link to the child.
+            Returns None if the connectivity map is missing.
         """
         conn = self.get_connectivity_map(parent_key, child_key)
-        parent_ids = conn[conn[:, 1] == child_id, 0]
-        return sorted(int(pid) for pid in parent_ids)
+        return_map = None
+        if conn is None:
+            warnings.warn(f"No parents with key {parent_key} found for child with key {child_key}.")
+        else:
+            parent_ids = conn[conn[:, 1] == child_id, 0]
+            return_map = sorted(int(pid) for pid in parent_ids)
+        return return_map
 
     def _join_with(self, ds):
         """
@@ -567,10 +586,14 @@ class H5DataSelector:
         Raises:
             AttributeError: If the property does not exist.
         """
+        if attr.startswith('__') and attr.endswith('__'):
+            raise AttributeError(attr)
+        if 'particle_group' not in self.__dict__ or 'h5_file' not in self.__dict__:
+            raise AttributeError(attr)
         try:
-            return self.__dict__[attr]
-        except KeyError:
             return self.get_property(attr)
+        except KeyError as exc:
+            raise AttributeError(f"{type(self).__name__!r} object has no attribute {attr!r}") from exc
 
     # def __setattr__(self, name, value): # does this make sense here? It seems much more convinient to use the funcitons, anyway
     #     """
@@ -678,17 +701,17 @@ class H5ObservableSelector:
     @property
     def value(self):
         ds = self.h5_file[f"observables/{self.observable_name}/value"]
-        return ds[self.ts_slice, ...]
+        return read_h5_selection(ds, self.ts_slice)
 
     @property
     def step(self):
         ds = self.h5_file[f"observables/{self.observable_name}/step"]
-        return ds[self.ts_slice]
+        return read_h5_selection(ds, self.ts_slice)
 
     @property
     def time(self):
         ds = self.h5_file[f"observables/{self.observable_name}/time"]
-        return ds[self.ts_slice]
+        return read_h5_selection(ds, self.ts_slice)
 
     def __repr__(self):
         return (f"<H5ObservableSelector(observable_name={self.observable_name}, "
@@ -844,7 +867,6 @@ class ParticleAccessor:
     def __repr__(self):
         return f"<ParticleAccessor(pt_slice={self.sim_data.pt_slice})>"
 
-
 def _compose_index(existing, new, total_length):
     """
     Compose two layers of indexing on a given axis by converting the existing index into an explicit list,
@@ -949,7 +971,7 @@ def _slice_to_list(slice_, len_=None):
 
         # if the lenght is not know
 
-        if slice_.end in None:
+        if slice_.stop is None:
             raise ValueError(f"Cannot convert slices with None end values to list, wihtout knowin the lenght: {slice_}")
 
         # get slice start
