@@ -11,6 +11,8 @@ import warnings
 import subprocess
 from pathlib import Path
 
+from numpy.typing import ArrayLike
+
 class MissingFeature(Exception):
     pass
 
@@ -138,6 +140,13 @@ class ManagedSimulation:
             self.instance.sys.constraints.clear()
             self.instance.sys.thermostat.turn_off()
             self.instance.sys.integrator.set_vv()
+            if espressomd.version.major() == 4:
+                self.instance.sys.actors.clear()
+            else:
+                self.instance.sys.lb = None
+                self.instance.sys.magnetostatics.clear()
+            self.instance.sys.periodicity = (True, True, True)
+            self.instance.sys.time = 0.
 
 
     def __getattr__(self, name):
@@ -262,6 +271,8 @@ class SinglePairDict(dict):
 
     # Class-level dictionary to track all unique key-value pairs across instances
     _global_registry = {}
+    # Class-level dictionary tracking which instance (by id()) registered each key.
+    _registry_owners = {}
 
     def __init__(self, key, value):
         """
@@ -288,8 +299,10 @@ class SinglePairDict(dict):
         # Initialize as a single-item dictionary
         super().__init__({key: value})
 
-        # Register the key-value pair globally
+        # Register the key-value pair globally, and record that *this* instance is
+        # the one that owns the registration (see __del__).
         SinglePairDict._global_registry[key] = value
+        SinglePairDict._registry_owners[key] = id(self)
 
     def __setitem__(self, key, value):
         """
@@ -312,6 +325,43 @@ class SinglePairDict(dict):
             Always raised because item deletion is not supported.
         """
         raise TypeError("SinglePairDict does not support item deletion.")
+
+    # Gaurd against dict funtions that could set/remove entries
+    def update(self, *args, **kwargs):
+        raise TypeError("SinglePairDict does not support update after initialization.")
+
+    def setdefault(self, *args, **kwargs):
+        raise TypeError("SinglePairDict does not support setdefault after initialization.")
+
+    def pop(self, *args, **kwargs):
+        raise TypeError("SinglePairDict does not support item deletion.")
+
+    def popitem(self):
+        raise TypeError("SinglePairDict does not support item deletion.")
+
+    def clear(self):
+        raise TypeError("SinglePairDict does not support item deletion.")
+
+    @classmethod
+    def unregister(cls, key):
+        """
+        Drop `key` from the global registry, freeing it for reuse.
+        """
+        cls._global_registry.pop(key, None)
+        cls._registry_owners.pop(key, None)
+
+    def __del__(self):
+        try:
+            key = next(iter(dict.keys(self)))
+            registry = getattr(SinglePairDict, "_global_registry", None)
+            owners = getattr(SinglePairDict, "_registry_owners", None)
+            if registry is None or owners is None:
+                return
+            if owners.get(key) == id(self):
+                registry.pop(key, None)
+                owners.pop(key, None)
+        except (StopIteration, RuntimeError):
+            return
 
     @property
     def key(self):
@@ -401,9 +451,19 @@ class PartDictSafe(dict):
             Positional arguments passed to the `dict` constructor.
         **kwargs : dict
             Keyword arguments passed to the `dict` constructor.
+
+        Raises
+        ------
+        RuntimeError
+            If the initial data violates the uniqueness constraints.
         """
+        if len(args) > 1:
+            raise TypeError(
+                f"PartDictSafe expected at most 1 positional argument, got {len(args)}"
+            )
         self.default_factory = list
-        super().__init__(*args, **kwargs)
+        super().__init__()
+        self.update(*args, **kwargs)
 
     def sanity_check(self, key, value):
         """
@@ -503,6 +563,15 @@ class PartDictSafe(dict):
             self[key] = self.default_factory()
         return super().__getitem__(key)
 
+    # guard against dict funcitons that could set/remove entries
+    def setdefault(self, key, default=None):
+        """
+        Insert `key` with `default` if absent, validating like `__setitem__`.
+        """
+        if key not in self:
+            self[key] = default
+        return super().__getitem__(key)
+
     def set_default_factory(self, factory):
         """
         Updates the default factory used to generate default values for missing keys.
@@ -516,18 +585,20 @@ class PartDictSafe(dict):
 
     def key_for(self, value):
         """
-        Return the (unique) key for `value`.
+        Return the key(s) mapping to `value`.
+
+        `value` may be a scalar or an array-like of values; the returned list holds
+        the key found for each of them, in order.
 
         Raises:
-            KeyError:   if no key maps to `value`.
+            KeyError:   if no key maps to one of the requested values.
         """
-        rek_keys=[]
+        rek_keys = []
         for val in np.atleast_1d(value):
-            for k, v in self.items():
-                if v == val:
-                    rek_keys.append(k)
-            if not rek_keys:
+            matches = [k for k, v in self.items() if v == val]
+            if not matches:
                 raise KeyError(f"No key found for value {val}")
+            rek_keys.extend(matches)
 
         return rek_keys
 
@@ -620,6 +691,7 @@ def load_coord_file(file_path):
     return coordinates
 
 def fold_coords(points, box_dim):
+    box_dim = _as_box(box_dim)
     return np.mod(points, box_dim)
 
 def min_img_dist(s, t, box_dim):
@@ -659,12 +731,12 @@ def generate_random_unit_vectors(N_PART):
 
 def normalize_vectors(vectors, axis=-1):
     array_of_vectors= np.asarray(vectors)
+    norms_array = np.atleast_1d(np.linalg.norm(array_of_vectors, axis=axis))
+    norms_array[norms_array==0] = 1
     if len(array_of_vectors.shape) > 1: # if multiple vectors return an array of shape (number_of_vectors, dims)
-        norms_array = np.atleast_1d(np.linalg.norm(array_of_vectors, axis=axis))
-        norms_array[norms_array==0] = 1
         return array_of_vectors / np.expand_dims(norms_array, axis)
-    else: # if only one vector return an array of shape (dims,)Z
-        return array_of_vectors / np.linalg.norm(array_of_vectors)
+    else: # if only one vector return an array of shape (dims,)
+        return array_of_vectors / norms_array
 
 def random_nested_3d_vectors_like(item, rng=None):
     """
@@ -711,7 +783,7 @@ def build_grid_and_adjacent(lattice_points, volume_side, cell_size):
     volume_side : float or array-like of shape (3,)
         The side length of the cubic volume or the side lengths of a rectangular volume.
     cell_size : float
-        The grid cell size (typically set equal to the cuttoff distance).
+        The grid cell size (typically set equal to the cutoff distance).
     Returns
     -------
     grid : defaultdict(list)
@@ -745,10 +817,10 @@ def build_grid_and_adjacent(lattice_points, volume_side, cell_size):
 
     return grid, adjacent
 
-def get_neighbours(lattice_points: np.ndarray, volume_side: float, cuttoff: float = 1.) -> defaultdict:
+def get_neighbours(lattice_points: np.ndarray, volume_side: float, cutoff: float = 1.) -> defaultdict:
     """
     Returns grouped_indices, where grouped_indices is a dictionary that maps each particle index
-    to a list of neighbor indices within the cuttoff distance. Uses a grid-based method for efficiency,
+    to a list of neighbor indices within the cutoff distance. Uses a grid-based method for efficiency,
     and reuses the min_img_dist function for distance calculations.
 
     Parameters
@@ -757,7 +829,7 @@ def get_neighbours(lattice_points: np.ndarray, volume_side: float, cuttoff: floa
         Array of particle positions.
     volume_side : float or array-like of shape (3,)
         The side length of the cubic volume or the side lengths of a rectangular volume.
-    cuttoff : float, optional
+    cutoff : float, optional
         The neighbor distance threshold.
 
     Note:
@@ -768,8 +840,8 @@ def get_neighbours(lattice_points: np.ndarray, volume_side: float, cuttoff: floa
     grouped_indices : defaultdict[int, list[int]]
         Dictionary mapping each particle index to a list of neighbor indices.
     """
-    # Use cuttoff as the grid cell size.
-    cell_size = cuttoff
+    # Use cutoff as the grid cell size.
+    cell_size = cutoff
     grid, adjacent_cells = build_grid_and_adjacent(lattice_points, volume_side, cell_size)
 
     grouped_indices = defaultdict(list)
@@ -1041,12 +1113,11 @@ def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_p
     res_orientations = [None] * num_spheres
     # Perform the point generation routine if `num_monomers` not 0
     if routine_per_volume.num_monomers>1:
-        if np.all(box_lengths==box_lengths[0]):
+        if not np.all(box_lengths==box_lengths[0]):
             warnings.warn("this methods assumes cubic system box for num_monomers > 1")
-        box_length = box_lengths[0]
         grouped_positions = defaultdict(list)
         #grouped_volumes is a dictionary that contains all neighouring lattice sites sphere_diameter
-        grouped_volumes=get_neighbours(sphere_centers,volume_side=box_lengths,cuttoff=sphere_diameter)
+        grouped_volumes=get_neighbours(sphere_centers,box_dim=box_lengths,cutoff=sphere_diameter)
         for i, center in enumerate(sphere_centers):
             valid_placement = False
             while not valid_placement:
@@ -1243,7 +1314,7 @@ def get_cross_lattice_nonintersecting_volumes(current_lattice_centers, current_l
     box_lengths = np.asarray(box_lengths)
     assert box_lengths.shape == (3,), "box_lengths must be an array-like of shape (3,)"
     neigh=get_neighbours_cross_lattice(current_lattice_centers,other_lattice_centers,
-    box_lengths, cuttoff=(current_lattice_diam+other_lattice_diam)*0.5)
+    box_lengths, cutoff=(current_lattice_diam+other_lattice_diam)*0.5)
     aranged_cross_lattice_options={}
     if mode=='cross_parts':
         fact=pow(2,1/6)
@@ -1391,13 +1462,12 @@ def add_box_constraints_func(sys, wall_type=0, sides=['all'], inter=None, types_
     - Walls are defined using outward-pointing normals and placed at specified distances from the origin.
     - The method adds constraints to `sys.constraints` directly.
     """
-    try:
-        PartDictSafe({'wall': wall_type})
-    except:
-        raise ValueError("wall_type must be unique from all other particle types. Default is 0.")
+    existing_part_types = set(sys.part.all().type)
+    if wall_type in existing_part_types:
+        raise ValueError("wall_type must be unique from all other particle types already present in the system. Default is 0.")
 
     sides = np.array([sides]).ravel().tolist()
-    if "no-" in sides[0]:
+    if any(side.startswith("no-") for side in sides):
         sides.append('all')
 
     if bottom is None:
@@ -1514,6 +1584,7 @@ def remove_box_constraints_func(sys, wall_type=0, wall_constraints=None, part_ty
         leftover_wall_types = set([constraint.particle_type for constraint in list(sys.constraints)])
         box_types_remove = original_wall_types - leftover_wall_types
     elif part_types is None: # removes only interactions (based on objects)
+        box_types_remove = set([constraint.particle_type for constraint in wall_constraints])
         object_types = np.array([object_types]).ravel()
         part_types = set([ele.part_types[typ] for ele in object_types for typ in ele.part_types])
     else: # removes only interactions (based on part_types)
@@ -1535,49 +1606,29 @@ def check_free_cuboid(sys, cuboid_l, cuboid_l_shift=None):
         return np.all(np.any((pos < cuboid_l_shift) | (pos > cuboid_l_shift + cuboid_l), axis=1))
 
 class BondWrapper:
+    """Transparent proxy around an espresso bond."""
+
     def __init__(self, bond_handle):
-        # Store the bond_handle instance
         self._bond_handle = bond_handle
         self.name = bond_handle.__class__.__name__
 
-        if isinstance(bond_handle, espressomd.interactions.FeneBond):
-            self.dtype = np.dtype([
-                        ("partner_id", np.int32),
-                        ("k", np.float32),
-                        ("r_0", np.float32),
-                        ("d_r_max", np.float32)
-                        ])
-        elif isinstance(bond_handle, espressomd.interactions.HarmonicBond):
-            self.dtype = np.dtype([
-                        ("partner_id", np.int32),
-                        ("k", np.float32),
-                        ("r_0", np.float32),
-                        ("r_cut", np.float32)
-                        ])
-
     def __getattr__(self, name):
-        # Delegate attribute access to the wrapped object
         return getattr(self._bond_handle, name)
 
     def __setattr__(self, name, value):
-        # Ensure that _bond_handle is set on the wrapper, not on the wrapped object
         if name == "_bond_handle":
             super().__setattr__(name, value)
         else:
             setattr(self._bond_handle, name, value)
 
     def __delattr__(self, name):
-        # Delegate deletion of attributes to the wrapped object
         delattr(self._bond_handle, name)
 
     def __repr__(self):
-        # Customize how the wrapper is printed
-        return f"BondWrapper({repr(self._bond_handle)})"
+        return f"BondWrapper({self._bond_handle!r})"
 
     def get_raw_handle(self):
-        """
-        Returns the raw object being wrapped.
-        """
+        """Return the wrapped espresso bond object."""
         return self._bond_handle
 
 def get_repo_context(path):
@@ -1647,3 +1698,22 @@ def get_submission_creator_info():
         return f"unknown/{script_path.name}", "unknown"
     relpath = script_path.relative_to(repo_root).as_posix()
     return f"{repo_root.name}/{relpath}", version
+
+_DEFFAULT_NDIM = 3
+def _as_box(box_dim: ArrayLike, ndim=None) -> np.ndarray:
+    """Coerce a scalar or sequence into a strictly-positive (3,) float array."""
+    box = np.asarray(box_dim, dtype=np.float64)
+    assert box.ndim <= 1
+    if ndim is None:
+        ndim = box.shape[0] if box.ndim == 1 else _DEFFAULT_NDIM
+    if box.ndim == 0:
+        box = np.full(ndim, float(box))
+    else:
+        box = np.atleast_1d(box).ravel()
+    if box.shape != (ndim,):
+        raise ValueError(f"box_dim must be a scalar or shape ({ndim},), got shape {box.shape}")
+    if not np.all(np.isfinite(box)):
+        raise ValueError("box_dim contains non-finite values")
+    if np.any(box <= 0):
+        raise ValueError(f"box_dim must be strictly positive, got {box}")
+    return box

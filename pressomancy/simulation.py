@@ -63,12 +63,6 @@ class Simulation():
         set_objects(objects):
             Generates random positions and orientations for managed objects and sets them using object-specific methods.
 
-        unstore_objects(iterable_list):
-            Removes specified objects from the simulation and updates relevant attributes.
-
-        delete_objects():
-            Deletes all parts owned by stored objects by calling their delete method.
-
         mark_for_collision_detection(object_type, part_type):
             Marks specific objects for collision detection and prepares them for covalent bond marking.
 
@@ -168,7 +162,10 @@ class Simulation():
 
     def set_sys(self, timestep=0.01, min_global_cut=3.0, have_quaternion=False):
         '''
-        Set espresso cellsystem params, and import virtual particle scheme. Run automatically on initialisation of the System class.
+        Set espresso cellsystem params, and import virtual particle scheme.
+
+        Note: this is NOT run automatically on initialisation -- callers must invoke it
+        explicitly.
         '''
         np.random.seed(seed=self.seed)
         logging.info(f'core.seed: {self.seed}')
@@ -446,7 +443,7 @@ class Simulation():
                 epsilon=lj_eps, sigma=lj_sigma, cutoff=lj_cut, shift=0)
         logging.info(f'vdW interactions initiated initiated for keys: {key}')
 
-    def set_vdW_custom(self, pairs=[(None, None),], lj_eps=[1.,], lj_sigma=[1.,], lj_cuttoffs=None, r_min=0):
+    def set_vdW_custom(self, pairs=[(None, None),], lj_eps=[1.,], lj_sigma=[1.,], lj_cutoffs=None, r_min=0):
         """
         Custom setter for Lennard-Jones (LJ) interactions between specified particle type pairs.
 
@@ -462,14 +459,14 @@ class Simulation():
 
         assert len(pairs) == len(lj_eps) and len(pairs) == len(
             lj_sigma), 'epsilon and sigma must be specified explicitly for each type pair'
-        if lj_cuttoffs is None:
+        if lj_cutoffs is None:
             for (key_el, key_el2), eps, sgm in zip(pairs, lj_eps, lj_sigma):
                 lj_cut = 2.5*sgm
                 self.sys.non_bonded_inter[self.part_types[key_el], self.part_types[key_el2]].lennard_jones.set_params(
                     epsilon=eps, sigma=sgm, cutoff=lj_cut, shift=0, min=r_min)
         else:
-            assert len(pairs) == len(lj_cuttoffs), 'cutoffs must be specified explicitly for each type pair'
-            for (key_el, key_el2), eps, sgm, cut in zip(pairs, lj_eps, lj_sigma, lj_cuttoffs):
+            assert len(pairs) == len(lj_cutoffs), 'cutoffs must be specified explicitly for each type pair'
+            for (key_el, key_el2), eps, sgm, cut in zip(pairs, lj_eps, lj_sigma, lj_cutoffs):
                 self.sys.non_bonded_inter[self.part_types[key_el], self.part_types[key_el2]].lennard_jones.set_params(
                     epsilon=eps, sigma=sgm, cutoff=cut, shift=0, min=r_min)
         logging.info('vdW interactions initiated!')
@@ -553,7 +550,8 @@ class Simulation():
             name = f"{type(self).__name__}.{inspect.currentframe().f_code.co_name}"
             raise MissingFeature(f"{name} requires WALBERLA. Please enable it in your ESPResSo installation.")
         self.sys.thermostat.turn_off()
-        self.sys.part.all().v = (0, 0, 0)
+        if len(self.sys.part):
+            self.sys.part.all().v = (0, 0, 0)
 
         if espressomd.version.major() == 4:
             param_dict={'kT':kT, 'seed':self.seed, 'agrid':agrid, 'dens':dens, 'visc':visc, 'tau':timestep}
@@ -595,21 +593,25 @@ class Simulation():
         :param slip_vel: tuple | Velocity of the slip boundary in the format (vx, vy, vz). Default is (0, 0, 0).
         :return: None
         """
-        if not api_agnostic_feature_check('LB_BOUNDARIES'):
-            name = f"{type(self).__name__}.{inspect.currentframe().f_code.co_name}"
-            raise MissingFeature(f"{name} requires LB_BOUNDARIES. Please enable it in your ESPResSo installation.")
-
         logging.info("Setup LB boundaries.")
         top_wall = shapes.Wall(normal=[1, 0, 0], dist=1) # type: ignore
         bottom_wall = shapes.Wall( # type: ignore
             normal=[-1, 0, 0], dist=-(self.sys.box_l[0] - 1))
 
-        top_boundary = espressomd.lbboundaries.LBBoundary( # type: ignore
-            shape=top_wall, velocity=slip_vel)
-        bottom_boundary = espressomd.lbboundaries.LBBoundary(shape=bottom_wall) # type: ignore
+        self.sys.lb.add_boundary_from_shape(shape=top_wall, velocity=slip_vel)
+        self.sys.lb.add_boundary_from_shape(shape=bottom_wall)
 
-        self.sys.lbboundaries.add(top_boundary)
-        self.sys.lbboundaries.add(bottom_boundary)
+    def thermostat_is_off(self):
+        """
+        True when no thermostat mode is active.
+        """
+        thermostat = self.sys.thermostat
+        if espressomd.version.major() == 4:
+            return thermostat.call_method("is_off")
+        if thermostat.kT is None:
+            return True
+        return not any(getattr(thermostat, name).is_active
+                        for name in ("langevin", "brownian", "lb"))
 
     def avoid_explosion(self, F_TOL, MAX_STEPS=5, F_incr=100, I_incr=100):
         """
@@ -754,7 +756,7 @@ class Simulation():
         :param cnt: int | The current timestep counter to be used as a key in the dump.
         :return: None
         """
-        particle_attribute_check(self.sys.part.by_id(0), 'to_dict_of_gods')
+        particle_attribute_check(self.sys.part.by_id(0), 'to_dict_of_god')
         f = gzip.open(path_to_dump, 'rb')
         dict_of_god = pickle.load(f)
         f.close()
@@ -1718,12 +1720,12 @@ class Simulation():
         ValueError
             If orientation must be inferred from ``dip`` and one or more dip vectors
             have zero (or nonpositive) magnitude.
-        KeyError
-            If HDF5/group lookups fail (e.g., missing datasets), depending on the
-            behavior of the data selector.
+        AttributeError
+            Raised by ``H5DataSelector`` when ``director`` is not a stored property
+            for the selected group; caught internally to fall back to normalized
+            ``dip``, and logged via ``sysos.exc_info()`` in that fallback path.
         Exception
-            Other exceptions may propagate from ``H5DataSelector`` or the predicate,
-            and are logged via ``sysos.exc_info()`` in the orientation fallback path.
+            Other exceptions may propagate from ``H5DataSelector`` or the predicate.
 
         Notes
         -----
@@ -1786,7 +1788,7 @@ class Simulation():
                 positions_per_obj.append(part_slice.pos)
                 try:
                     ori_per_obj.append(part_slice.director)
-                except KeyError:
+                except AttributeError:
                     exc_type, value, traceback = sysos.exc_info()
                     logging.debug("Failed with exception [%s,%s ,%s]" %
                         (exc_type, value, traceback))

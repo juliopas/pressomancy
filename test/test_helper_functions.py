@@ -1,10 +1,10 @@
-from create_system import BaseTestCase
+from .create_system import BaseTestCase
 import numpy as np
 from pressomancy.helper_functions import get_perpendicular, partition_cuboid_volume, get_neighbours, get_neighbours_cross_lattice
 
 class HelperFunctionsTest(BaseTestCase):
 
-    box_len=np.array([2.5, 2.5, 2.5])
+    box_dim=np.array([2.5, 2.5, 2.5])
     num_vol_all=14
     num_vol_side=5
 
@@ -41,10 +41,9 @@ class HelperFunctionsTest(BaseTestCase):
         perp_x = get_perpendicular(vec_x, phi=0.0)
         self.assertTrue(np.allclose(perp_x, np.array([0.0, 1.0, 0.0])))
 
-
 class PartitioningTest(BaseTestCase):
 
-    box_len=np.array([2.5, 2.5, 2.5])
+    box_dim=np.array([2.5, 2.5, 2.5])
     num_vol_all=14
     num_vol_side=5
 
@@ -54,8 +53,8 @@ class PartitioningTest(BaseTestCase):
 
     def test_get_neighbours(self):
         control= {0: [2,], 1: [2,],2: [0, 1, 3, 4,], 3: [2, ], 4: [2,]}
-        sphere_centers_short, _,_=partition_cuboid_volume(np.ones(3) * self.box_len,self.num_vol_side,self.sph_diam, flag='norand')
-        neigh=get_neighbours(sphere_centers_short,np.ones(3) * self.box_len,cuttoff=self.sph_diam)
+        sphere_centers_short, _,_=partition_cuboid_volume(self.box_dim,self.num_vol_side,self.sph_diam, flag='norand')
+        neigh=get_neighbours(sphere_centers_short,self.box_dim,cutoff=self.sph_diam)
         neigh_sets = {key: set(val) for key, val in neigh.items()}
         control_sets = {key: set(val) for key, val in control.items()}
         self.assertEqual(neigh_sets,control_sets,'the get_neighbour method failed to reproduce correct neighbour pairs for a single face of an fcc lattice')
@@ -63,11 +62,11 @@ class PartitioningTest(BaseTestCase):
     def test_get_neighbours_cross_lattice(self):
 
         control={0: [0, 2, 5, 6], 1: [1, 2, 5, 7], 2: [0, 1, 2, 3, 4, 5, 6, 7, 8], 3: [2, 3, 6, 8], 4: [2, 4, 7, 8]}
-        sphere_centers_long, _,_=partition_cuboid_volume(np.ones(3) * self.box_len,self.num_vol_all,self.sph_diam,flag='norand')
+        sphere_centers_long, _,_=partition_cuboid_volume(self.box_dim,self.num_vol_all,self.sph_diam,flag='norand')
 
-        sphere_centers_short, _,_=partition_cuboid_volume(np.ones(3) * self.box_len,self.num_vol_side,self.sph_diam,flag='norand')
+        sphere_centers_short, _,_=partition_cuboid_volume(self.box_dim,self.num_vol_side,self.sph_diam,flag='norand')
 
-        neigh=get_neighbours_cross_lattice(sphere_centers_short,sphere_centers_long,np.ones(3) * self.box_len,cuttoff=self.sph_diam)
+        neigh=get_neighbours_cross_lattice(sphere_centers_short,sphere_centers_long,self.box_dim,cutoff=self.sph_diam)
         self.assertEqual(neigh,control,'the get_neighbour method failed to reproduce correct neighbour pairs for a single face of an fcc lattice')
 
     def test_get_neighbours_rectangular(self):
@@ -82,7 +81,7 @@ class PartitioningTest(BaseTestCase):
                 [5.0, 10.0, 15.0],
             ]
         )
-        neigh = get_neighbours(points, box, cuttoff=cut)
+        neigh = get_neighbours(points, box, cutoff=cut)
 
         self.assertIn(1, neigh[0])
         self.assertIn(0, neigh[1])
@@ -108,7 +107,7 @@ class PartitioningTest(BaseTestCase):
                 [5.0, 18.5, 15.0],
             ]
         )
-        neigh = get_neighbours_cross_lattice(lattice_a, lattice_b, box, cuttoff=cut)
+        neigh = get_neighbours_cross_lattice(lattice_a, lattice_b, box, cutoff=cut)
 
         expected = {0: [0], 1: [1]}
         self.assertEqual(neigh, expected)
@@ -130,7 +129,7 @@ class PartitioningTest(BaseTestCase):
                 [5.0, 10.0, 15.0],
             ]
         )
-        neigh = get_neighbours(points, box, cuttoff=cut)
+        neigh = get_neighbours(points, box, cutoff=cut)
         expected = {0: [1, 2, 3], 1: [0], 2: [0], 3: [0]}
         neigh_sets = {key: set(val) for key, val in neigh.items()}
         expected_sets = {key: set(val) for key, val in expected.items()}
