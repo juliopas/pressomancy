@@ -1,5 +1,5 @@
 from pressomancy.simulation import Elastomer, PointDipolePermanent
-from create_system import sim_inst, BaseTestCase
+from .create_system import sim_inst, BaseTestCase
 import numpy as np
 from collections import defaultdict
 
@@ -69,7 +69,7 @@ class ElastomerTest(BaseTestCase):
         sim_inst.sys.thermostat.set_langevin(kT=0.7, gamma=3.5, seed=41)
         self.instance_cust.mix_elastomer_stuff(n_iter=0)
 
-        self.assertFalse(sim_inst.sys.thermostat.call_method("is_off"))
+        self.assertFalse(sim_inst.thermostat_is_off())
         self.assertTrue(sim_inst.sys.thermostat.langevin.is_active)
         self.assertAlmostEqual(sim_inst.sys.thermostat.kT, 0.7)
         np.testing.assert_allclose(np.copy(sim_inst.sys.thermostat.langevin.gamma), 3.5)
@@ -82,7 +82,7 @@ class ElastomerTest(BaseTestCase):
         sim_inst.sys.thermostat.turn_off()
         self.instance_cust._restore_thermostat_state(snapshot)
 
-        self.assertFalse(sim_inst.sys.thermostat.call_method("is_off"))
+        self.assertFalse(sim_inst.thermostat_is_off())
         self.assertTrue(sim_inst.sys.thermostat.brownian.is_active)
         self.assertAlmostEqual(sim_inst.sys.thermostat.kT, 0.9)
         np.testing.assert_allclose(np.copy(sim_inst.sys.thermostat.brownian.gamma), 2.5)

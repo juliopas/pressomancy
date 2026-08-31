@@ -1,6 +1,6 @@
 import numpy as np
 import espressomd
-from create_system import sim_inst, BaseTestCase
+from .create_system import sim_inst, BaseTestCase
 from pressomancy.simulation import MulticorePart
 from pressomancy.helper_functions import api_agnostic_feature_check
 if espressomd.version.major() == 5:

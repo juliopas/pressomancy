@@ -4,7 +4,7 @@ import logging
 import samples
 import os
 import sys
-from create_system import sim_inst, BaseTestCase
+from .create_system import sim_inst, BaseTestCase
 from unittest import mock
 from pressomancy.helper_functions import MissingFeature
 

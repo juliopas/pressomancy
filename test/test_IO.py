@@ -1,6 +1,6 @@
 import numpy as np
 import espressomd
-from create_system import sim_inst , BaseTestCase
+from .create_system import sim_inst , BaseTestCase
 from pressomancy.simulation import Filament, Quartet, Quadriplex, Crowder, Elastomer, PointDipolePermanent
 from pressomancy.helper_functions import BondWrapper
 from pressomancy.analysis import H5DataSelector, H5ObservableSelector
@@ -21,16 +21,21 @@ def capture_particle_snapshot(parts, custom_prop=None):
     snap=[]
     for part in parts:
         new=cestica()
-        for prop, _ in sim_inst.io_dict["properties"]:
+        for prop, _, _ in sim_inst.io_dict["properties"]:
             setattr(new, prop, getattr(part, prop))
         if custom_prop is not None:
             setattr(new, custom_prop, getattr(part, custom_prop))
         snap.append(new)
     return snap
 
-def check_prop_dim(dataview, ref_parts, prop_shape, time_slice=-1, expected_types=None):
-    prop, shape = prop_shape
+def check_prop_dim_dtype(dataview, ref_parts, prop_shape_dtype, time_slice=-1, expected_types=None):
+    prop, shape, _dtype = prop_shape_dtype
     property_data_h5df=getattr(dataview,prop)
+    # dtype / shape checks on the stored data, before any squeeze
+    assert property_data_h5df.dtype == np.dtype(_dtype), \
+        f"'{prop}': stored dtype {property_data_h5df.dtype}, expected {np.dtype(_dtype)}"
+    assert property_data_h5df.shape[-1] == shape, \
+        f"'{prop}': stored last dim {property_data_h5df.shape[-1]}, expected {shape}"
     property_data=[]
     time_part_slice=np.atleast_2d(ref_parts if time_slice is None else ref_parts[time_slice])
     for snap in time_part_slice:
@@ -40,18 +45,19 @@ def check_prop_dim(dataview, ref_parts, prop_shape, time_slice=-1, expected_type
             property_data.append([getattr(part,prop) for part in snap])
     if shape == 1:
         property_data_h5df=np.squeeze(property_data_h5df, axis=-1)
-    assert np.allclose(property_data, property_data_h5df, rtol=1e-05, atol=1e-08), f'The vectors differ!, {property_data}, {property_data_h5df}'
+    assert np.allclose(property_data, property_data_h5df, rtol=1e-05, atol=1e-08), \
+        f'The vectors differ!, {property_data}, {property_data_h5df}'
 
 def get_and_check_complete_object(dataview, object_grp_name, identity, ref_parts, expected_types, time_slice):
 
     selection_source = dataview if time_slice is None else dataview.timestep[time_slice]
     selection=selection_source.select_particles_by_object(object_name=object_grp_name, connectivity_value=identity)
-    for prop,shape in sim_inst.io_dict['properties']:
-        check_prop_dim(selection, ref_parts, (prop, shape), time_slice=time_slice, expected_types=expected_types)
+    for prop,shape,_dtpye in sim_inst.io_dict['properties']:
+        check_prop_dim_dtype(selection, ref_parts, (prop, shape, _dtpye), time_slice=time_slice, expected_types=expected_types)
     for predicate_type in expected_types:
         selection=selection_source.select_particles_by_object(object_name=object_grp_name, connectivity_value=identity,predicate=lambda p:p.type==predicate_type)
-        for prop,shape in sim_inst.io_dict['properties']:
-            check_prop_dim(selection, ref_parts, (prop, shape), time_slice=time_slice, expected_types=[predicate_type])
+        for prop,shape,_dtype in sim_inst.io_dict['properties']:
+            check_prop_dim_dtype(selection, ref_parts, (prop, shape, _dtype), time_slice=time_slice, expected_types=[predicate_type])
 
 class CommonH5DataSelectorTests:
 
@@ -295,7 +301,7 @@ class CommonH5DataSelectorTests:
                     self.check_version_signing(dataview)
                     self.check_expected_metadata(dataview, h5_file, particle_group=particle_group)
                     np.testing.assert_array_equal(dataview.step, np.array([self.written_steps[-1]], dtype=np.int32))
-                    check_prop_dim(dataview, [self.part_snapshots[particle_group][-1]], ("pos", 3), time_slice=0)
+                    check_prop_dim_dtype(dataview, [self.part_snapshots[particle_group][-1]], ("pos", 3, np.float64), time_slice=0)
 
     def test_load_modes(self):
         with tempfile.TemporaryDirectory() as tmpdirname:
@@ -454,15 +460,22 @@ class CommonH5DataSelectorTests:
 
     def test_obsolete_IO(self):
         with tempfile.TemporaryDirectory() as tmpdirname:
+            target = os.path.join(tmpdirname, "testfile.p.gz")
+
+            path_to_dump, counter = sim_inst.init_pickle_dump(path_to_dump=target)
+            self.assertEqual(path_to_dump, target)
+            self.assertEqual(counter, 0)
+            self.assertTrue(os.path.exists(target))
+            self.assertGreater(os.path.getsize(target), 0)
+
+            dungeon_witch_list = list(sim_inst.sys.part.all())
             try:
-                path_to_dump, GLOBAL_COUNTER = sim_inst.init_pickle_dump(
-                    path_to_dump=os.path.join(tmpdirname, "testfile.p.gz"))
-                dungeon_witch_list = list(sim_inst.sys.part.all())
-                sim_inst.dump_to_init(path_to_dump, dungeon_witch_list, GLOBAL_COUNTER)
-                path_to_dump, GLOBAL_COUNTER = sim_inst.load_pickle_dump(
-                    os.path.join(tmpdirname, "testfile.p.gz"))
+                sim_inst.dump_to_init(path_to_dump, dungeon_witch_list, counter)
             except MissingFeature as excp:
-                logging.warning(f"Skipping depreciated IO pipeline tests because it requires a feature that is not available.  Caught exception {excp}")
+                self.skipTest(f"Skipping depreciated IO pipeline tests because it requires a feature that is not available.  Caught exception {excp}")
+
+            _, next_counter = sim_inst.load_pickle_dump(target)
+            self.assertEqual(next_counter, counter + 1)
 
 class ElastomerFixture(CommonH5DataSelectorTests, BaseTestCase):
     box_dim = [5,5,20]

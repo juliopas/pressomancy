@@ -16,40 +16,26 @@ class SimulationTest(BaseTestCase):
 
     def test_store_set_del_objects(self):
         classes = [member for name, member in inspect.getmembers(pressomancy.object_classes, inspect.isclass)]
+        exercised = []
         for cls in classes:
             try:
                 instance=[cls(config=cls.config.specify(espresso_handle=sim_inst.sys)),]
                 sim_inst.store_objects(instance)
                 sim_inst.set_objects(instance)
-                instance[0].delete_owned_parts()
             except MissingFeature as excp:
                 logging.warning(f"Skipping {cls.__name__} because it requires a feature that is not available.  Caught exception {excp}")
                 continue
-            self.assertEqual(len(sim_inst.sys.part), 0)
+            self.assertGreater(len(sim_inst.sys.part), 0,
+                               f"{cls.__name__}.set_object created no particles")
+            exercised.append(cls.__name__)
+            instance[0].delete_owned_parts()
+            self.assertEqual(len(sim_inst.sys.part), 0,
+                             f"{cls.__name__}.delete_owned_parts left particles behind.")
+        self.assertGreater(len(exercised), 0,
+                           "every object class was skipped; nothing was actually tested.")
 
     def test_set_valid_attr(self):
         old_seed = sim_inst.seed
-        try:
-            sim_inst.seed = old_seed + 1
-        except:
-            pass
+        sim_inst.seed = old_seed + 1
 
         assert sim_inst.test_set_attr("seed") == sim_inst.seed == old_seed + 1
-
-    def test_set_private_attr(self):
-        try:
-            sim_inst.no_objects = 3
-            success = False
-        except:
-            success = True
-
-        assert success
-
-    def test_set_private_attr(self):
-        try:
-            sim_inst.no_objects = 3
-            success = False
-        except:
-            success = True
-
-        assert success

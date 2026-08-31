@@ -1,6 +1,6 @@
 import espressomd
 import numpy as np
-from create_system import sim_inst, BaseTestCase
+from .create_system import sim_inst, BaseTestCase
 from pressomancy.object_classes.tel_sequence import TelSeq
 from pressomancy.object_classes.quadriplex_class import Quartet, Quadriplex
 from pressomancy.helper_functions import BondWrapper, api_agnostic_feature_check

@@ -1,7 +1,9 @@
 from pressomancy.simulation import PointDipolePermanent, PointDipoleMagnetizable
 from pressomancy.helper_functions import api_agnostic_feature_check
 from pressomancy.magnetodynamics import required_features_for
-from create_system import sim_inst, BaseTestCase
+from .create_system import sim_inst, BaseTestCase
+
+import numpy as np
 
 
 class PointDipoleTest(BaseTestCase):
@@ -21,8 +23,16 @@ class PointDipoleTest(BaseTestCase):
         sim_inst.set_objects(self.mag_part)
 
     def test_set_object_generic(self):
-
+        for name, type_id in PointDipolePermanent.part_types.items():
+            assert sim_inst.part_types[name] == type_id
         assert sim_inst.part_types["pdp_real"] == 61
+
+        parts = sim_inst.sys.part.select(type=sim_inst.part_types['pdp_real'])
+        assert len(parts) == len(self.mag_part) == 11
+
+        moments = sorted(np.linalg.norm(p.dip) for p in parts)
+        np.testing.assert_allclose(moments[:10], [1.0] * 10, rtol=1e-6)
+        np.testing.assert_allclose(moments[10], 1.2, rtol=1e-6)
 
 MODEL = 'langevin'
 
@@ -48,15 +58,22 @@ if all(api_agnostic_feature_check(feature) for feature in required_features_for(
             sim_inst.set_objects(self.mag_part)
 
         def test_set_object_generic(self):
-            assert sim_inst.part_types["pdm_real"] == 62 and sim_inst.part_types["pdm_virt"] == 666
+            for name, type_id in PointDipoleMagnetizable.part_types.items():
+                assert sim_inst.part_types[name] == type_id
+            assert sim_inst.part_types["pdm_real"] == 62 and sim_inst.part_types["pdm_virt"] == 622
 
         def test_model_written_to_virtual_site(self):
-            p_virt = next(iter(sim_inst.sys.part.select(type=sim_inst.part_types["pdm_virt"])))
-            # defaults come from the class level config
-            assert p_virt.dipm_sat == 1.
-            assert p_virt.mag_susc_0 == 1.
-            assert p_virt.langevin_magnetization_is_enabled is True
-            assert p_virt.froelich_kennelly_is_enabled is False
+            specified_virt = self.mag_part[-1].type_part_dict['pdm_virt'][0]
+            assert specified_virt.mag_susc_0 == 0.5, 'per-object config must reach the particle'
+            assert specified_virt.dipm_sat == 1.
+
+            for obj in self.mag_part[:-1]:
+                p_virt = obj.type_part_dict['pdm_virt'][0]
+                assert p_virt.mag_susc_0 == 0.1, 'default config object must keep the default'
+                assert p_virt.dipm_sat == 1.
+
+            assert specified_virt.langevin_magnetization_is_enabled is True
+            assert specified_virt.froelich_kennelly_is_enabled is False
 
         def test_virtual_site_binding(self):
             p_virt = next(iter(sim_inst.sys.part.select(type=sim_inst.part_types["pdm_virt"])))

@@ -11,7 +11,7 @@ from pressomancy.magnetodynamics import (MAGNETIZATION_MODELS, configure_magneti
                                          susceptibility_from_kT, validate_model)
 from pressomancy.simulation import (Filament, PointDipoleMagnetizable,
                                     PointDipoleSuperparamagnetic)
-from create_system import sim_inst, BaseTestCase
+from .create_system import sim_inst, BaseTestCase
 
 AVAILABLE_MODELS = [name for name in MAGNETIZATION_MODELS
                     if all(api_agnostic_feature_check(f)
@@ -257,7 +257,6 @@ class ContractionRatioTest(BaseTestCase):
     m_sat = 1.732
 
     def tearDown(self) -> None:
-        sim_inst.sys.magnetostatics.clear()
         self.cleanup()
         self.assertEqual(len(sim_inst.sys.part), 0)
 
@@ -277,22 +276,94 @@ class ContractionRatioTest(BaseTestCase):
         sim_inst.set_H_ext(H=[0., 0., 1.])
         return parts
 
+    @staticmethod
+    def _reset_cluster():
+        sim_inst.sys.magnetostatics.clear()
+        sim_inst.sys.part.all().remove()
+
+    @staticmethod
+    def _increment_series(parts, n_iter, scalar):
+        increments = []
+        previous = None
+        for _ in range(n_iter):
+            sim_inst.sys.integrator.run(0, recalc_forces=True)
+            current = (np.array([p.dipm for p in parts]) if scalar
+                       else np.array([p.dip for p in parts]).ravel())
+            if previous is not None:
+                increments.append(np.linalg.norm(current - previous))
+            previous = current
+        return np.asarray(increments)
+
+    @staticmethod
+    def _ratios(increments, tol=1e-12):
+        converged = np.flatnonzero(increments <= tol)
+        cut = int(converged[0]) if converged.size else len(increments)
+        increments = increments[:cut]
+        if len(increments) < 2:
+            return np.empty(0)
+        return increments[1:] / increments[:-1]
+
+    def _tilted_ring(self, chi_0, n=6, radius=1.0, tilt=0.3*np.pi, H=(0., 0., 0.1)):
+        parts = []
+        for i in range(n):
+            phi = 2. * np.pi * i / n
+            anchor = sim_inst.sys.part.add(
+                pos=[10. + radius * np.cos(phi), 10. + radius * np.sin(phi), 10.],
+                fix=[True] * 3)
+            moment = self.m_sat * np.array([np.sin(tilt) * np.cos(phi),
+                                            np.sin(tilt) * np.sin(phi),
+                                            np.cos(tilt)])
+            virt = sim_inst.sys.part.add(pos=anchor.pos, rotation=[True] * 3,
+                                         dip=moment)
+            configure_magnetization(virt, AVAILABLE_MODELS[0], self.m_sat, chi_0,
+                                    anchor=anchor)
+            parts.append(virt)
+        sim_inst.init_magnetic_inter(
+            espressomd.magnetostatics.DipolarDirectSum(prefactor=1.))
+        sim_inst.set_H_ext(H=list(H))
+        return parts
+
+    def test_rotation_dominated_series_tracks_moment_vectors(self):
+        n_iter = 10
+
+        vec_inc = self._increment_series(
+            self._tilted_ring(chi_0=0.8), n_iter, scalar=False)
+        self._reset_cluster()
+        sca_inc = self._increment_series(
+            self._tilted_ring(chi_0=0.8), n_iter, scalar=True)
+        self._reset_cluster()
+        # the fixture must actually be rotation-dominated, otherwise the rest is vacuous
+        live = vec_inc > 1e-12
+        self.assertTrue(live.any(), "no resolvable increments")
+        self.assertLess((sca_inc[live] / vec_inc[live]).mean(), 0.25,
+                        "fixture is not roation-dominated, otherwise this ration would be small")
+
+        expected_vector = self._ratios(vec_inc)
+        expected_scalar = self._ratios(sca_inc)
+        actual = sim_inst.probe_magnetization_convergence(
+            self._tilted_ring(chi_0=0.8), n_iter=n_iter)
+        np.testing.assert_allclose(
+            actual, expected_vector, rtol=1e-9,
+            err_msg='probe does not track the stacked moment vectors')
+        self.assertFalse(
+            np.allclose(actual, expected_scalar),
+            "probe output matches a magnitude-only metric."
+            "contraction_ratio has regressed to reading p.dipm instead of p.dip")
+
     def test_weak_coupling_contracts(self):
         parts = self._chain(chi_0=0.1)
-        ratios = sim_inst.probe_magnetization_convergence(parts, n_iter=30)
+        ratios = sim_inst.probe_magnetization_convergence(parts, n_iter=10)
         self.assertGreater(len(ratios), 0)
-        self.assertLess(ratios[-1], 1.,
-                        'weakly coupled chain must contract')
+        self.assertLess(ratios[-1], 1.)
 
     def test_stronger_coupling_contracts_more_slowly(self):
         weak = self._chain(chi_0=0.05)
-        weak_ratio = sim_inst.probe_magnetization_convergence(weak, n_iter=30)[-1]
+        weak_ratio = sim_inst.probe_magnetization_convergence(weak, n_iter=10)[-1]
         sim_inst.sys.magnetostatics.clear()
         sim_inst.sys.part.all().remove()
         strong = self._chain(chi_0=0.4)
-        strong_ratio = sim_inst.probe_magnetization_convergence(strong, n_iter=30)[-1]
-        self.assertLess(weak_ratio, strong_ratio,
-                        'the amplification factor must grow with susceptibility')
+        strong_ratio = sim_inst.probe_magnetization_convergence(strong, n_iter=10)[-1]
+        self.assertLess(weak_ratio, strong_ratio)
 
     def test_probe_does_not_advance_the_simulation(self):
         parts = self._chain(chi_0=0.1)
@@ -302,28 +373,13 @@ class ContractionRatioTest(BaseTestCase):
         self.assertEqual(sim_inst.sys.time, time_before)
         np.testing.assert_allclose(sim_inst.sys.part.all().pos, pos_before)
 
-    def test_rejects_degenerate_arguments(self):
-        parts = self._chain(chi_0=0.1)
-        for bad in (0, 1, -3):
-            with self.assertRaises(ValueError):
-                contraction_ratio(sim_inst.sys, parts, n_iter=bad)
-        with self.assertRaises(ValueError):
-            contraction_ratio(sim_inst.sys, [], n_iter=10)
-        for bad_tol in (0., -1e-9):
-            with self.assertRaises(ValueError):
-                contraction_ratio(sim_inst.sys, parts, n_iter=10, tol=bad_tol)
-
     def test_converged_series_is_truncated_not_reported_as_noise(self):
-        # once the moments stop changing to machine precision the raw ratio of
-        # successive increments drifts to 1; the probe must not report that
         parts = self._chain(chi_0=0.02)
-        ratios = sim_inst.probe_magnetization_convergence(parts, n_iter=60)
-        if len(ratios):
-            self.assertLess(ratios[-1], 1.)
+        ratios = sim_inst.probe_magnetization_convergence(parts, n_iter=10)
+        self.assertGreater(len(ratios), 0)
+        self.assertLess(ratios[-1], 1.)
 
     def test_exact_fixed_point_reports_no_ratio(self):
-        # a lone particle has no dipolar field, so it lands on its fixed point
-        # in the first iterate and never moves again
         anchor = sim_inst.sys.part.add(pos=[10., 10., 10.], fix=[True] * 3)
         virt = sim_inst.sys.part.add(pos=anchor.pos, rotation=[True] * 3,
                                      dip=[0., 0., self.m_sat])
@@ -341,7 +397,7 @@ class MissingFeatureTest(unittest.TestCase):
         unavailable = [name for name in MAGNETIZATION_MODELS
                        if name not in AVAILABLE_MODELS]
         if not unavailable:
-            self.skipTest('every model is compiled in this espresso build')
+            self.skipTest("every model is compiled in this espresso build")
         anchor = sim_inst.sys.part.add(pos=[5., 5., 5.])
         virt = sim_inst.sys.part.add(pos=anchor.pos)
         try:

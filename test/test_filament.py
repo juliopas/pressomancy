@@ -2,7 +2,7 @@ import numpy as np
 import espressomd
 from pressomancy.helper_functions import BondWrapper
 from pressomancy.object_classes import Filament, Quartet, Quadriplex, RaspberrySphere
-from create_system import sim_inst , BaseTestCase
+from .create_system import sim_inst , BaseTestCase
 
 class FilamentTest(BaseTestCase):
 
