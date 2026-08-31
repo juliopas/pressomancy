@@ -817,90 +817,100 @@ def build_grid_and_adjacent(lattice_points, volume_side, cell_size):
 
     return grid, adjacent
 
-def get_neighbours(lattice_points: np.ndarray, volume_side: float, cutoff: float = 1.) -> defaultdict:
-    """
-    Returns grouped_indices, where grouped_indices is a dictionary that maps each particle index
-    to a list of neighbor indices within the cutoff distance. Uses a grid-based method for efficiency,
-    and reuses the min_img_dist function for distance calculations.
+def get_neighbours(points: np.ndarray, box_dim: ArrayLike, cutoff: float = 1., sort: bool = True,
+                   max_bytes: int = 256 << 15, cells_per_cutoff: int | None = None):
+    """Symmetric neighbour lists within one lattice under PBC. Numpy only.
+
+    Every index 0..N-1 is a key, isolated particles map to [], j is in
+    result[i] if and only if i is in result[j], and no particle is its own
+    neighbour.
 
     Parameters
     ----------
-    lattice_points : np.ndarray of shape (N, 3)
-        Array of particle positions.
-    volume_side : float or array-like of shape (3,)
-        The side length of the cubic volume or the side lengths of a rectangular volume.
-    cutoff : float, optional
-        The neighbor distance threshold.
-
-    Note:
-        - particle index is taken from 0 to number of particles.
-
-    Returns
-    -------
-    grouped_indices : defaultdict[int, list[int]]
-        Dictionary mapping each particle index to a list of neighbor indices.
+    sort : bool
+        True gives ascending neighbour lists; False leaves the order
+        unspecified but deterministic, and is slightly cheaper.
+    max_bytes : int
+        Soft cap on the transient candidate buffers, default 256 MB. Lower it
+        on a memory-constrained machine; results are unaffected.
+    cells_per_cutoff : int or None
+        Cells per cutoff length along each axis. None (default) auto-selects by
+        minimising a cost model over k = 1, 2, 3, 4, 6, 8; pass an integer only
+        to override that choice.
     """
-    # Use cutoff as the grid cell size.
-    cell_size = cutoff
-    grid, adjacent_cells = build_grid_and_adjacent(lattice_points, volume_side, cell_size)
+    box_dim = _as_box(box_dim)
+    pts = np.ascontiguousarray(points)
+    cutoff_limit = 0.5 * box_dim.min()
+    if cutoff > cutoff_limit:
+        raise ValueError(
+            f"cutoff {cutoff:g} exceeds half the smallest box side ({cutoff_limit:g}). "
+            "The minimum image convention breaks down above L/2: a particle "
+            "would be counted as its own periodic neighbour."
+        )
 
-    grouped_indices = defaultdict(list)
-    volume_side = np.asarray(volume_side)
-    if volume_side.ndim == 0:
-        box_dim = np.ones(3) * volume_side
-    else:
-        box_dim = volume_side
+    # simple cases (avoid wrappign and building cell)
+    n_points = pts.shape[0]
+    if n_points == 0:
+        return {}
+    if n_points == 1:
+        return {0: []}
 
-    # For each occupied cell in the grid...
-    for cell, indices in grid.items():
-        # Get the list of adjacent cells (neighbors) for this cell.
-        neighbor_cells = adjacent_cells[cell]
-        # For every particle in the current cell...
-        for i in indices:
-            # Check particles in each neighboring cell.
-            for adj_cell in neighbor_cells:
-                for j in grid.get(adj_cell, []):
-                    if j == i:
-                        continue
-                    # Use min_img_dist to compute the distance with periodic boundaries.
-                    diff = min_img_dist(lattice_points[i], lattice_points[j], box_dim=box_dim)
-                    if np.linalg.norm(diff) <= cuttoff:
-                        grouped_indices[i].append(j)
+    wrapped = np.ascontiguousarray(fold_coords(pts, box_dim))
+    i, j = _pairs_from_cells(
+        wrapped,
+        wrapped,
+        box_dim,
+        cutoff,
+        exclude_self=True,
+        half=True,
+        max_bytes=max_bytes,
+        cells_per_cutoff=cells_per_cutoff,
+    )
 
-    return grouped_indices
+    # Mirror the half list into the symmetric form.
+    rows = np.concatenate([i, j])
+    cols = np.concatenate([j, i])
+    return _pairs_rows_cols_to_dict(rows, cols, n_points, sort=sort)
 
-def get_neighbours_cross_lattice(lattice1, lattice2, box_lengths, cuttoff=1.):
+def get_neighbours_cross_lattice(points_a: np.ndarray, points_b: np.ndarray, box_dim: ArrayLike,
+    cutoff: float = 1.0, sort: bool = True,
+    max_bytes: int = 256 << 15, cells_per_cutoff: bool = None):
+    """Neighbours of each lattice1 point among the lattice2 points. Numpy only.
+
+    Keys index lattice1, values index lattice2. Nothing is excluded: a
+    coincident pair is reported at distance zero. max_bytes and
+    cells_per_cutoff behave as in get_neighbours.
     """
-    Get neighbors between two lattices in a cuboid under PBC using minimum image convention.
+    box_dim = _as_box(box_dim)
+    pts_a = np.ascontiguousarray(points_a)
+    pts_b = np.ascontiguousarray(points_b)
+    cutoff_limit = 0.5 * box_dim.min()
+    if cutoff > cutoff_limit:
+        raise ValueError(
+            f"cutoff {cutoff:g} exceeds half the smallest box side ({cutoff_limit:g}). "
+            "The minimum image convention breaks down above L/2: a particle "
+            "would be counted as its own periodic neighbour."
+        )
 
-    Parameters
-    ----------
-    lattice1 : np.ndarray, shape (N1, 3)
-    lattice2 : np.ndarray, shape (N2, 3)
-    box_len : array-like of shape (3,)
-    cutoff : float
+    n_a = pts_a.shape[0]
+    n_b = pts_b.shape[0]
+    if n_a == 0:
+        return {}
+    if n_b == 0:
+        return {i: [] for i in range(n_a)}
 
-    Returns
-    -------
-    dict
-        {index in lattice1: [indices in lattice2 within cutoff]}
-    """
-    if isinstance(box_lengths, float):
-        box_lengths = box_lengths * np.ones(3)
-    box_lengths = np.asarray(box_lengths)
-
-    grouped_indices = defaultdict(list)
-    points_a = np.atleast_2d(lattice1)
-    points_b = np.atleast_2d(lattice2)
-    num_b = len(points_b)
-    indices_b = np.arange(num_b)
-
-    for id,point in enumerate(points_a):
-        distances=np.linalg.norm(min_img_dist(point, points_b, box_dim=box_lengths), axis=-1)
-        mask=np.where(distances<=cuttoff)
-        grouped_indices[id]=list(indices_b[mask])
-
-    return grouped_indices
+    i, j = _pairs_from_cells(
+        np.ascontiguousarray(fold_coords(pts_a, box_dim)),
+        np.ascontiguousarray(fold_coords(pts_b, box_dim)),
+        box_dim,
+        cutoff,
+        exclude_self=False,
+        half=False,
+        max_bytes=max_bytes,
+        cells_per_cutoff=cells_per_cutoff,
+    )
+    # _pairs_from_cells emits i in ascending order, so grouping is already done.
+    return _pairs_rows_cols_to_dict(i, j, n_a, sort=sort)
 
 def calculate_pair_distances(points_a, points_b, box_lengths):
     """
@@ -951,21 +961,34 @@ def calculate_pair_distances(points_a, points_b, box_lengths):
 
     return distances
 
-def fcc_lattice(radius, volume_sides, scaling_factor=1., max_points_per_side=100):
+def fcc_lattice(radius: float, box_dim, scaling_factor: float = 1.0,
+                max_points_per_side: int = 100, mode: str = "pack") -> np.ndarray:
     """
-    Generates a face-centered cubic (FCC) lattice of points within a cuboid volume. The function creates an FCC crystal structure where spheres of given radius are arranged such that they touch along the face diagonal of the unit lattice.
+    Generates a face-centered cubic (FCC) lattice of points within a cuboid volume.
+
+    The function creates an FCC crystal structure where spheres of given radius are
+    arranged such that they touch along the face diagonal of the unit lattice
+    (conventional lattice constant a = 2*sqrt(2)*r).
 
     Parameters
     ----------
     radius : float
         Radius of the spheres in the lattice.
-    volume_side : iterable of float of size 3
+    box_dim : iterable of float of size 3
         Length of the cuboid volume's sides.
     scaling_factor : float, optional
         Factor to scale the radius of the spheres. Default is 1.0.
     max_points_per_side : int, optional
         Maximum number of points allowed per dimension. Default is 100.
         If exceeded, lattice constant is increased.
+    mode : {'pack', 'crystal'}
+        'pack' (default) — densest non-overlapping arrangement at the touching
+        pitch sqrt(2)*r. Locally FCC with coordination 12, but the leftover
+        collects as a void at the periodic seam, so the lattice does not
+        continue into its own image.
+        'crystal' — the pitch is relaxed per axis until the lattice tiles the
+        box exactly, giving a defect-free periodic FCC with no seam, at the
+        cost of neighbours sitting slightly beyond 2r.
 
     Returns
     -------
@@ -975,38 +998,44 @@ def fcc_lattice(radius, volume_sides, scaling_factor=1., max_points_per_side=100
 
     Notes
     -----
-    - The lattice constant is calculated as 2*radius_scaled/sqrt(2), where
-      radius_scaled = radius*scaling_factor.
-    - If the number of points per side exceeds max_points_per_side, the lattice
-      constant is gradually increased until the constraint is satisfied.
-    - The function ensures the lattice fits within the given volume by removing
-      the last row of points to avoid periodic boundary condition overlaps.
-    - When the lattice constant is increased, a warning message is logged with
-      the new value.
+    - The half-step (simple-cubic sub-lattice pitch) is p = sqrt(2)*r and the
+      conventional constant is a = 2*p. Sites are the (i+j+k) even subset,
+      generated here as whole cells times the 4-point basis.
+    - mode='crystal' always resolves to an even site count, while
+      mode='pack' does not guarantee this.
+        Sites are the (i+j+k) even subset of a simple-cubic grid of pitch p.
+        An even number of layers per axis guarantees a site and the periodic
+        image of its wrap partner differ in parity, putting them at least
+        sqrt(2)*p = 2r apart. An odd count is kept only when the seam gap is
+        itself >= 2r.
     """
-    assert len(volume_sides)==3, "this metthod assumes volume_sides to be have len of 3"
-    volume_sides = np.asarray(volume_sides)
+    box_dim = _as_box(box_dim, ndim=3)
+    if radius <= 0 or scaling_factor <= 0:
+        raise ValueError("radius and scaling_factor must be positive")
+    stretch = mode == "crystal"
+    if mode not in ("pack", "crystal"):
+        raise ValueError(f"mode must be 'pack' or 'crystal', got {mode!r}")
 
-    radius_scaled = radius*scaling_factor
-    lattice_constant = 2 * radius_scaled / np.sqrt(2)
-    while True:
-        num_points = np.ceil(volume_sides / lattice_constant).astype(int)
-        if (num_points <= max_points_per_side).any():
-            break
-        lattice_constant *= 1.1
-        logging.info('lattice_constant increased to %s becaouse %s bigger than %s', lattice_constant,num_points,max_points_per_side)
+    radius_scaled = radius * scaling_factor
+    half_lattice_constant = np.sqrt(2) * radius_scaled
+    step = max(half_lattice_constant, (box_dim / max_points_per_side).max())
 
-    indices = [np.arange(num-1) for num in num_points ]
-    x, y, z = np.meshgrid(indices[0], indices[1], indices[2], indexing='ij')
-    sum_indices = x + y + z
-    mask = sum_indices % 2 == 0
-    lattice_points = np.column_stack(
-        (x[mask], y[mask], z[mask])) * lattice_constant + np.ones(shape=3)*radius
-    leftover = volume_sides - (num_points - 2) * lattice_constant
-    if np.any(leftover < 2 * radius_scaled):
-        recenica = f'box_l is not big enough to avoid pbc clipping of the partitioning! Leftover per axis: {leftover}, needed: {2 * radius_scaled}'
-        warnings.warn(recenica)
-    return lattice_points
+    radius_fit_per_side = np.floor(box_dim / step + 1e-9).astype(int)
+    if np.any(radius_fit_per_side < 2):
+        raise ValueError(f"box {box_dim} too small for spheres of radius {radius_scaled}")
+    n_half = radius_fit_per_side
+    if not stretch:
+        seam = box_dim - (n_half - 1) * step
+        odd_unsafe = (n_half % 2 == 1) & (seam < 2 * radius_scaled - 1e-9)
+        n_half = np.where(odd_unsafe, n_half - 1, n_half)
+    else:
+        n_half -= n_half % 2
+        step = box_dim / n_half
+    cells = np.meshgrid(*[np.arange(n) for n in n_half], indexing="ij")
+    mask = (cells[0] + cells[1] + cells[2]) % 2 == 0
+    points = np.column_stack([g[mask] for g in cells]) * step
+
+    return points
 
 def make_centered_rand_orient_point_array(center=np.array([0,0,0]), sphere_radius=1., num_monomers=1, spacing=None, box_lengths=None):
     """
@@ -1088,12 +1117,19 @@ def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_p
     scaling = 1.0
 
     # Adjust scaling until we have enough sphere centers
+    scaling_floor = 0.85
     while True:
-        sphere_centers = fcc_lattice(radius=sphere_radius, volume_sides=box_lengths, scaling_factor=scaling)
+        sphere_centers = fcc_lattice(radius=sphere_radius, box_dim=box_lengths, scaling_factor=scaling, mode="pack")
         volumes_to_fill=len(sphere_centers)
         logging.info('num_spheres_needed, num_spheres_got: %s', (num_spheres, volumes_to_fill))
         if  volumes_to_fill>= num_spheres:
             break
+        if scaling - 0.1 < scaling_floor:
+            raise ValueError(
+                f"Cannot fit {num_spheres} spheres of diameter {sphere_diameter} into a box of "
+                f"{box_lengths}: only {volumes_to_fill} lattice sites exist at the minimum "
+                f"packing scale ({scaling_floor}). Reduce num_spheres or sphere_diameter, "
+                f"or enlarge the box.")
         scaling -= 0.1
     logging.info('scaling used: %s', scaling)
 
@@ -1717,3 +1753,203 @@ def _as_box(box_dim: ArrayLike, ndim=None) -> np.ndarray:
     if np.any(box <= 0):
         raise ValueError(f"box_dim must be strictly positive, got {box}")
     return box
+
+# Neighbor helper functions
+# A candidate costs: i(int32) + j(int32) + three float64 buffers (d, dy, dz).
+_BYTES_PER_CANDIDATE = 4 + 4 + 8 * 3
+def _pairs_from_cells(query_pts, target_pts, box_dim, cutoff,
+    exclude_self, half,
+    max_bytes, cells_per_cutoff):
+    """Return (i, j) index arrays of all pairs within the cutoff.
+
+    i indexes query_pts, j indexes target_pts. With half=True only pairs with
+    j > i are returned (valid only when the two point sets are the same array).
+    """
+    box_dim = _as_box(box_dim)
+    ndim = box_dim.shape[0]
+    n_cells, cell_size, stencil = _choose_grid(
+        box_dim, cutoff, target_pts.shape[0], cells_per_cutoff
+    )
+    n_total = int(n_cells.prod())
+    
+    cell_coords_t = np.floor(target_pts / cell_size).astype(np.int64)
+    np.clip(cell_coords_t, 0, n_cells - 1, out=cell_coords_t)
+    linear_idx_t = (cell_coords_t[:, 0] * n_cells[1] + cell_coords_t[:, 1]) * n_cells[2] + cell_coords_t[:, 2]
+    
+    order = np.argsort(linear_idx_t, kind="stable").astype(np.int32)
+    counts = np.bincount(linear_idx_t, minlength=n_total)
+    start = np.concatenate(([0], np.cumsum(counts)))
+
+    if query_pts is target_pts:
+        linear_idx_q = linear_idx_t
+    else:
+        cell_coords_q = np.floor(query_pts / cell_size).astype(np.int64)
+        np.clip(cell_coords_q, 0, n_cells - 1, out=cell_coords_q)
+        linear_idx_q = (cell_coords_q[:, 0] * n_cells[1] + cell_coords_q[:, 1]) * n_cells[2] + cell_coords_q[:, 2]
+        del cell_coords_q
+
+    del cell_coords_t
+
+    qx, qy, qz = (np.ascontiguousarray(query_pts[:, d]) for d in range(ndim))
+    tx, ty, tz = (np.ascontiguousarray(target_pts[:, d]) for d in range(ndim))
+
+    n_q = query_pts.shape[0]
+    n_stencil = stencil.shape[0]
+    cutoff_sq = ( cutoff * cutoff ) * (1 + 1e-9) # some slack for numerical error
+    inv_box = 1.0 / box_dim
+
+    mean_occupancy = max(target_pts.shape[0] / max(n_total, 1), 1e-9)
+    bytes_per_point = max(n_stencil * mean_occupancy * _BYTES_PER_CANDIDATE, 1.0)
+    chunk = int(max(1, min(n_q, max_bytes // bytes_per_point)))
+
+    out_i, out_j = [], []
+    for lo in range(0, n_q, chunk):
+        hi = min(lo + chunk, n_q)
+        linear_idx_q_in_range = linear_idx_q[lo:hi]
+
+        nz = int(n_cells[2])
+        ny = int(n_cells[1])
+        cz = linear_idx_q_in_range % nz
+        cy = (linear_idx_q_in_range // nz) % ny
+        cx = linear_idx_q_in_range // (nz * ny)
+        cell_coords = np.stack([cx, cy, cz], axis=1)
+        # broadcast to get stencils per cell_coords
+        neighbour_coords = cell_coords[:, None, :] + stencil[None, :, :]
+        # Periodic boundaries
+        neighbour_coords = np.mod(neighbour_coords, n_cells)
+        neighbour_ids = (neighbour_coords[:, :, 0] * ny + neighbour_coords[:, :, 1]) * nz + neighbour_coords[:, :, 2]
+        del cell_coords, neighbour_coords
+
+        grp_counts = counts[neighbour_ids].ravel()
+        total_count = int(grp_counts.sum())
+        if total_count == 0:
+            continue
+        grp_start = start[neighbour_ids].ravel()
+        del neighbour_ids
+
+        if total_count == 0:
+            slots = np.empty(0, dtype=np.int64)
+        else:
+            output_offsets = np.concatenate(([0], np.cumsum(grp_counts)[:-1]))
+            slots = np.repeat(grp_start - output_offsets, grp_counts) + np.arange(total_count, dtype=np.int64)
+        j = order[slots]
+        del slots, output_offsets
+        i = np.repeat(
+            np.repeat(np.arange(lo, hi, dtype=np.int32), n_stencil), grp_counts
+        )
+        del grp_counts, grp_start
+
+        # Halve the work before touching any coordinates.
+        if half:
+            keep = j > i
+            i, j = i[keep], j[keep]
+            del keep
+            if i.size == 0:
+                continue
+        elif exclude_self:
+            keep = i != j
+            i, j = i[keep], j[keep]
+            del keep
+            if i.size == 0:
+                continue
+
+        # Accumulate the squared distance one axis at a time
+        # weird syntax is to avoid extra temporary arrays that might be large
+        d2 = None
+        periodic_shift = np.empty(i.size, dtype=np.float64)
+        for d, (qc, tc) in enumerate(((qx, tx), (qy, ty), (qz, tz))):
+            delta = tc[j]
+            delta -= qc[i]
+            # Periodic boundary
+            np.multiply(delta, inv_box[d], out=periodic_shift)
+            np.round(periodic_shift, out=periodic_shift)
+            np.multiply(periodic_shift, box_dim[d], out=periodic_shift)
+            delta -= periodic_shift
+            delta *= delta
+            if d == 0:
+                d2 = delta
+            else:
+                d2 += delta
+                del delta
+        del periodic_shift
+
+        keep = d2 <= cutoff_sq
+        del d2
+        if keep.any():
+            out_i.append(i[keep])
+            out_j.append(j[keep])
+
+    if not out_i:
+        empty = np.empty(0, dtype=np.int32)
+        return empty, empty.copy()
+    return np.concatenate(out_i), np.concatenate(out_j)
+
+def _choose_grid(box, cutoff, n_target, cells_per_cutoff=None, max_cells=10_000_000):
+    """
+    Pick the cell subdivision, and return the grid with its pruned stencil.
+    """
+    ndim = box.shape[0]
+    max_cells = min(max_cells, max(8 * n_target, 64))
+    best = None
+    k_values = (
+        [max(int(cells_per_cutoff), 1)] if cells_per_cutoff is not None
+        else [1, 2, 3, 4, 6, 8]
+    )
+    for k in k_values:
+        n = np.maximum(np.floor(box * k / cutoff).astype(np.int64), 1)
+        if n.prod() > max_cells:
+            continue
+        size = box / n
+        stencil = _stencil(n, size, cutoff, ndim)
+        occupancy = n_target / float(n.prod())
+        score = stencil.shape[0] * (1.0 + occupancy)
+        if best is None or score < best[0]:
+            best = (score, n, size, stencil)
+    if best is None:  # all divisons had > max_cells cells
+        np.clip(np.floor(box / cutoff).astype(np.int64), 1, max_cells, out=n)
+        size = box / n
+        return n, size, _stencil(n, size, cutoff, ndim)
+    return best[1], best[2], best[3]
+
+def _stencil(n_cells, cell_size, cutoff, ndim):
+    """
+    Offsets to every cell that can hold a neighbour, with no repeats.
+    """
+    per_axis = []
+    for d in range(ndim):
+        n = int(n_cells[d])
+        k = int(np.ceil(cutoff / cell_size[d]))
+        if 2 * k + 1 >= n:
+            per_axis.append(np.arange(n, dtype=np.int64))  # every distinct cell
+        else:
+            per_axis.append(np.arange(-k, k + 1, dtype=np.int64))
+    grids = np.meshgrid(*per_axis, indexing="ij")
+    offsets = np.stack([g.ravel() for g in grids], axis=1)
+
+    gap_sq = np.zeros(offsets.shape[0])
+    for d in range(ndim):
+        n = int(n_cells[d])
+        # Separation in cells, measured the short way round the periodic box.
+        sep = np.minimum(offsets[:, d] % n, (-offsets[:, d]) % n)
+        gap = np.maximum(sep - 1, 0) * cell_size[d]
+        gap_sq += gap * gap
+
+    keep = gap_sq <= cutoff * cutoff
+    return np.ascontiguousarray(offsets[keep])
+
+def _pairs_rows_cols_to_dict(rows, cols, n_keys, sort=True):
+    """Group directed pairs into dict[i] -> list of j, one key per index."""
+    grouped_pairs = {i: [] for i in range(n_keys)}
+    if rows.size == 0:
+        return grouped_pairs
+    if sort:
+        order = np.lexsort((cols, rows))
+    else:
+        order = np.argsort(rows, kind="stable")
+    rows = rows[order]
+    cols = np.ascontiguousarray(cols[order])
+    counts = np.bincount(rows, minlength=n_keys)
+    offsets = np.concatenate(([0], np.cumsum(counts)))
+    for i in np.flatnonzero(counts):
+        grouped_pairs[int(i)] = cols[offsets[i] : offsets[i + 1]].tolist()
+    return grouped_pairs
