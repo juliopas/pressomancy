@@ -25,7 +25,8 @@ class GenericRigidObj(metaclass=Simulation_Object):
     ----------
     required_features : ``['VIRTUAL_SITES_RELATIVE']``.
     numInstances : int
-        Counter of constructed instances (used to assign ``who_am_i``).
+        Monotonic id allocator (number of instances ever constructed); the
+        metaclass uses it to assign ``who_am_i`` and never rolls it back.
     simulation_type : SinglePairDict
         Object type identifier (name and integer code).
     part_types : PartDictSafe instance containing ('real', 'virt').
@@ -38,7 +39,8 @@ class GenericRigidObj(metaclass=Simulation_Object):
     associated_objects : Any
         External associations passed in via ``config``.
     who_am_i : int
-        Per-instance ordinal ID.
+        Per-instance ordinal ID, assigned by the ``Simulation_Object`` metaclass
+        once construction has succeeded.
     type_part_dict : PartDictSafe
         Mutable mapping of part-type names to lists of particle handles created
         by this object.
@@ -72,7 +74,7 @@ class GenericRigidObj(metaclass=Simulation_Object):
     ``1 + len(<file>)`` (1 real + N virtuals).
     """
 
-    required_features = ['VIRTUAL_SITES_RELATIVE']
+    required_features = ['VIRTUAL_SITES_RELATIVE', 'ROTATION']
     numInstances = 0
     _resources_dir = os.path.join(os.path.dirname(__file__), '..', 'resources')
     _resource_file: dict = {}
@@ -122,11 +124,10 @@ class GenericRigidObj(metaclass=Simulation_Object):
         self.params = config
         self.sys = config['espresso_handle']
         self.associated_objects = config['associated_objects']
-        self.who_am_i = GenericRigidObj.numInstances
-        GenericRigidObj.numInstances += 1
         self.type_part_dict = PartDictSafe(
             {key: [] for key in GenericRigidObj.part_types.keys()}
         )
+        GenericRigidObj.numInstances += 1
 
     def set_object(self, pos, ori):
         """

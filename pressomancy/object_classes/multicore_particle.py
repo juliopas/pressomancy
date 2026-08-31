@@ -14,6 +14,7 @@ class MulticorePart(GenericRigidObj):
     '''
     Class that contains relevant paramaters and methods. At construction one must pass an espresso handle becaouse the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a Quadriplex. Therefore many relevant parameters are class specific, not instance specific.
     '''
+    required_features = GenericRigidObj.required_features + ['DIPOLES']
     numInstances = 0
     part_types = PartDictSafe()
     config=ObjectConfigParams(
@@ -22,10 +23,8 @@ class MulticorePart(GenericRigidObj):
 
     def __init__(self, config: ObjectConfigParams):
         super().__init__(config)
-        self.who_am_i = MulticorePart.numInstances
         MulticorePart.numInstances += 1
 
-    
     def add_dipole_moments_to_virtuals(self, dip_moments, selection='random', anisotropy={'kind':'infinite','params': {}}):
         """
         Assign magnetic dipole moments to selected virtual particles.

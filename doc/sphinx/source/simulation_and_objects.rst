@@ -68,6 +68,17 @@ requirements are not there for style. They are what lets a
 :class:`~pressomancy.object_classes.quadriplex_class.Quadriplex` all be
 handled by the same :class:`~pressomancy.simulation.Simulation` machinery.
 
+Two of those are managed for you and should not be written by a subclass.
+``numInstances`` is an identifier allocator: it is incremented by
+after ``__init__``, and decremented by ``__del__``. The metaclass keeps ``who_am_i``
+unique and stable for the whole run, which matters because it is also the value
+written into the HDF5 ownership tables. A separate, metaclass-created
+``live_instances`` counter tracks how many instances are currently alive. The
+metaclass also hands every construction a private copy of the ``config`` it was
+given, so an ``__init__`` that fills in inferred parameters or builds its
+``associated_objects`` implicitly cannot contaminate a config that the caller
+intends to reuse for further instances.
+
 The metaclass also operationalises the worker functions that keep the peace
 across the object library. It injects shared methods such as
 :meth:`~pressomancy.object_classes.object_class.Simulation_Object.add_particle`,
@@ -204,9 +215,8 @@ object class must satisfy.
            self.sys = config["espresso_handle"]
            self.params = config
            self.associated_objects = config["associated_objects"]
-           self.who_am_i = MyObject.numInstances
-           MyObject.numInstances += 1
            self.type_part_dict = PartDictSafe({"real": []})
+           MyObject.numInstances += 1
 
        def set_object(self, pos, ori):
            part = self.add_particle(type_name="real", pos=pos, rotation=(True, True, True))

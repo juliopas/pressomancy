@@ -14,7 +14,7 @@ class SWPart(GenericPart):
     '''
     Class that contains quadriplex relevant paramaters and methods. At construction one must pass an espresso handle becaouse the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a Quadriplex. Therefore many relevant parameters are class specific, not instance specific.
     '''
-    required_features=['THERMAL_STONER_WOHLFARTH',]
+    required_features=GenericPart.required_features + ['THERMAL_STONER_WOHLFARTH', 'DIPOLES', 'VIRTUAL_SITES_RELATIVE']
 
     numInstances = 0
     simulation_type= SinglePairDict('sw_part', 13)
@@ -36,7 +36,6 @@ class SWPart(GenericPart):
         self.params=config
         self.associated_objects=self.params['associated_objects']
         self.type_part_dict=PartDictSafe({key: [] for key in SWPart.part_types.keys()})
-        self.who_am_i = SWPart.numInstances
         SWPart.numInstances += 1
 
     def set_object(self,  pos, ori):

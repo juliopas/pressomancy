@@ -12,7 +12,7 @@ class Elastomer(metaclass=Simulation_Object):
     '''
     Class that contains elastomer relevant paramaters and methods. At construction one must pass an espresso handle becaouse the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a Elastomer. Therefore many relevant parameters are class specific, not instance specific.
     '''
-    required_features=list()
+    required_features=['DIPOLES', 'EXTERNAL_FORCES', 'ROTATION']
     numInstances = 0
     simulation_type=SinglePairDict('elastomer', 98)
     part_types = PartDictSafe({'real':1, 'substrate': 98})
@@ -66,9 +66,8 @@ class Elastomer(metaclass=Simulation_Object):
             num_monomers=self.params['n_parts'],
             monomer_size=self.params['size']
             )
-        self.who_am_i = Elastomer.numInstances
-        Elastomer.numInstances += 1
         self.type_part_dict=PartDictSafe({key: [] for key in Elastomer.part_types.keys()})
+        Elastomer.numInstances += 1
 
     def set_object(self, pos, ori):
         '''

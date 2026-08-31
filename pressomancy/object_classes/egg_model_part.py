@@ -23,7 +23,7 @@ class EGGPart(GenericPart):
     ``axis_quat_body`` is the identity quaternion, so the easy axis is aligned
     with ``ori``.
     """
-    required_features = ['EGG_MODEL']
+    required_features = GenericPart.required_features + ['EGG_MODEL', 'DIPOLES', 'VIRTUAL_SITES_RELATIVE']
     numInstances = 0
     simulation_type = SinglePairDict('egg_part', 74)
     part_types = PartDictSafe({'yolk': 11})
@@ -47,11 +47,10 @@ class EGGPart(GenericPart):
         """
         self.sys = config['espresso_handle']
         self.params = config
-        self.who_am_i = EGGPart.numInstances
-        EGGPart.numInstances += 1
         self.associated_objects = config['associated_objects']
         self.type_part_dict = PartDictSafe(
             {key: [] for key in EGGPart.part_types.keys()})
+        EGGPart.numInstances += 1
 
     def set_object(self, pos, ori):
         """

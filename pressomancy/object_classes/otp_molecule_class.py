@@ -10,7 +10,7 @@ class OTP(metaclass=Simulation_Object):
     '''
     Class that contains OTP relevant paramaters and methods. At construction one must pass an espresso handle becaouse the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a OTP. Therefore many relevant parameters are class specific, not instance specific.
     '''
-    required_features=list()	
+    required_features=['EXCLUSIONS']
     numInstances = 0
 
     _resources_dir = os.path.join( os.path.dirname(__file__), '..', 'resources')
@@ -35,12 +35,11 @@ class OTP(metaclass=Simulation_Object):
         assert config['n_parts'] == len(OTP._reference_sheet), 'n_parts must be equal to the number of parts in the reference sheet!!!'
         self.sys=config['espresso_handle']
         self.params=config
-        self.who_am_i = OTP.numInstances
-        OTP.numInstances += 1
         self.realz_indices = []
         self.virts_indices = []
         self.associated_objects=self.params['associated_objects']        
         self.type_part_dict=PartDictSafe({key: [] for key in OTP.part_types.keys()})
+        OTP.numInstances += 1
 
     def set_object(self,  pos, ori):
         '''

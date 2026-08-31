@@ -11,7 +11,7 @@ class Filament(metaclass=Simulation_Object):
     '''
     Class that contains filament relevant paramaters and methods. At construction one must pass an espresso handle becaouse the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a Filament. Therefore many relevant parameters are class specific, not instance specific.
     '''
-    required_features=list()	
+    required_features=['DIPOLES', 'VIRTUAL_SITES_RELATIVE', 'ROTATION']
     numInstances = 0
     simulation_type=SinglePairDict('filament', 54)
     part_types = PartDictSafe({'real': 1, 'virt': 2})
@@ -37,10 +37,9 @@ class Filament(metaclass=Simulation_Object):
             warnings.warn('monomer size infered from Filament size and the BondWrapper.r_0')
         else:
             self.build_function.monomer_size=self.associated_objects[0].params['size']
-        self.who_am_i = Filament.numInstances
-        Filament.numInstances += 1
         self.orientor = np.empty(shape=3, dtype=float)
         self.type_part_dict=PartDictSafe({key: [] for key in Filament.part_types.keys()})
+        Filament.numInstances += 1
 
     def set_object(self,  pos, ori):
         '''

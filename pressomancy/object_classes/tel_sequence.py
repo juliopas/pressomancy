@@ -114,7 +114,7 @@ class TelSeq(metaclass=Simulation_Object):
         self.sys=config['espresso_handle']
         assert config['type'] in ['parallel', 'antiparallel','hybrid'], 'type must be either parallel, antiparallel or hybrid!!!'
         self.params=config
-        if self.params['associated_objects']==None:
+        if self.params['associated_objects'] is None:
             warnings.warn('no associated_objects have been passed explicity. Creating objects required to initialise object implicitly!')
             configuration=Quartet.config.specify(espresso_handle=self.sys,type='brokenA')
             quartets=[Quartet(config=configuration) for _ in range(3*self.params['n_parts'])]
@@ -125,10 +125,9 @@ class TelSeq(metaclass=Simulation_Object):
         self.associated_objects=self.params['associated_objects']
 
         self.build_function=RoutineWithArgs(func=make_centered_rand_orient_point_array,num_monomers=self.params['n_parts'],spacing=config['spacing'])
-        self.who_am_i = TelSeq.numInstances
-        TelSeq.numInstances += 1
         self.orientor = np.empty(shape=3, dtype=float)
         self.type_part_dict=PartDictSafe({key: [] for key in TelSeq.part_types.keys()})
+        TelSeq.numInstances += 1
 
     def _choose_antiparallel_phi(self, chain_dir, n_phi=720):
         chain_dir = np.asarray(chain_dir, dtype=float)

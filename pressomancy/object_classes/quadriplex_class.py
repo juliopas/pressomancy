@@ -14,9 +14,10 @@ class Quartet(GenericRigidObj):
     '''
     Class that contains quartet relevant paramaters and methods. At construction one must pass an espresso handle becaouse the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a Quartet. Therefore many relevant parameters are class specific, not instance specific.
     '''
+    required_features = GenericRigidObj.required_features + ['EXCLUSIONS']
     numInstances = 0
-    
-    recepie_dictA = {'assoc': {1: [2, 3, 6, 7, 8], 
+
+    recepie_dictA = {'assoc': {1: [2, 3, 6, 7, 8],
                                5: [4, 9, 10, 13, 14], 
                                20: [11, 12, 15, 16, 21], 
                                24: [17, 18, 19, 22, 23]}, 
@@ -78,16 +79,19 @@ class Quartet(GenericRigidObj):
         '''
         super().__init__(config)
         assert config['type'] in ['solid', 'brokenA', 'brokenB'], 'type must be either solid, brokenA or brokenB!!!'
+        if config['type'] == 'solid':
+            self.required_features = Quartet.required_features + ['ROTATIONAL_INERTIA']
+        else:
+            self.required_features = Quartet.required_features + ['ELECTROSTATICS']
         assert self.params['alias'] in ['quartet', 'quartet_11x11'], 'unsupported quartet alias!!!'
         assert config['n_parts'] == len(self._reference_sheet[self.params['alias']]), 'n_parts must be equal to the number of parts in the reference sheet!!!'
         self.recepie_dictA, self.recepie_dictB = self.__class__.recepie_dicts_by_alias[self.params['alias']]
         if self.params['type'] in ['brokenA', 'brokenB']:
             Quartet.part_types.update({'circ': 28,
                   'squareA': 24, 'squareB': 25, 'cation': 27})
-        self.who_am_i = Quartet.numInstances
-        Quartet.numInstances += 1
         self.orientor = np.empty(shape=3, dtype=float)
         self.corner_particles = []
+        Quartet.numInstances += 1
 
     def set_object(self,  pos, ori, triplet=None):
         '''
@@ -221,7 +225,7 @@ class Quadriplex(metaclass=Simulation_Object):
     '''
     Class that contains quadriplex relevant paramaters and methods. At construction one must pass an espresso handle becaouse the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a Quadriplex. Therefore many relevant parameters are class specific, not instance specific.
     '''
-    required_features=list()	
+    required_features=['VIRTUAL_SITES_RELATIVE', 'ROTATION']
     numInstances = 0
     part_types = PartDictSafe()
     simulation_type=SinglePairDict('quadriplex',22)
@@ -246,10 +250,9 @@ class Quadriplex(metaclass=Simulation_Object):
         self.associated_objects=self.params['associated_objects']
         assert config['n_parts'] == len(config['associated_objects']), f'n_parts must be equal to the number of associated objects!!! {config["n_parts"], len(config["associated_objects"])}'
         self.has_been_set=False
-        self.who_am_i = Quadriplex.numInstances
-        Quadriplex.numInstances += 1
         self.orientor = np.empty(shape=3, dtype=float)
         self.type_part_dict=PartDictSafe({key: [] for key in Quadriplex.part_types.keys()})
+        Quadriplex.numInstances += 1
 
     def set_object(self,  pos, ori):
         '''

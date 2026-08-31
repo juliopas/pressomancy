@@ -8,7 +8,7 @@ class Crowder(GenericPart):
     Class that contains quadriplex relevant paramaters and methods. At construction one must pass an espresso handle becaouse the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a Quadriplex. Therefore many relevant parameters are class specific, not instance specific.
     '''
     
-    required_features=list()	
+    required_features=GenericPart.required_features
     numInstances = 0
     simulation_type= SinglePairDict('crowder', 5)
     part_types = PartDictSafe({'crowder': 5})
@@ -21,9 +21,8 @@ class Crowder(GenericPart):
         self.sys=config['espresso_handle']
         self.params=config
         self.associated_objects=self.params['associated_objects']
-        self.who_am_i = Crowder.numInstances
-        Crowder.numInstances += 1
         self.type_part_dict=PartDictSafe({key: [] for key in Crowder.part_types.keys()})
+        Crowder.numInstances += 1
 
     def set_object(self,  pos, ori):
         '''

@@ -9,7 +9,7 @@ class PointDipolePermanent(metaclass=Simulation_Object):
     Class that contains permanent magnetic point dipole particles relevant paramaters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a PointDipolePermanent. Therefore many relevant parameters are class specific, not instance specific.
     '''
 
-    required_features=['DIPOLES']
+    required_features=['DIPOLES', 'ROTATION']
     numInstances = 0
     simulation_type= SinglePairDict('point_dipole_permanent', 3)
     part_types = PartDictSafe({'pdp_real': 61})
@@ -23,11 +23,10 @@ class PointDipolePermanent(metaclass=Simulation_Object):
         '''
         self.sys=config['espresso_handle']
         self.params=config
-        PointDipolePermanent.numInstances += 1
-        self.who_am_i = PointDipolePermanent.numInstances
         self.associated_objects=config['associated_objects']
         self.type_part_dict=PartDictSafe({key: [] for key in PointDipolePermanent.part_types.keys()})
         assert self.associated_objects is None, "Point dipoles can not have associated objects. They are singular particles, as basic as possible."
+        PointDipolePermanent.numInstances += 1
 
     def set_object(self,  pos, ori):
         '''
@@ -57,14 +56,14 @@ class PointDipoleMagnetizable(metaclass=Simulation_Object):
     added to the instance in __init__ and is what Simulation.sanity_check reads.
     '''
 
-    required_features=list(COMMON_FEATURES)
+    required_features=list(COMMON_FEATURES) + ['ROTATION']
     numInstances = 0
     simulation_type= SinglePairDict('point_dipole_magnetizable', 4)
     part_types = PartDictSafe({'pdm_real': 62, 'pdm_virt': 622})
     config = ObjectConfigParams(
         magnetization_model='langevin',
         dipm_sat=1.,
-        mag_susc_0=1.,
+        mag_susc_0=0.1,
     )
 
     def __init__(self, config: ObjectConfigParams):
@@ -75,11 +74,10 @@ class PointDipoleMagnetizable(metaclass=Simulation_Object):
         self.params=config
         validate_model(config['magnetization_model'])
         self.required_features=required_features_for(config['magnetization_model'])
-        PointDipoleMagnetizable.numInstances += 1
-        self.who_am_i = PointDipoleMagnetizable.numInstances
         self.associated_objects=config['associated_objects']
         self.type_part_dict=PartDictSafe({key: [] for key in PointDipoleMagnetizable.part_types.keys()})
         assert self.associated_objects is None, "Point dipoles can not have associated objects. They are singular particles, as basic as possible."
+        PointDipoleMagnetizable.numInstances += 1
 
     def set_object(self,  pos, ori):
         '''
@@ -118,7 +116,7 @@ class PointDipoleSuperparamagnetic(metaclass=Simulation_Object):
     not agree if that is what the model calls for.
     '''
 
-    required_features=list(COMMON_FEATURES)
+    required_features=list(COMMON_FEATURES) + ['ROTATION']
     numInstances = 0
     simulation_type= SinglePairDict('point_dipole_superparamagnetic', 7)
     part_types = PartDictSafe({'pds_real': 63, 'pds_virt': 633})
@@ -138,11 +136,10 @@ class PointDipoleSuperparamagnetic(metaclass=Simulation_Object):
         # fail here rather than at set_object time if dipm or kT are unphysical
         susceptibility_from_kT(config['dipm'], config['kT'])
         self.required_features=required_features_for(config['magnetization_model'])
-        PointDipoleSuperparamagnetic.numInstances += 1
-        self.who_am_i = PointDipoleSuperparamagnetic.numInstances
         self.associated_objects=config['associated_objects']
         self.type_part_dict=PartDictSafe({key: [] for key in PointDipoleSuperparamagnetic.part_types.keys()})
         assert self.associated_objects is None, "Point dipoles can not have associated objects. They are singular particles, as basic as possible."
+        PointDipoleSuperparamagnetic.numInstances += 1
 
     def set_object(self,  pos, ori):
         '''

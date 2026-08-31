@@ -4,6 +4,7 @@ from functools import partial
 import logging
 import espressomd
 import itertools
+import numpy as np
 import sys
 
 def _generic_type_exception(scope, name, attribute_name, expected_type):
@@ -24,6 +25,17 @@ def helper_set_attribute(instance,attr_name,target):
         bound_method = types.MethodType(target, instance)
         setattr(instance, attr_name, bound_method)
 
+def _privatise_config(args, kwargs):
+    """
+    Replace the `config` argument of a construction call with a private copy.
+    """
+    if 'config' in kwargs and isinstance(kwargs['config'], ObjectConfigParams):
+        kwargs = dict(kwargs)
+        kwargs['config'] = kwargs['config'].specify()
+    elif args and isinstance(args[0], ObjectConfigParams):
+        args = (args[0].specify(),) + tuple(args[1:])
+    return args, kwargs
+
 class Simulation_Object(type):
     """
     Metaclass for simulation objects, providing attribute enforcement and shared methods.
@@ -43,17 +55,27 @@ class Simulation_Object(type):
     --------------------------------
     - `required_features` : list
         List of required features for the simulation object.
-    - `numInstances` : int
-        Tracks the number of instances of the class.
+    - `instance_id_counter` : int
+        Monotonic id allocator: the number of instances of the class ever *created*.
+        Declare it as ``0``; the metaclass owns it from then on and never rolls it
+        back, so `who_am_i` values are unique and stable for the whole run.
     - `part_types` : PartDictSafe
         Dictionary-like object mapping particle types to their identifiers.
     - `simulation_type` : SinglePairDict
         A single key-value pair representing the type of simulation object.
 
+    Metaclass-Managed Class Attributes
+    ----------------------------------
+    - `live_instances` : int
+        Number of instances of the class currently alive. Maintained by
+        `__call__`/`_del`; do not declare it in a subclass.
+
     Instance-Level Required Attributes
     -----------------------------------
     - `who_am_i` : int
-        Unique identifier for the instance.
+        Unique identifier for the instance. Assigned by the metaclass from
+        `instance_id_counter` once `__init__` has returned successfully; subclasses must
+        *not* set it themselves.
     - `type_part_dict` : PartDictSafe
         Tracks particle handles grouped by type.
     - `associated_objects` : list
@@ -140,6 +162,10 @@ class Simulation_Object(type):
             elif not isinstance(getattr(cls, attr), expected_type):
                 generic_type_exception(name, attr, expected_type)
 
+        if "instance_id_counter" not in class_dict:
+            cls.instance_id_counter = 0
+        cls.live_instances = 0
+
         # Merge ObjectConfigParams from base classes
         merged_config_data = {}
         for base in bases:
@@ -175,8 +201,13 @@ class Simulation_Object(type):
         NotImplementedError
             If a required instance attribute is missing or incorrectly typed.
         """
+        args, kwargs = _privatise_config(args, kwargs)
         # Create a new instance of the class
         instance = super().__call__(*args, **kwargs)
+        instance.who_am_i = cls.instance_id_counter
+        cls.instance_id_counter += 1
+        cls.live_instances += 1
+        instance._is_live = True
         # Assign the build_function to the class if it does not already have one
 
         helper_set_attribute(instance,"build_function",RoutineWithArgs())
@@ -210,7 +241,7 @@ class Simulation_Object(type):
         bool
             True if the instances are equal, False otherwise.
         """
-        if not isinstance(other, self.__class__):
+        if type(self) is not type(other):
             return False
         return getattr(self, "who_am_i", None) == getattr(other, "who_am_i", None)
 
@@ -238,10 +269,16 @@ class Simulation_Object(type):
         """
         if sys.is_finalizing():
             return
-        self.delete_owned_parts()
-        for cls in self.__class__.mro():
-            if hasattr(cls, "numInstances") and cls.numInstances > 0:
-                cls.numInstances -= 1
+        if hasattr(self, "delete_owned_parts"):
+            self.delete_owned_parts()
+        if getattr(self, "_is_live", False):
+            self._is_live = False
+            for self_cls in self.__class__.mro():
+                if hasattr(self_cls, "numInstances"):
+                    self_cls.numInstances -= 1
+            cls = type(self)
+            if cls.live_instances > 0:
+                cls.live_instances -= 1
 
     @staticmethod
     def _cusiter(self):
@@ -275,13 +312,23 @@ class Simulation_Object(type):
         Iterates through `type_part_dict` to remove particles from the simulation.
         If `associated_objects` is defined, recursively deletes their owned particles.
         """
-        if self.associated_objects!= None:
-            for obj in self.associated_objects:
-                obj.delete_owned_parts()
-        for key,elem in self.type_part_dict.items():
-            for prt in elem:
-                prt.remove()
-            elem.clear()
+        visited = set()
+
+        def worker(obj):
+            if id(obj) in visited:
+                logging.debug("delete_owned_parts: skipping already visited %s(who_am_i=%s)",
+                    obj.__class__.__name__, getattr(obj, "who_am_i", None))
+                return
+            visited.add(id(obj))
+            if obj.associated_objects is not None:
+                for sub_obj in obj.associated_objects:
+                    worker(sub_obj)
+            for key, elem in obj.type_part_dict.items():
+                for prt in elem:
+                    prt.remove()
+                elem.clear()
+
+        worker(self)
 
     def get_owned_part(self):
         """
@@ -294,8 +341,14 @@ class Simulation_Object(type):
         """
         tot_part = []
         particle_chains = []
+        visited = set()
 
         def worker(obj, chain):
+            if id(obj) in visited:
+                logging.debug("get_owned_part: skipping already visited %s(who_am_i=%s)",
+                    obj.__class__.__name__, getattr(obj, "who_am_i", None))
+                return
+            visited.add(id(obj))
             # Update the chain with the current object's identity.
             new_chain = chain + [(obj.__class__.__name__, obj.who_am_i)]
             # Get all the particle handles from the current object.
@@ -387,9 +440,19 @@ class Simulation_Object(type):
         ------
         AssertionError
             If the new type is not declared in `part_types`.
+        ValueError
+            If the particle is not currently owned by this object (foreign handle, or
+            one already removed from `type_part_dict`).
         """
         assert new_type_name in self.part_types.keys(), 'an object can only add partices of types declared in self.part_types'
-        current_key = next(key for key, values in self.type_part_dict.items() if particle in values)
+        current_key = next((key for key, values in self.type_part_dict.items() if particle in values), None)
+        if current_key is None:
+            raise ValueError(
+                f"particle id={getattr(particle, 'id', particle)} is not owned by "
+                f"{self.__class__.__name__}(who_am_i={getattr(self, 'who_am_i', None)}), so its type "
+                f"cannot be changed to '{new_type_name}'. Tracked particles per type: "
+                f"{ {key: [getattr(p, 'id', p) for p in values] for key, values in self.type_part_dict.items()} }"
+            )
         self.type_part_dict[current_key].remove(particle)
         particle.type=self.part_types[new_type_name]
         self.type_part_dict[new_type_name].append(particle)
@@ -417,10 +480,25 @@ class ObjectConfigParams(dict):
     """
     common_keys = {'sigma': 1, 'espresso_handle': None, 'associated_objects': None, 'size': 1, 'n_parts': 1}
 
+    @staticmethod
+    def _detach(value):
+        """
+        Return a value that is safe to store without aliasing the source config.
+        """
+        if isinstance(value, ObjectConfigParams):
+            return value.specify()
+        if isinstance(value, np.ndarray):
+            return value.copy()
+        if isinstance(value, (list, set, bytearray)):
+            return type(value)(value)
+        if type(value) is dict:
+            return dict(value)
+        return value
+
     def __init__(self, **kwargs):
         # Merge common_keys with kwargs; kwargs overwrite common_keys
         initial_data = {**self.common_keys, **kwargs}
-        super().__init__(initial_data)
+        super().__init__({k: self._detach(v) for k, v in initial_data.items()})
         self._allowed_keys = set(initial_data.keys())  # Track allowed keys
 
     def __setitem__(self, key, value):
@@ -430,6 +508,31 @@ class ObjectConfigParams(dict):
 
     def __delitem__(self, key):
         raise KeyError(f"Cannot delete key '{key}' from configuration.")
+
+    # Guards againsta unprotected dict functions that can set/delete items
+    def update(self, *args, **kwargs):
+        if len(args) > 1:
+            raise TypeError(
+                f"update expected at most 1 positional argument, got {len(args)}"
+            )
+        for key, value in dict(*args, **kwargs).items():
+            self[key] = value
+
+    def setdefault(self, key, default=None):
+        if key not in self._allowed_keys:
+            raise KeyError(f"Cannot add new key '{key}' after initialization.")
+        if key not in self:
+            super().__setitem__(key, default)
+        return dict.__getitem__(self, key)
+
+    def pop(self, key, *args):
+        raise KeyError(f"Cannot delete key '{key}' from configuration.")
+
+    def popitem(self):
+        raise KeyError("Cannot delete keys from configuration.")
+
+    def clear(self):
+        raise KeyError("Cannot delete keys from configuration.")
 
     def specify(self, **overrides):
         """
@@ -455,7 +558,7 @@ class ObjectConfigParams(dict):
         # Create a new configuration with overrides applied
         new_config = ObjectConfigParams(**self)
         for key, value in overrides.items():
-            new_config[key] = value
+            new_config[key] = self._detach(value)
         return new_config
 
     def __repr__(self):
