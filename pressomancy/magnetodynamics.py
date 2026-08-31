@@ -21,12 +21,6 @@ Two models are currently exposed, both parameterised by the saturation moment
     :math:`m = m_{sat} L(\\alpha) \\hat{H}` with :math:`\\alpha = 3 \\chi_0 |H| / m_{sat}`.
 ``froelich_kennelly``
     :math:`m = \\chi_0 m_{sat} / (m_{sat} + \\chi_0 |H|) H`.
-
-.. note::
-    The retired ``Simulation.magnetize`` used :math:`\\alpha = m |H|`. To reproduce
-    it with the ``langevin`` model set ``mag_susc_0 = dipm_sat**2 / 3``. The retired
-    ``Simulation.magnetize_froelich_kennelly`` maps one to one, with its ``Xi``
-    becoming ``mag_susc_0`` and its ``dip_magnitude`` becoming ``dipm_sat``.
 '''
 import numpy as np
 
@@ -38,6 +32,12 @@ from pressomancy.helper_functions import MissingFeature, api_agnostic_feature_ch
 if espressomd.version.major() == 5:
     import espressomd.propagation
     Propagation = espressomd.propagation.Propagation
+
+    MOMENT_CARRIER_PROPAGATION = int(Propagation.TRANS_VS_RELATIVE |
+                                     Propagation.ROT_VS_INDEPENDENT)
+
+    _REPLACEABLE_PROPAGATION = int(Propagation.SYSTEM_DEFAULT |
+                                   Propagation.ROT_VS_RELATIVE)
 
 #: Features every magnetodynamics model needs, whichever model is picked.
 COMMON_FEATURES = ['DIPOLES', 'DIPOLE_FIELD_TRACKING', 'VIRTUAL_SITES_RELATIVE']
@@ -53,7 +53,7 @@ def validate_model(model):
     '''
     Checks that a magnetization model name is one this module knows about.
 
-    :param model: str | key of MAGNETIZATION_MODELS
+    :param model: str | name of the model (key of MAGNETIZATION_MODELS)
     :return: str | the validated model name
     :raises ValueError: if the name is unknown
     '''
@@ -92,6 +92,11 @@ def susceptibility_from_kT(dipm, kT):
     :return: float | the initial susceptibility to hand to espresso as mag_susc_0
 
     :raises ValueError: if dipm or kT is not strictly positive
+
+    Note that here the susceptibility is not unitless and it corresponds to the
+    change in moment, m/H, opposed to the common unitless definition as the change
+    in magnetization M/H. To compare to experimental measurements, one must take
+    this into account.
     '''
     if dipm <= 0.:
         raise ValueError(f"dipm must be > 0, got {dipm}.")
@@ -111,6 +116,86 @@ def required_features_for(model):
     return COMMON_FEATURES + [feature]
 
 
+def _propagation_names(value):
+    '''
+    Names the bits of a propagation bitmask, for error messages.
+
+    ``Propagation`` is an ``enum.IntFlag``, whose str is the plain integer on
+    recent pythons, which is unreadable in a message that is trying to explain
+    which flags clash.
+
+    :param value: int | a propagation bitmask
+    :return: str | the flags OR-ed together, or 'NONE' for an empty mask
+    '''
+    value = int(value)
+    names = [flag.name for flag in Propagation if flag.value and
+             flag.value & value == flag.value]
+    return '|'.join(names) if names else 'NONE'
+
+
+def _assert_bound_virtual_site(part_hndl):
+    '''
+    Checks that a particle really is a virtual site bound to a real anchor.
+
+    Called on the ``anchor=None`` path, where the caller asserts the binding was
+    done elsewhere. Espresso does not check this: a particle carrying
+    TRANS_VS_RELATIVE with no ``vs_relative`` partner is silently propagated
+    against the default partner id -1, which is not an error but is also not a
+    position, so the moment would ride on garbage.
+
+    :param part_hndl: ParticleHandle | the particle to check
+    :return: None
+    :raises ValueError: if the particle is not a virtual site relative, or is
+        one but was never related to a real particle
+    '''
+    if espressomd.version.major() == 5:
+        is_vs_relative = bool(int(part_hndl.propagation) &
+                              int(Propagation.TRANS_VS_RELATIVE))
+    else:
+        is_vs_relative = bool(part_hndl.virtual)
+    related_to = int(part_hndl.vs_relative[0])
+    if not is_vs_relative or related_to < 0:
+        raise ValueError(
+            f"Particle {part_hndl.id} was passed with anchor=None, which "
+            f"asserts it is already a virtual site bound to a real particle, "
+            f"but it is not (virtual sites relative: {is_vs_relative}, "
+            f"related to particle id: {related_to}). Pass the anchor explicitly "
+            f"so the binding is made here, or call vs_auto_relate_to first.")
+
+
+def _set_moment_carrier_propagation(part_hndl):
+    '''
+    Gives a particle the propagation a moment carrying virtual site needs.
+
+    Assignment cannot be a plain overwrite, because that would discard bits the
+    caller put there, and it cannot be a plain OR either, because espresso
+    accepts ROT_VS_INDEPENDENT in exactly one combination, so any surviving
+    extra bit would be rejected. Bits that this module owns are therefore
+    replaced, and bits that belong to the caller are refused loudly: a virtual
+    site coupled to Langevin or to LB, as vs_auto_relate_to's ``couple_to_lb``
+    and ``couple_to_langevin`` arrange, cannot also rotate independently.
+
+    :param part_hndl: ParticleHandle | the particle that carries the moment
+    :return: None
+    :raises ValueError: if the current propagation carries bits that would have
+        to be dropped to reach MOMENT_CARRIER_PROPAGATION
+    '''
+    current = int(part_hndl.propagation)
+    conflicting = current & ~(_REPLACEABLE_PROPAGATION | MOMENT_CARRIER_PROPAGATION)
+    if conflicting:
+        raise ValueError(
+            f"Particle {part_hndl.id} already propagates as "
+            f"{_propagation_names(current)}. Carrying a magnetization model "
+            f"requires {_propagation_names(MOMENT_CARRIER_PROPAGATION)}, and "
+            f"espresso accepts ROT_VS_INDEPENDENT in that combination only, so "
+            f"{_propagation_names(conflicting)} cannot be kept. Dropping it "
+            f"silently would change the physics of this particle, so it is "
+            f"refused: either let a plain virtual site carry the moment, or "
+            f"keep the coupling and magnetize a different particle.")
+    part_hndl.propagation = ((current & ~_REPLACEABLE_PROPAGATION) |
+                             MOMENT_CARRIER_PROPAGATION)
+
+
 def configure_magnetization(part_hndl, model, dipm_sat, mag_susc_0, anchor=None):
     '''
     Makes a particle magnetizable under one of ESPResSo's magnetization models.
@@ -126,15 +211,19 @@ def configure_magnetization(part_hndl, model, dipm_sat, mag_susc_0, anchor=None)
     :param dipm_sat: float | saturation moment, must be > 0
     :param mag_susc_0: float | initial susceptibility, must be >= 0
     :param anchor: ParticleHandle (=None) | real particle to bind to. If None the
-        particle is assumed to be virtual already and is left bound as it is.
+        particle must already be a virtual site bound to a real anchor, which is
+        checked rather than assumed, and is left bound as it is.
 
     :return: None
 
-    :raises ValueError: on an unknown model or out of range parameters
+    :raises ValueError: on an unknown model, out of range parameters, an
+        anchorless particle that is not already a bound virtual site, or a
+        propagation mode that cannot host the moment (see
+        _set_moment_carrier_propagation)
     :raises MissingFeature: if the ESPResSo build lacks the required features
     '''
     validate_model(model)
-    feature, enable_flag = MAGNETIZATION_MODELS[model]
+    _, enable_flag = MAGNETIZATION_MODELS[model]
 
     missing = [f for f in required_features_for(model)
                if not api_agnostic_feature_check(f)]
@@ -153,9 +242,10 @@ def configure_magnetization(part_hndl, model, dipm_sat, mag_susc_0, anchor=None)
 
     if anchor is not None:
         part_hndl.vs_auto_relate_to(anchor)
+    else:
+        _assert_bound_virtual_site(part_hndl, anchor)
     if espressomd.version.major() == 5:
-        part_hndl.propagation = (Propagation.TRANS_VS_RELATIVE |
-                                 Propagation.ROT_VS_INDEPENDENT)
+        _set_moment_carrier_propagation(part_hndl)
 
     for other_model, (other_feature, other_flag) in MAGNETIZATION_MODELS.items():
         if other_model != model and api_agnostic_feature_check(other_feature):
@@ -183,6 +273,12 @@ def contraction_ratio(system, part_list, n_iter=50, tol=1e-12):
     it repeatedly therefore advances the fixed point iteration without advancing
     the simulation, and the ratio of successive moment increments is the
     empirical amplification factor of the map.
+
+    The increment is the euclidean norm of the change of the stacked moment
+    **vectors** over all watched particles, so a moment that only reorients
+    counts. Measuring the magnitudes alone would miss the dominant mode: a chain
+    of neighbours that magnetize each other reaches its final magnitudes long
+    before it reaches its final directions.
 
     Ratios that settle below 1 and shrink indicate convergence. A ratio that
     plateaus at or above 1, or moments that keep creeping towards saturation,
@@ -224,14 +320,12 @@ def contraction_ratio(system, part_list, n_iter=50, tol=1e-12):
     previous = None
     for _ in range(n_iter):
         system.integrator.run(0, recalc_forces=True)
-        moments = np.array([p.dipm for p in parts])
+        moments = np.array([p.dip for p in parts]).ravel()
         if previous is not None:
             increments.append(np.linalg.norm(moments - previous))
         previous = moments
 
     increments = np.asarray(increments)
-    # drop everything from the first converged increment onwards, so the ratios
-    # are formed only from increments that are still numerically resolvable
     converged = np.flatnonzero(increments <= tol)
     cut = int(converged[0]) if converged.size else len(increments)
     increments = increments[:cut]
