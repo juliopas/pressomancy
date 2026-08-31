@@ -6,13 +6,13 @@ setup(
     author="Deniz Mostarac",
     author_email="deniz.mostarac@uniroma1.it",
     description="Simulation package wrapping Espresso objects",
-    packages=find_packages(),
+    packages=find_packages(exclude=["test", "test.*", "samples", "samples.*"]),
     test_suite="test",
-    include_package_data=True,  # Include non-Python files like those in the resources folder
+    include_package_data=True,
+    package_data={"pressomancy": ["resources/*.txt", "resources/*.py"]},
     install_requires=[
         "numpy", 
-         "h5py", # Add any pip-installable dependencies here
-        # Don't include espresso since it's run via pypresso
+         "h5py",
     ],
     classifiers=[
         "Programming Language :: Python :: 3",

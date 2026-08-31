@@ -1,0 +1,8 @@
+# Geometry/template resources are loaded at runtime by filesystem path
+# (e.g. rigid_obj.py and otp_molecule_class.py resolve `<pkg>/resources/<name>.txt`),
+# so they must be shipped in the distribution or those object classes break on a real install.
+recursive-include pressomancy/resources *.txt
+recursive-include pressomancy/resources *.py
+
+include LICENSE
+include README.md
