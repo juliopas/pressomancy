@@ -21,11 +21,47 @@ TELSEQ_RULES = {
 }
 
 
-def rule_maker(fold_type, choice_id, offset, n=3):
+def _telseq_block_offset(alias, corner_particles):
+    """
+    Derive the particle-id offset of one monomer's TELSEQ_RULES block.
+
+    ``TELSEQ_RULES`` indexes corners in a monomer-*local* space (0..block_size-1),
+    while the ids handed to :func:`_rule_maker` are real ESPResSo particle ids. The
+    two are related by a constant shift, which must be read off the monomer's *own*
+    particles: object identity (``who_am_i``) is a monotonic, never-reset counter,
+    whereas ``sys.part.clear()`` restarts espresso ids at 0, so the id spaces drift
+    apart as soon as more than one TelSeq is built in a single process.
+    """
+    try:
+        rule_params = TELSEQ_RULES[alias]
+    except KeyError:
+        raise ValueError(f"no TelSeq rule set is defined for alias '{alias}'; known aliases: {sorted(TELSEQ_RULES)}") from None
+    local_ids = sorted(rule_params['top'] + rule_params['bottom'])
+    actual_ids = sorted(part.id for part in corner_particles)
+    if len(actual_ids) != len(local_ids):
+        raise ValueError(f"alias '{alias}' expects {len(local_ids)} corner particles per monomer, got {len(actual_ids)}")
+    offset = actual_ids[0] - local_ids[0]
+    expected_ids = [local_id + offset for local_id in local_ids]
+    if actual_ids != expected_ids:
+        raise ValueError(f"corner particle ids {actual_ids} are not a rigid translation of the "
+            f"'{alias}' rule corners {local_ids} (inferred offset={offset}, expected {expected_ids}); "
+            "the monomer layout does not match the rule block")
+    return offset
+
+
+def _rule_maker(fold_type, choice_id, offset, n=3, alias=None):
     length = 4
     choice_local = choice_id - offset
 
-    for rule_params in TELSEQ_RULES.values():
+    if alias is None:
+        rule_sets = TELSEQ_RULES.values()
+    else:
+        try:
+            rule_sets = (TELSEQ_RULES[alias],)
+        except KeyError:
+            raise ValueError(f"no TelSeq rule set is defined for alias '{alias}'; known aliases: {sorted(TELSEQ_RULES)}") from None
+
+    for rule_params in rule_sets:
         top = rule_params['top']
         bottom = rule_params['bottom']
         if choice_local in bottom:
@@ -189,7 +225,7 @@ class TelSeq(metaclass=Simulation_Object):
             if monomer == self.associated_objects[0]:
                 start_part_id = random.choice(candidates1).id
             alias = monomer.associated_objects[0].params['alias']
-            offset = monomer.who_am_i * TELSEQ_RULES[alias]['block_size']
+            offset = _telseq_block_offset(alias, candidates1)
             logging.debug(
                 "wrap_into_Tel step=%s monomer_id=%s start_part_id=%s offset=%s",
                 iid,
@@ -197,8 +233,8 @@ class TelSeq(metaclass=Simulation_Object):
                 start_part_id,
                 offset,
             )
-            diag_pairs, across_pairs, free_end = rule_maker(
-                self.params['type'], start_part_id, offset
+            diag_pairs, across_pairs, free_end = _rule_maker(
+                self.params['type'], start_part_id, offset, alias=alias
             )
             logging.debug(
                 "rule_result fold_type=%s choice_local=%s diag_pairs=%s across_pairs=%s free_end=%s",
