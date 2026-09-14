@@ -1,3 +1,7 @@
+'''
+``RaspberrySphere``: a rigid raspberry-model sphere, adding hydrodynamic
+properties (rotational inertia, mass) on top of ``GenericRigidObj``.
+'''
 import numpy as np
 from pressomancy.object_classes.object_class import ObjectConfigParams
 from pressomancy.object_classes.rigid_obj import GenericRigidObj
@@ -6,7 +10,7 @@ from pressomancy.helper_functions import PartDictSafe
 class RaspberrySphere(GenericRigidObj):
 
     '''
-    Class that contains relevant paramaters and methods. At construction one must pass an espresso handle becaouse the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a Quadriplex. Therefore many relevant parameters are class specific, not instance specific.
+    Class that contains RaspberrySphere relevant parameters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instance there will be only one type of a RaspberrySphere. Therefore many relevant parameters are class specific, not instance specific.
     '''
     required_features = GenericRigidObj.required_features + ['MASS', 'ROTATIONAL_INERTIA']
     numInstances = 0

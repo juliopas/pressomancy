@@ -1,3 +1,8 @@
+'''
+``EGGPart``: a magnetic particle driven by ESPResSo's egg-model Brownian
+dipole dynamics, built from a real reference particle plus a virtual ``yolk``
+particle carrying the dipole moment. Gated behind the ``EGG_MODEL`` feature.
+'''
 from pressomancy.object_classes.part_class import GenericPart
 from pressomancy.object_classes.object_class import ObjectConfigParams
 from pressomancy.helper_functions import PartDictSafe, SinglePairDict

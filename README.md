@@ -45,14 +45,33 @@ To install **Pressomancy**, use pip ( -e flag for edit mode):
 ```bash
 pip install pressomancy
 ```
-To test **Pressomancy**, use:
+To test **Pressomancy**, run inside presomancy directory:
 ```bash
-$path_to_espresso/build/pypresso -m unittest discover -s test
+$path_to_espresso/build/pypresso -m unittest discover -s test -t .
 ```
+Some tests are skipped when the ESPResSo build lacks an optional feature — see Requirements below.
 
 ### Requirements
-- Python 3.x
-- EspressoMD
+
+- **Python >= 3.10**
+- **numpy >= 2.0**, **h5py >= 3.0** — installed automatically by pip.
+- **ESPResSo 5.x**, built from source.
+
+`pip install pressomancy` installs the package but *not* ESPResSo, which is not pip-installable.
+Build it from source and run your scripts through its `pypresso` launcher rather than a plain
+`python`, so that `espressomd` is importable — this is why the test command above invokes
+`pypresso` directly.
+
+ESPResSo must be compiled with the features pressomancy uses. Individual object classes declare
+what they need and raise a clear `MissingFeature` if the build lacks it, so a partial build is
+usable — you simply cannot construct the classes that depend on what is missing.
+
+```
+DIPOLES            DIPOLE_FIELD_TRACKING   VIRTUAL_SITES_RELATIVE   ROTATION
+ROTATIONAL_INERTIA MASS                    EXCLUSIONS               EXTERNAL_FORCES
+ELECTROSTATICS     MORSE                   WALBERLA                 CUDA
+THERMAL_STONER_WOHLFARTH   LANGEVIN_MAGNETIZATION   FROELICH_KENNELLY
+```
 
 ## Quick Start
 
@@ -109,9 +128,9 @@ sim = Simulation()
 Objects in **Pressomancy** use the `SimulationObject` metaclass, ensuring that each object is compliant with the framework's structure. Examples include:
 - **Filament**: Represents a linear array of objects.
 - **Quadriplex**: Non-canonical DNA conformation.
-- **SWPart**: Magnetic nanoparticle with internal anisotropy and magnetodynamis via the tSW model.
+- **SWPart**: Magnetic nanoparticle with internal anisotropy and magnetodynamics via the tSW model.
 
-`SimulationObject` is implemented to facititate contributors adding their own simualtion object. The metaclass adds various methods, hooks and traps to guarantee compatibility and integration with the **Pressomancy** framework..
+`SimulationObject` is implemented to facilitate contributors adding their own simulation object. The metaclass adds various methods, hooks and traps to guarantee compatibility and integration with the **Pressomancy** framework.
 
 
 ```python
@@ -128,8 +147,10 @@ class CustomObject(metaclass=Simulation_Object):
 
 - **`objects`**: Library of simulation objects.
 - **`resources`**: resources and metadata for objects.
-- **`analysis`**: Library of utilities and anaysis routines.
+- **`analysis`**: Library of utilities and analysis routines.
 - **`simulation`**: Centralized management of the simulation state.
+- **`io`**: HDF5 I/O.
+- **`magnetodynamics`**: Per-particle magnetization models (Langevin, Froelich-Kennelly) built into ESPResSo.
 
 ## Contributing
 

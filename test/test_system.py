@@ -38,4 +38,4 @@ class SimulationTest(BaseTestCase):
         old_seed = sim_inst.seed
         sim_inst.seed = old_seed + 1
 
-        assert sim_inst.test_set_attr("seed") == sim_inst.seed == old_seed + 1
+        assert getattr(sim_inst, "seed") == sim_inst.seed == old_seed + 1

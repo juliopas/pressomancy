@@ -99,3 +99,19 @@ pressomancy.object\_classes.tel\_sequence module
    :members:
    :undoc-members:
    :show-inheritance:
+
+pressomancy.object\_classes.elastomer module
+----------------------------------------------
+
+.. automodule:: pressomancy.object_classes.elastomer
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+pressomancy.object\_classes.point\_dipole module
+----------------------------------------------------
+
+.. automodule:: pressomancy.object_classes.point_dipole
+   :members:
+   :undoc-members:
+   :show-inheritance:

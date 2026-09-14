@@ -1,14 +1,18 @@
+'''
+``OTP``: a rigid 3-site ortho-terphenyl-like glass-former molecule, built from
+rigid-bond constraints and intramolecular exclusions.
+'''
 import espressomd
 import os
 from pressomancy.helper_functions import load_coord_file, PartDictSafe, SinglePairDict, align_vectors,BondWrapper
 import numpy as np
-from pressomancy.object_classes.object_class import Simulation_Object, ObjectConfigParams 
+from pressomancy.object_classes.object_class import Simulation_Object, ObjectConfigParams
 
 
 class OTP(metaclass=Simulation_Object):
 
     '''
-    Class that contains OTP relevant paramaters and methods. At construction one must pass an espresso handle becaouse the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a OTP. Therefore many relevant parameters are class specific, not instance specific.
+    Class that contains OTP relevant parameters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instance there will be only one type of a OTP. Therefore many relevant parameters are class specific, not instance specific.
     '''
     required_features=['EXCLUSIONS']
     numInstances = 0
@@ -30,9 +34,10 @@ class OTP(metaclass=Simulation_Object):
 
     def __init__(self, config: ObjectConfigParams):
         '''
-        Initialisation of a crowder object requires the specification of particle size and a handle to the espresso system
+        Initialisation of an OTP object requires the specification of particle size and a handle to the espresso system
         '''
-        assert config['n_parts'] == len(OTP._reference_sheet), 'n_parts must be equal to the number of parts in the reference sheet!!!'
+        if not (config['n_parts'] == len(OTP._reference_sheet)):
+            raise ValueError('n_parts must be equal to the number of parts in the reference sheet!!!')
         self.sys=config['espresso_handle']
         self.params=config
         self.realz_indices = []
@@ -43,7 +48,7 @@ class OTP(metaclass=Simulation_Object):
 
     def set_object(self,  pos, ori):
         '''
-        Sets a n_parts sequence of particles in espresso, asserting that the dimensionality of the pos paramater passed is commesurate with n_part.Using a generator object with the particle enumeration logic, and a try catch paradigm. When the StopIteration except is caught Filament.last_index_used += Filament.n_parts . Particles created here are treated as real, non_magnetic, with enabled rotations. Indices of added particles stored in self.realz_indices.append attribute. Orientation of filament stored in self.orientor = self.get_orientation_vec()
+        Sets a n_parts sequence of particles in espresso, asserting that the dimensionality of the pos parameter passed is commensurate with n_part.Using a generator object with the particle enumeration logic, and a try catch paradigm. When the StopIteration except is caught Filament.last_index_used += Filament.n_parts . Particles created here are treated as real, non_magnetic, with enabled rotations. Indices of added particles stored in self.realz_indices.append attribute. Orientation of filament stored in self.orientor = self.get_orientation_vec()
 
         :param pos: np.array() | float, list of positions
         :return: None

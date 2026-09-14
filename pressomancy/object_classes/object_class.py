@@ -1,3 +1,14 @@
+'''
+Framework core for pressomancy's simulation objects.
+
+Defines the ``Simulation_Object`` metaclass, which enforces the required
+class- and instance-level attributes on every object class (see
+:mod:`pressomancy.object_classes`), injects shared methods (``set_object``,
+``add_particle``, ``get_owned_part``, ``bond_owned_part_pair``,
+``change_part_type``, ``delete_owned_parts``) and dunders
+(``__eq__``/``__hash__``/``__iter__``/``__del__``), and ``ObjectConfigParams``,
+a locked-key ``dict`` subclass used for per-class default configuration.
+'''
 from pressomancy.helper_functions import RoutineWithArgs, PartDictSafe, SinglePairDict
 import types
 from functools import partial
@@ -55,20 +66,28 @@ class Simulation_Object(type):
     --------------------------------
     - `required_features` : list
         List of required features for the simulation object.
-    - `instance_id_counter` : int
-        Monotonic id allocator: the number of instances of the class ever *created*.
-        Declare it as ``0``; the metaclass owns it from then on and never rolls it
-        back, so `who_am_i` values are unique and stable for the whole run.
+    - `numInstances` : int
+        Number of instances of the class ever *created*. Declare it as ``0``;
+        each subclass is responsible for incrementing it in its own `__init__`,
+        and the metaclass decrements it in `_del` as instances are garbage
+        collected.
     - `part_types` : PartDictSafe
         Dictionary-like object mapping particle types to their identifiers.
     - `simulation_type` : SinglePairDict
         A single key-value pair representing the type of simulation object.
+    - `config` : ObjectConfigParams
+        Locked-key default configuration for the class.
 
     Metaclass-Managed Class Attributes
     ----------------------------------
     - `live_instances` : int
         Number of instances of the class currently alive. Maintained by
         `__call__`/`_del`; do not declare it in a subclass.
+    - `instance_id_counter` : int
+        Monotonic id allocator: defaults to ``0`` and is owned by the metaclass
+        from then on, incrementing on every `__call__` and never rolling back,
+        so `who_am_i` values are unique and stable for the whole run. Optional
+        to declare in a subclass; do not increment it yourself.
 
     Instance-Level Required Attributes
     -----------------------------------
@@ -290,7 +309,6 @@ class Simulation_Object(type):
         iterator
             An iterator for the object.
         """
-        """Return an iterator for the internal list, making the object iterable."""
         return iter([self])
 
     def set_object(self, *args,**kwargs):

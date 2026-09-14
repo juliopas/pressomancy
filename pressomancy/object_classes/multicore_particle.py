@@ -1,3 +1,8 @@
+'''
+``MulticorePart``: a rigid body with many magnetizable "core" virtual
+particles, magnetized via ``add_dipole_moments_to_virtuals`` under either an
+infinite-anisotropy model or ESPResSo's egg model.
+'''
 import inspect
 import numpy as np
 import espressomd
@@ -12,7 +17,13 @@ if espressomd.version.major() == 5:
 class MulticorePart(GenericRigidObj):
 
     '''
-    Class that contains relevant paramaters and methods. At construction one must pass an espresso handle becaouse the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a Quadriplex. Therefore many relevant parameters are class specific, not instance specific.
+    Class that contains MulticorePart relevant parameters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instance there will be only one type of a MulticorePart. Therefore many relevant parameters are class specific, not instance specific.
+
+   ``MulticorePart`` inherits ``GenericRigidObj.set_object`` as-is, so the core pattern
+    is translated but not rotated by ``ori`` (only the CoM particle's director is set) -
+    — virtual orientation is coaligned but should be taken as arbitrary. This is fine
+    here because ``add_dipole_moments_to_virtuals`` assigns dipoles to a random subset
+    of cores, so the core pattern's absolute orientation is not physically meaningful.
     '''
     required_features = GenericRigidObj.required_features + ['DIPOLES']
     numInstances = 0
@@ -59,10 +70,10 @@ class MulticorePart(GenericRigidObj):
             If ``anisotropy['kind'] == 'finite_egg'`` but the ESPResSo build lacks
             the ``EGG_MODEL`` feature.
         AssertionError
-            If an unsupported anisotropy kind is specified or required Egg-model
-            parameters are missing.
+            If an unsupported anisotropy kind is specified.
         ValueError
-            If ``dip_moments`` cannot be coerced to a ``(N, 3)`` array.
+            If ``dip_moments`` cannot be coerced to a ``(N, 3)`` array, or
+            required Egg-model parameters are missing.
 
         Notes
         -----
@@ -71,7 +82,8 @@ class MulticorePart(GenericRigidObj):
         - For the Egg model, selected particles are retyped to a ``'yolk'`` part
         type.
         """
-        assert anisotropy['kind'] in ['infinite', 'finite_egg'],'Supporting infinite anisotropy and finite anisotropy via the Egg model'
+        if not (anisotropy['kind'] in ['infinite', 'finite_egg']):
+            raise ValueError('Supporting infinite anisotropy and finite anisotropy via the Egg model')
         
         dip_moments=np.atleast_2d(dip_moments)
         part_handles = self.type_part_dict['virt']
@@ -88,15 +100,15 @@ class MulticorePart(GenericRigidObj):
             for x,dip_mom_per_part in zip(part_handles, dip_moments):
                 x.dip = dip_mom_per_part
         if anisotropy['kind']=='finite_egg':
-            if  not api_agnostic_feature_check('EGG_MODEL'):
-                name = f"{type(self).__name__}.{inspect.currentframe().f_code.co_name}"
-                raise MissingFeature(f"{name} requires EGG_MODEL. Please enable it in your ESPResSo installation.") 
-            MulticorePart.part_types.update({'yolk': 11})
             missing = [key for key in ['egg_gamma', 'aniso_energy'] if key not in anisotropy['params']]
             if missing:
                 raise ValueError(
                     f"Finite anisotropy via the Egg model requires parameters: {', '.join(missing)}"
                 )
+            if  not api_agnostic_feature_check('EGG_MODEL'):
+                name = f"{type(self).__name__}.{inspect.currentframe().f_code.co_name}"
+                raise MissingFeature(f"{name} requires EGG_MODEL. Please enable it in your ESPResSo installation.")
+            MulticorePart.part_types.update({'yolk': 11})
             for x,dip_mom_per_part in zip(part_handles, dip_moments):
                 x.dip = dip_mom_per_part
                 if espressomd.version.major() == 5:

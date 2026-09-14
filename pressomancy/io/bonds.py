@@ -80,8 +80,9 @@ def check_bond_count(stored, particles, group_name, policy='raise'):
         f"Bond topology of group '{group_name}' changed after inscription "
         f"({stored} -> {live} bond occurrences). Topology is written once and "
         "has no time axis, so this change is NOT in the file. Create all bonds "
-        "before inscribe_part_group_to_h5(), or call rewrite_bonds() to "
-        "re-capture, or set io_dict['bond_topology_policy']='warn'."
+        "before calling inscribe_part_group_to_h5()."
+        "\nThis warning/error can be supressed by chainging the 'policy' in"
+        "pressomancy.io.bonds.check_bond_count."
     )
     if policy == 'warn':
         logging.warning(msg)

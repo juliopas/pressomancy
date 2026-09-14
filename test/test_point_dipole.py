@@ -1,6 +1,6 @@
-from pressomancy.simulation import PointDipolePermanent, PointDipoleMagnetizable
+from pressomancy.simulation import PointDipolePermanent, PointDipoleMagnetizable, PointDipoleSuperparamagnetic
 from pressomancy.helper_functions import api_agnostic_feature_check
-from pressomancy.magnetodynamics import required_features_for
+from pressomancy.magnetodynamics import required_features_for, susceptibility_from_kT
 from .create_system import sim_inst, BaseTestCase
 
 import numpy as np
@@ -88,7 +88,52 @@ if all(api_agnostic_feature_check(feature) for feature in required_features_for(
             for p_virt in sim_inst.sys.part.select(type=sim_inst.part_types["pdm_virt"]):
                 assert p_virt.dipm > 0.
 
-        def test_specified_config_overrides_defaults(self):
-            assert self.config['dipm_sat'] == 1.
-            assert self.config['mag_susc_0'] == 0.5
-            assert self.mag_part[-1].required_features == required_features_for(MODEL)
+    class PointDipoleSuperparamagneticTest(BaseTestCase):
+        H_ext = [0,0,3.]
+        config=PointDipoleSuperparamagnetic.config.specify(
+            magnetization_model=MODEL, dipm=2., kT=0.5,
+            size=0.5, espresso_handle=sim_inst.sys)
+
+        def tearDown(self) -> None:
+            self.mag_part=None
+            self.cleanup()
+            self.assertEqual(len(sim_inst.sys.part),0)
+
+        def setUp(self) -> None:
+            self.mag_part = [PointDipoleSuperparamagnetic(config=PointDipoleSuperparamagnetic.config.specify(espresso_handle=sim_inst.sys)) for _ in range(10)]
+            self.mag_part.append(PointDipoleSuperparamagnetic(config=self.config))
+            sim_inst.store_objects(self.mag_part)
+            sim_inst.set_objects(self.mag_part)
+
+        def test_set_object_generic(self):
+            for name, type_id in PointDipoleSuperparamagnetic.part_types.items():
+                assert sim_inst.part_types[name] == type_id
+            assert sim_inst.part_types["pds_real"] == 63 and sim_inst.part_types["pds_virt"] == 633
+
+        def test_model_written_to_virtual_site(self):
+            specified_virt = self.mag_part[-1].type_part_dict['pds_virt'][0]
+            expected_susc = susceptibility_from_kT(2., 0.5)
+            assert specified_virt.mag_susc_0 == expected_susc, 'per-object config must reach the particle, via susceptibility_from_kT'
+            assert specified_virt.dipm_sat == 2.
+
+            default_susc = susceptibility_from_kT(1., 1.)
+            for obj in self.mag_part[:-1]:
+                p_virt = obj.type_part_dict['pds_virt'][0]
+                assert p_virt.mag_susc_0 == default_susc, 'default config object must keep the default'
+                assert p_virt.dipm_sat == 1.
+
+            assert specified_virt.langevin_magnetization_is_enabled is True
+            assert specified_virt.froelich_kennelly_is_enabled is False
+
+        def test_virtual_site_binding(self):
+            p_virt = next(iter(sim_inst.sys.part.select(type=sim_inst.part_types["pds_virt"])))
+            assert p_virt.is_virtual()
+            anchor = sim_inst.sys.part.by_id(p_virt.vs_relative[0])
+            assert anchor.type == sim_inst.part_types["pds_real"]
+            assert p_virt.propagation == (Propagation.TRANS_VS_RELATIVE |
+                                          Propagation.ROT_VS_INDEPENDENT)
+
+        def test_moment_seeded_at_saturation(self):
+            # a zero magnitude dipole cannot be used to infer an orientation on I/O
+            for p_virt in sim_inst.sys.part.select(type=sim_inst.part_types["pds_virt"]):
+                assert p_virt.dipm > 0.

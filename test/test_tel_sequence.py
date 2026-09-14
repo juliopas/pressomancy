@@ -1,9 +1,67 @@
+import unittest
+
 import espressomd
 import numpy as np
 from .create_system import sim_inst, BaseTestCase
-from pressomancy.object_classes.tel_sequence import TelSeq
+from pressomancy.object_classes.tel_sequence import (TELSEQ_RULES, TelSeq,
+                                                     _geometric_corner_local_ids,
+                                                     _validate_telseq_rules,
+                                                     _VALIDATED_TELSEQ_ALIASES)
 from pressomancy.object_classes.quadriplex_class import Quartet, Quadriplex
 from pressomancy.helper_functions import BondWrapper, api_agnostic_feature_check
+
+
+class TelSeqRulesGeometryTest(unittest.TestCase):
+    '''
+    The TELSEQ_RULES-vs-geometry cross-check itself.
+
+    Deliberately not feature-gated: it only reads resource files and does
+    numpy geometry, so it stays exercised even on builds where TelSeq's own
+    MORSE-gated tests cannot run.
+    '''
+
+    def setUp(self) -> None:
+        self._saved = {alias: dict(params) for alias, params in TELSEQ_RULES.items()}
+        _VALIDATED_TELSEQ_ALIASES.clear()
+
+    def tearDown(self) -> None:
+        for alias, params in self._saved.items():
+            TELSEQ_RULES[alias] = params
+        _VALIDATED_TELSEQ_ALIASES.clear()
+
+    def test_shipped_rules_match_the_resource_geometry(self):
+        for alias in TELSEQ_RULES:
+            with self.subTest(alias=alias):
+                _validate_telseq_rules(alias)
+
+    def test_corner_ids_are_the_quartet_block_corners(self):
+        # the rule table's top/bottom blocks must both reduce to the same
+        # single-quartet-local corner set that the geometry gives
+        for alias, params in TELSEQ_RULES.items():
+            with self.subTest(alias=alias):
+                quartet_size = params['block_size'] // 3
+                expected = _geometric_corner_local_ids(alias)
+                self.assertEqual(len(expected), 4, 'a tetrad has four corners')
+                self.assertEqual({i - quartet_size for i in params['top']}, expected)
+                self.assertEqual({i - 2 * quartet_size for i in params['bottom']}, expected)
+
+    def test_desynchronised_rules_are_rejected(self):
+        alias = 'quartet'
+        corrupted = dict(TELSEQ_RULES[alias])
+        corrupted['top'] = [idx + 1 for idx in corrupted['top']]
+        TELSEQ_RULES[alias] = corrupted
+        with self.assertRaises(ValueError):
+            _validate_telseq_rules(alias)
+
+    def test_validation_is_memoised_per_alias(self):
+        _validate_telseq_rules('quartet')
+        self.assertIn('quartet', _VALIDATED_TELSEQ_ALIASES)
+        # a later corruption is not re-checked for an alias already validated,
+        # which is what keeps the check off the hot path
+        TELSEQ_RULES['quartet'] = {**TELSEQ_RULES['quartet'], 'top': [0, 0, 0, 0]}
+        _validate_telseq_rules('quartet')
+
+
 if all(api_agnostic_feature_check(feature) for feature in TelSeq.required_features):
     class TelSeqTest(BaseTestCase):
 
@@ -78,11 +136,18 @@ if all(api_agnostic_feature_check(feature) for feature in TelSeq.required_featur
         def test_high_resolution_wrap_into_tel(self):
             for fold_type in ('parallel', 'hybrid', 'antiparallel'):
                 tel = self._build_tel(fold_type,alias='quartet_11x11')
-                self.assertEqual(tel.associated_objects[1].who_am_i, 1)
+                # who_am_i is a monotonic allocator that cleanup() never resets, so its
+                # absolute value depends on how many objects earlier tests built. Assert
+                # the relationship instead: this TelSeq's quadriplexes are consecutive.
+                owned_ids = [quad.who_am_i for quad in tel.associated_objects]
+                self.assertEqual(owned_ids, list(range(owned_ids[0], owned_ids[0] + len(owned_ids))))
                 second_corner_ids = []
                 second_corner_ids.extend(part.id for part in tel.associated_objects[1].associated_objects[1].corner_particles)
                 second_corner_ids.extend(part.id for part in tel.associated_objects[1].associated_objects[2].corner_particles)
-                self.assertTrue(max(second_corner_ids) > 75)
+                # Likewise relative: the second quadriplex's corners must come after the
+                # first's, rather than exceeding a hardcoded particle id.
+                first_corner_ids = [part.id for part in tel.associated_objects[0].associated_objects[1].corner_particles]
+                self.assertGreater(max(second_corner_ids), max(first_corner_ids))
                 tel.wrap_into_Tel()
                 bonded_corners = []
                 for monomer in tel.associated_objects:

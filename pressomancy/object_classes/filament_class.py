@@ -1,15 +1,20 @@
+'''
+``Filament``: a linear chain of monomers (or associated sub-objects), with
+anchor/bonding logic along the chain, bending potentials, dipole embedding,
+and bonding into ``Quadriplex`` assemblies.
+'''
 import espressomd
 import numpy as np
 import random
 from itertools import product, pairwise
-from pressomancy.object_classes.object_class import Simulation_Object, ObjectConfigParams 
+from pressomancy.object_classes.object_class import Simulation_Object, ObjectConfigParams
 from pressomancy.helper_functions import RoutineWithArgs, make_centered_rand_orient_point_array, PartDictSafe, SinglePairDict, BondWrapper, get_orientation_vec
 import logging
 import warnings
 
 class Filament(metaclass=Simulation_Object):
     '''
-    Class that contains filament relevant paramaters and methods. At construction one must pass an espresso handle becaouse the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a Filament. Therefore many relevant parameters are class specific, not instance specific.
+    Class that contains filament relevant parameters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instance there will be only one type of a Filament. Therefore many relevant parameters are class specific, not instance specific.
     '''
     required_features=['DIPOLES', 'VIRTUAL_SITES_RELATIVE', 'ROTATION']
     numInstances = 0
@@ -43,7 +48,7 @@ class Filament(metaclass=Simulation_Object):
 
     def set_object(self,  pos, ori):
         '''
-        Sets a n_parts sequence of particles in espresso, asserting that the dimensionality of the pos paramater passed is commesurate with n_part.Using a generator object with the particle enumeration logic, and a try catch paradigm. Particles created here are treated as real, non_magnetic, with enabled rotations. Indices of added particles stored in self.realz_indices.append attribute. Orientation of filament stored in self.orientor = self.get_orientation_vec()
+        Sets a n_parts sequence of particles in espresso, asserting that the dimensionality of the pos parameter passed is commensurate with n_part.Using a generator object with the particle enumeration logic, and a try catch paradigm. Particles created here are treated as real, non_magnetic, with enabled rotations. Indices of added particles stored in self.realz_indices.append attribute. Orientation of filament stored in self.orientor = self.get_orientation_vec()
 
         :param pos: np.array() | float, list of positions
         :return: None
@@ -75,8 +80,9 @@ class Filament(metaclass=Simulation_Object):
 
         '''
         handles=[]
-        if self.associated_objects!=None:
-            assert all([type_name in x.part_types.keys() for x in self.associated_objects]), 'type key must exist in the part_types of all associated monomers!'
+        if self.associated_objects is not None:
+            if not (all([type_name in x.part_types.keys() for x in self.associated_objects])):
+                raise KeyError('type key must exist in the part_types of all associated monomers!')
             warnings.warn('add_anchors should be used with caution for generic objects')
             for obj in self.associated_objects:
                 handles.extend(obj.type_part_dict[type_name])
@@ -106,7 +112,7 @@ class Filament(metaclass=Simulation_Object):
 
     def bond_overlapping_virtualz(self, crit=0.):
         '''
-        Adds FENE bonds between virtuals that fulfill the crit distance criterion. In general, it is assumed that there are virtual anchors placed using the add_anchors() method, and that between two real parts one can always found a pair of either overlapping virts or at a distance corresponding to the FENE_r0 parameter (crit param can be arbitrary but should be realated to the aforementioned params). Relies on np.isclose().
+        Adds FENE bonds between virtuals that fulfill the crit distance criterion. In general, it is assumed that there are virtual anchors placed using the add_anchors() method, and that between two real parts one can always found a pair of either overlapping virts or at a distance corresponding to the FENE_r0 parameter (crit param can be arbitrary but should be related to the aforementioned params). Relies on np.isclose().
 
         :return: None
 
@@ -121,7 +127,7 @@ class Filament(metaclass=Simulation_Object):
         '''
         Adds virtual particles to the center of each particle whose index is stored in self.realz_indices. It is critical that said virtuals do not have a director and have disabled rotation!
 
-        :param dip_magnitude: float | magnitude of the dipole moment to be asigned using the part.director unit vector. Default=1.
+        :param dip_magnitude: float | magnitude of the dipole moment to be assigned using the part.director unit vector. Default=1.
         :return: None
 
         '''
@@ -130,7 +136,8 @@ class Filament(metaclass=Simulation_Object):
         handles=[]
         self.__class__.part_types.update({'to_be_magnetized': 3})
         if self.associated_objects!=None:
-            assert all([type_name in x.part_types.keys() for x in self.associated_objects]), 'type key must exist in the part_types of all associated monomers!'
+            if not (all([type_name in x.part_types.keys() for x in self.associated_objects])):
+                raise KeyError('type key must exist in the part_types of all associated monomers!')
             for obj in self.associated_objects:
                 handles.extend(obj.type_part_dict[type_name])
         else:
@@ -144,7 +151,7 @@ class Filament(metaclass=Simulation_Object):
         '''
         Adds dipoles to real particles.
 
-        :param dip_magnitude: float | magnitude of the dipole moment to be asigned using the part.director unit vector. Default=1.
+        :param dip_magnitude: float | magnitude of the dipole moment to be assigned using the part.director unit vector. Default=1.
         :return: None
 
         '''
@@ -156,7 +163,8 @@ class Filament(metaclass=Simulation_Object):
     def bond_center_to_center(self, type_name):
         
         if self.associated_objects!=None:
-            assert all([type_name in x.part_types.keys() for x in self.associated_objects]), 'type key must exist in the part_types of all associated monomers!'
+            if not (all([type_name in x.part_types.keys() for x in self.associated_objects])):
+                raise KeyError('type key must exist in the part_types of all associated monomers!')
 
             for el1,el2 in pairwise(self.associated_objects):
                 for x,y in zip(el1.type_part_dict[type_name],el2.type_part_dict[type_name]):
@@ -181,8 +189,10 @@ class Filament(metaclass=Simulation_Object):
         :param type_name: particle type key to select from each associated object
         :type type_name: str
         '''
-        assert all([type_name in x.part_types.keys() for x in self.associated_objects]), 'type key must exist in the part_types of all associated monomers!'
-        assert self.associated_objects != None, 'self.associated_objects must not be None for this method ot work correctly'
+        if not (all([type_name in x.part_types.keys() for x in self.associated_objects])):
+            raise KeyError('type key must exist in the part_types of all associated monomers!')
+        if not (self.associated_objects != None):
+            raise RuntimeError('self.associated_objects must not be None for this method ot work correctly')
         len_sq=pow(self.associated_objects[0].params['n_parts'],2)
         for el1,el2 in pairwise(self.associated_objects):
             el1_pos=np.mean([x.pos for x in el1.type_part_dict['real']],axis=0)
@@ -229,7 +239,7 @@ class Filament(metaclass=Simulation_Object):
         
     def bond_quadriplexes(self, mode='hinge'):
         '''
-        associated_objects contains monomer objects (assume quadriplex). We add cormer particles in each quadriplex pair to a pool of candidate corners: candidate1 and candidate2. Finaly checks which corner pairs have a distance self.params['sigma']-2*fene_r0. Relies on np.isclose().
+        associated_objects contains monomer objects (assume quadriplex). We add corner particles in each quadriplex pair to a pool of candidate corners: candidate1 and candidate2. Finally checks which corner pairs have a distance self.params['sigma']-2*fene_r0. Relies on np.isclose().
         :return: None
 
         '''

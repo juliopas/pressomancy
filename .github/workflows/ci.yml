@@ -27,7 +27,7 @@ jobs:
             stekajack/ubuntults_with_espresso_magnetodynamics_wip \
             bash -c "
               pip3 install -e . coverage &&
-              coverage run --branch --source=pressomancy -m unittest discover -s test &&
+              coverage run --branch --source=pressomancy -m unittest discover -s test -t . &&
               coverage xml -o coverage.xml
             "
 

@@ -11,3 +11,11 @@ pressomancy.analysis.data\_analysis module
    :members:
    :undoc-members:
    :show-inheritance:
+
+pressomancy.analysis.h5\_helper\_functions module
+--------------------------------------------------
+
+.. automodule:: pressomancy.analysis.h5_helper_functions
+   :members:
+   :undoc-members:
+   :show-inheritance:

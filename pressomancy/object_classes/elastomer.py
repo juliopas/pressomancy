@@ -1,3 +1,10 @@
+'''
+``Elastomer``: a dense random-sphere-packing elastomer network. Built via
+FCC-lattice packing, an optional particle- or wall-based substrate, a
+thermostat-preserving "mixing" pre-equilibration
+(``mix_elastomer_stuff``), and random/nearest-neighbor harmonic-bond curing
+(``cure_elastomer``, ``random_harmonic_bonds``, ``bond_to_neighbors``).
+'''
 import espressomd
 import logging
 import numpy as np
@@ -10,7 +17,7 @@ import sys as sysos
 
 class Elastomer(metaclass=Simulation_Object):
     '''
-    Class that contains elastomer relevant paramaters and methods. At construction one must pass an espresso handle becaouse the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a Elastomer. Therefore many relevant parameters are class specific, not instance specific.
+    Class that contains elastomer relevant parameters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instance there will be only one type of a Elastomer. Therefore many relevant parameters are class specific, not instance specific.
     '''
     required_features=['DIPOLES', 'EXTERNAL_FORCES', 'ROTATION']
     numInstances = 0
@@ -45,12 +52,13 @@ class Elastomer(metaclass=Simulation_Object):
                 config['layer_height'] = config['box_E'][2] - self._substrate_size
             else:
                 config['box_E'][2] = self._substrate_size + config['layer_height']
-                assert config['box_E'][2] <= self.sys.box_l[2]
+                if not (config['box_E'][2] <= self.sys.box_l[2]):
+                    raise ValueError("Elastomer layer is too thick - does not fit in simulations box.")
         else:
             if config['layer_height'] is None:
                 config['layer_height'] = config['box_E'][2] - self._substrate_size
             elif config['box_E'][2] != config['layer_height'] + self._substrate_size:
-                raise ValueError("box_E and layer_height are not compatible. Ensure that box_E[2] == layer_height.\nAlternatively, use only on of the parameters and hae the other be automatically chosen.")
+                raise ValueError("box_E and layer_height are not compatible. Ensure that box_E[2] == layer_height.\nAlternatively, use only one of the parameters and have the other be automatically chosen.")
         assert config['layer_height'] == config['box_E'][2] - self._substrate_size
         if config['sigma'] is None:
             config['sigma'] = config['size'] * 0.89089872 # size / 2^(1/6)
@@ -61,7 +69,8 @@ class Elastomer(metaclass=Simulation_Object):
         self.associated_objects=self.params['associated_objects']
         if self.associated_objects is not None:
             self.part_types.update({nam: typ for obj in self.associated_objects for nam, typ in obj.part_types.items()})
-            assert len(self.associated_objects) == self.params["n_parts"]
+            if not (len(self.associated_objects) == self.params["n_parts"]):
+                raise ValueError("Number of elastomer particles must coincide with the number of associated objects.")
         self.substrate=None
         self.build_function=RoutineWithArgs(
             func=self.build_Elastomer,
@@ -73,7 +82,7 @@ class Elastomer(metaclass=Simulation_Object):
 
     def set_object(self, pos, ori):
         '''
-        Sets the particles in espresso according to self.build_funciton. Particles created here are treated according to their class set_object functions. Indices of added particles stored in self.realz_indices.append attribute.
+        Sets the particles in espresso according to self.build_function. Particles created here are treated according to their class set_object functions. Indices of added particles stored in self.realz_indices.append attribute.
 
         :param pos: np.array() | float, list of positions
         :return: None
@@ -81,15 +90,18 @@ class Elastomer(metaclass=Simulation_Object):
         '''
         pos=np.atleast_2d(pos)
         pos_z=pos[:,2]
-        assert np.all((pos_z >= self._substrate_size + self.params['size']/2) & (pos_z <= self.params['box_E'][2] - self.params['size'] / 2)), f"particle positions are outisde of elastomer space.\n\t min({pos_z.min()}) max({pos_z.max()}). should be min({self._substrate_size+self.params['size']/2}) max({self.params['box_E'][2]-self.params['size'] / 2})"
-        assert check_free_cuboid(self.sys, self.params['box_E']), "Elastomer must be build on empty space. Adjust box_E or remove non-elastomer particles to make space."
-        assert len(pos) == self.params['n_parts'], 'there is a missmatch between the pos lenth and Elastomer n_parts'
+        assert np.all((pos_z >= self._substrate_size + self.params['size']/2) & (pos_z <= self.params['box_E'][2] - self.params['size'] / 2)), f"particle positions are outside of elastomer space.\n\t min({pos_z.min()}) max({pos_z.max()}). should be min({self._substrate_size+self.params['size']/2}) max({self.params['box_E'][2]-self.params['size'] / 2})"
+        if not (check_free_cuboid(self.sys, self.params['box_E'])):
+            raise RuntimeError("Elastomer must be build on empty space. Adjust box_E or remove non-elastomer particles to make space.")
+        assert len(pos) == self.params['n_parts'], \
+            "there is a mismatch between the pos length and Elastomer n_parts"
         if self.associated_objects is None:
             dipm= 1.
             logic = (self.add_particle(type_name='real',pos=pp, dip=(dipm * oo), rotation=(True, True, True)) for pp, oo in zip(pos, ori))
         else:
-            assert self.params['n_parts'] == len(
-                self.associated_objects), " there doest seem to be enough particles stored!!! "
+            if not (self.params['n_parts'] == len(
+                self.associated_objects)):
+                raise ValueError(" there doesn't seem to be enough particles stored!!! ")
             if not all(hasattr(obj, 'set_object') and callable(getattr(obj, 'set_object')) for obj in self.associated_objects):
                 raise TypeError("One or more objects do not implement a callable 'set_object'")
             logic = (obj_el.set_object(pos_el, ori_el)
@@ -102,7 +114,32 @@ class Elastomer(metaclass=Simulation_Object):
         return self
 
     def build_Elastomer(self, center=None, sphere_radius=1., num_monomers=1, spacing=None, box_lengths=None, flag='rand'):
-        # fuction signature is determined by the build_function attribute, and should not be changed.
+        """
+        Generates monomer positions and orientations for the elastomer packing.
+
+        Builds an FCC lattice (see :func:`pressomancy.helper_functions.fcc_lattice`,
+        mode ``'crystal'``) sized to ``box_E`` minus substrate clearance,
+        shrinking the packing scale factor from 1.0 down to a floor of 0.85
+        if needed to fit ``num_monomers`` lattice sites, then centers the
+        packing in x/y and shifts it up in z to clear the substrate. This is
+        invoked via ``self.build_function`` (see :class:`RoutineWithArgs`)
+        during ``set_object``, not called directly; ``center``/``spacing`` are
+        accepted for signature compatibility but unused.
+
+        :param center: unused | kept for build_function signature compatibility
+        :param sphere_radius: float (=1.) | FCC lattice sphere radius
+        :param num_monomers: int (=1) | number of monomer positions to return
+        :param spacing: unused | kept for build_function signature compatibility
+        :param box_lengths: unused | kept for build_function signature compatibility
+        :param flag: str (='rand') | 'rand' shuffles the lattice sites before
+            truncating to ``num_monomers``; any other value takes them in
+            lattice order
+        :return: tuple(np.ndarray, np.ndarray) | (orientations, points), each
+            shape (num_monomers, 3)
+        :raises ValueError: if box_E[2] leaves no room above the substrate, or
+            if num_monomers can't be fit even at the scaling floor
+        """
+        # function signature is determined by the build_function attribute, and should not be changed.
         box_lengths = np.asarray(self.sys.box_l)
         box_lengths_tmp = np.asarray(self.params['box_E'])
         assert (box_lengths_tmp <= box_lengths).all()
@@ -110,7 +147,7 @@ class Elastomer(metaclass=Simulation_Object):
 
         z_offset = self._substrate_size + self.params['size'] / 2
         box_lengths_eff = box_lengths.copy()
-        box_lengths_eff[2] = self.params['layer_height'] - self.params['size'] / 2 # layer height minus the shpere radius, to take into account for pbc volume in fcc funciton
+        box_lengths_eff[2] = self.params['layer_height'] - self.params['size'] / 2 # layer height minus the sphere radius, to take into account for pbc volume in fcc function
         if box_lengths_eff[2] <= 0:
             raise ValueError("box_E[2] is too small to fit elastomer above substrate clearance.")
 
@@ -249,10 +286,27 @@ class Elastomer(metaclass=Simulation_Object):
         )
 
     def mix_elastomer_stuff(self, n_iter=100, time_step=0.001):
+        """
+        Pre-equilibrates the packed monomers before curing, to shake out an
+        even random distribution.
+
+        Temporarily adds top/bottom WCA box walls, switches to a short,
+        strongly-damped Langevin run (``kT=1e-3, gamma=10``) at the given
+        ``time_step``, runs ``n_iter`` integrator steps, then always restores
+        the box (removing the temporary walls), the prior thermostat mode
+        (whatever was active before, including 'off', via
+        ``_snapshot_thermostat_state``/``_restore_thermostat_state``), and the
+        prior ``time_step`` — even if the run raises.
+
+        :param n_iter: int (=100) | number of integrator steps to run
+        :param time_step: float (=0.001) | time step to use during mixing
+        :return: None
+        :raises ValueError: if called before ``create_substrate``
+        """
         if isinstance(self, list):
             raise ValueError("Must be used on Elastomer object type")
 
-        # add iniziatilation process, to get a nice random distribution before bonding
+        # add initialization process, to get a nice random distribution before bonding
         old_time_step= float(self.sys.time_step)
 
         self.sys.time_step = time_step
@@ -283,6 +337,22 @@ class Elastomer(metaclass=Simulation_Object):
             self.sys.time_step = old_time_step
 
     def cure_elastomer(self, fold_coord=True):
+        """
+        Fixes the network in place: bonds monomers into a permanent
+        random-harmonic-bond network.
+
+        If a substrate is set, monomers within a quarter monomer-size of the
+        substrate clearance plane have their z motion fixed (``part.fix``).
+
+        Bonds are created via ``random_harmonic_bonds`` using
+        ``bond_cutoff``/``max_bonds``/``bond_K_lims``/``bond_K_dist``, and any
+        monomer left with zero bonds is retried via ``bond_to_neighbors``
+        against its nearest neighbors.
+
+        :param fold_coord: bool (=True) | if True, folds every owned particle
+            back into the primary periodic box before bonding
+        :return: None
+        """
         if isinstance(self, list):
             raise ValueError("Must be used on Elastomer object type")
 
@@ -391,15 +461,17 @@ class Elastomer(metaclass=Simulation_Object):
 
         box_lengths = self.sys.box_l + 1e6 * ~np.array(self.sys.periodicity)
         if self.sys.periodicity[2]:
-            assert all(ele == box_lengths[0] for ele in box_lengths[1:]), "method assumes cubic box for system PBC"
+            if not (all(ele == box_lengths[0] for ele in box_lengths[1:])):
+                raise ValueError("method assumes cubic box for system PBC")
 
         if isinstance(bond_k, (float, int)):
             bond_k = [bond_k, bond_k]
-        assert (len(bond_k)==2
-                and bond_k[1]-bond_k[0]>=0
-               ), "method assumes bond_k to be either a number, or an interval represented by a tuple of the form (min, max)"
+        if not (len(bond_k)==2
+                and bond_k[1]-bond_k[0]>=0):
+            raise ValueError("method assumes bond_k to be either a number, or an interval represented by a tuple of the form (min, max)")
 
-        assert r_cut > r_catch or r_cut == -1, "r_cut must be larger than any bond lenght. (default -1)"
+        if not (r_cut > r_catch or r_cut == -1):
+            raise ValueError("r_cut must be larger than any bond lenght. (default -1)")
 
         if dist in ("normal", "norm", "gaussian", "gauss"):
             mean_tmp = ( bond_k[1] + bond_k[0] ) / 2
@@ -408,7 +480,7 @@ class Elastomer(metaclass=Simulation_Object):
             dist_func = np.random.normal
             dist_kwargs = {'loc': mean_tmp, 'scale': std_tmp}
         else:
-            raise ValueError(f"Tried to use unsupported distribution for elastomer bond strenght: '{dist}'. Supported distributions: 'normal'.")
+            raise ValueError(f"Tried to use unsupported distribution for elastomer bond strength: '{dist}'. Supported distributions: 'normal'.")
 
         n_bonds_dict= defaultdict(int)
 
@@ -489,17 +561,19 @@ class Elastomer(metaclass=Simulation_Object):
 
         box_lengths = self.sys.box_l + 1e6 * ~np.array(self.sys.periodicity)
         if self.sys.periodicity[2]:
-            assert all(ele == box_lengths[0] for ele in box_lengths[1:]), "method assumes cubic box for system PBC"
+            if not (all(ele == box_lengths[0] for ele in box_lengths[1:])):
+                raise ValueError("method assumes cubic box for system PBC")
 
         if isinstance(bond_k, (float, int)):
             bond_k = [bond_k, bond_k]
-        assert (len(bond_k)==2
-                and bond_k[1]-bond_k[0]>=0
-               ), "method assumes bond_k to be either a number, or an interval represented by a tuple of the form (min, max)"
+        if not (len(bond_k)==2
+                and bond_k[1]-bond_k[0]>=0):
+            raise ValueError("method assumes bond_k to be either a number, or an interval represented by a tuple of the form (min, max)")
 
         if r_catch is None:
             r_catch = (self.sys.box_l[2] - self._substrate_size) / 2
-        assert r_cut > r_catch or r_cut == -1, "r_cut must be larger than any bond lenght. (default -1)"
+        if not (r_cut > r_catch or r_cut == -1):
+            raise ValueError("r_cut must be larger than any bond lenght. (default -1)")
 
         if dist in ("normal", "norm", "gaussian", "gauss"):
             mean_tmp = ( bond_k[1] + bond_k[0] ) / 2
@@ -508,7 +582,7 @@ class Elastomer(metaclass=Simulation_Object):
             dist_func = np.random.normal
             dist_kwargs = {'loc': mean_tmp, 'scale': std_tmp}
         else:
-            raise ValueError(f"Tried to use unsupported distribution for elastomer bond strenght: '{dist}'. Supported distributions: 'normal'.")
+            raise ValueError(f"Tried to use unsupported distribution for elastomer bond strength: '{dist}'. Supported distributions: 'normal'.")
 
         parts_id_map = list(parts.id)
         if candidate_parts is parts or set(candidate_parts.id) == set(parts_id_map):
@@ -540,8 +614,6 @@ class Elastomer(metaclass=Simulation_Object):
 
                 r_12 = self.sys.distance(p1=particle, p2=particle_nghb)
 
-                mean_tmp = ( bond_k[1] + bond_k[0] ) / 2
-                std_tmp = ( bond_k[1] - bond_k[0] ) / 6
                 k_12= bond_k[0] - 1
                 while k_12<bond_k[0] or k_12>bond_k[1]:
                     k_12 = dist_func(**dist_kwargs)
@@ -564,6 +636,15 @@ class Elastomer(metaclass=Simulation_Object):
             self.sys.periodicity = old_periodicity
 
     def create_substrate(self, geometry: str = 'part'):
+        """
+        Creates the elastomer's substrate, if none exists yet.
+
+        :param geometry: str (='part') | 'wall' for an implicit WCA wall
+            constraint (``create_substrate_wall``), anything else for an
+            explicit lattice of fixed substrate particles
+            (``create_substrate_part``)
+        :return: None
+        """
         if self.substrate is None:
             if geometry == 'wall':
                 self.create_substrate_wall()
@@ -573,6 +654,13 @@ class Elastomer(metaclass=Simulation_Object):
             warnings.warn("Substrate already set. Will ignore this call.")
 
     def remove_substrate(self, geometry: str = 'part'):
+        """
+        Removes the elastomer's substrate, if one exists.
+
+        :param geometry: str (='part') | must match the geometry passed to
+            ``create_substrate`` ('wall' or 'part')
+        :return: None
+        """
         if self.substrate is not None:
             if geometry == 'wall':
                 self.remove_substrate_wall()
@@ -582,6 +670,14 @@ class Elastomer(metaclass=Simulation_Object):
             warnings.warn("Substrate not yet set. Will ignore this call.")
 
     def create_substrate_part(self):
+        """
+        Builds an explicit, fixed, sub-monomer-sized 'substrate' particle
+        lattice covering the x/y footprint of the box at z=substrate_radius,
+        and sets a strongly-repulsive WCA interaction between it and every
+        'real' monomer type so monomers can't sink through it.
+
+        :return: None
+        """
         substrate_radius = self._substrate_size / 2.
         n_substrate_x = int(np.ceil(self.params['box_E'][0]))
         n_substrate_y = int(np.ceil(self.params['box_E'][1]))
@@ -599,6 +695,8 @@ class Elastomer(metaclass=Simulation_Object):
             substrate_list.append(part_hndl)
         self.substrate = substrate_list
 
+        # The /2^(1/6) softened sigma keeps monomers sitting at their equilibrium
+        # distance from the substrate instead of a stiff overlap.
         substrate_sigma_half = substrate_radius * 0.89089871814 # radius / 2^(1/6)
         for key, typ in self.part_types.items():
             if "real" in key:
@@ -606,6 +704,12 @@ class Elastomer(metaclass=Simulation_Object):
                 self.sys.non_bonded_inter[self.part_types['substrate'], typ].wca.set_params(epsilon=1e6, sigma=sigma)
 
     def remove_substrate_part(self):
+        """
+        Removes every substrate particle created by ``create_substrate_part``
+        and deactivates the substrate/monomer WCA interaction.
+
+        :return: None
+        """
         for part in self.substrate:
             part.remove()
             self.type_part_dict['substrate'].remove(part)
@@ -616,10 +720,22 @@ class Elastomer(metaclass=Simulation_Object):
                 self.sys.non_bonded_inter[self.part_types['substrate'], typ].wca.deactivate()
 
     def create_substrate_wall(self):
+        """
+        Creates an implicit substrate as a bottom WCA wall constraint (see
+        :func:`pressomancy.helper_functions.add_box_constraints_func`)
+        against every 'real' monomer type.
+
+        :return: None
+        """
         types_M = tuple(typ for key, typ in self.part_types.items() if "real" in key)
         wall_constraints = add_box_constraints_func(bottom=self._substrate_size, wall_type=self.part_types['substrate'], inter='wca', types_=types_M, sys=self.sys)
         self.substrate = wall_constraints[0]
 
     def remove_substrate_wall(self):
+        """
+        Removes the bottom wall constraint created by ``create_substrate_wall``.
+
+        :return: None
+        """
         remove_box_constraints_func(wall_type=self.part_types['substrate'], sys=self.sys)
         self.substrate = None

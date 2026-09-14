@@ -1,6 +1,12 @@
-from .create_system import BaseTestCase
+from .create_system import BaseTestCase, sim_inst
 import numpy as np
-from pressomancy.helper_functions import get_perpendicular, partition_cuboid_volume, get_neighbours, get_neighbours_cross_lattice, fcc_lattice, min_img_dist
+from pressomancy.helper_functions import (get_perpendicular, partition_cuboid_volume, get_neighbours,
+                                          get_neighbours_cross_lattice, fcc_lattice, min_img_dist,
+                                          align_vectors, make_centered_rand_orient_point_array,
+                                          get_orientation_vec, get_cross_lattice_nonintersecting_volumes,
+                                          PartDictSafe, generate_random_unit_vectors,
+                                          random_nested_3d_vectors_like, RoutineWithArgs,
+                                          check_free_cuboid, calculate_pair_distances)
 
 class HelperFunctionsTest(BaseTestCase):
 
@@ -40,6 +46,189 @@ class HelperFunctionsTest(BaseTestCase):
         vec_x = np.array([1.0, 0.0, 0.0])
         perp_x = get_perpendicular(vec_x, phi=0.0)
         self.assertTrue(np.allclose(perp_x, np.array([0.0, 1.0, 0.0])))
+
+
+class RegressionTest(BaseTestCase):
+    """Claude found some bugs (mostly minor), so I had him make tests that would catch them."""
+
+    def test_align_vectors_handles_every_antiparallel_axis(self):
+        """C1: the -x case used to project the reference onto zero and return NaN."""
+        axes = [np.array(v, dtype=float) for v in
+                ([1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1])]
+        for v1 in axes:
+            v2 = -v1
+            rot = align_vectors(v1, v2)
+            with self.subTest(v1=v1.tolist()):
+                self.assertTrue(np.all(np.isfinite(rot)), msg=f"non-finite rotation for {v1}")
+                self.assertTrue(np.allclose(rot @ v1, v2, atol=1e-12))
+                # A rotation, not a reflection.
+                self.assertAlmostEqual(float(np.linalg.det(rot)), 1.0, places=12)
+
+    def test_random_orientation_is_uniform_on_the_sphere(self):
+        """P1: phi was drawn uniformly, which oversampled the poles."""
+        rng_backup = np.random.get_state()
+        try:
+            np.random.seed(20240601)
+            n_draws = 20000
+            z = np.array([
+                make_centered_rand_orient_point_array(
+                    center=np.zeros(3), sphere_radius=1.0, num_monomers=2, spacing=1.0)[0][0][2]
+                for _ in range(n_draws)
+            ])
+        finally:
+            np.random.set_state(rng_backup)
+
+        # Uniform on the sphere => |cos(phi)| is uniform on [0, 1], mean 0.5.
+        self.assertAlmostEqual(float(np.abs(z).mean()), 0.5, delta=0.02)
+        self.assertAlmostEqual(float((np.abs(z) > 0.9).mean()), 0.10, delta=0.02)
+
+    def test_coincident_lattices_are_never_reported_free(self):
+        """P2: zero-distance pairs were filtered out before the separation test."""
+        box = np.array([30.0, 30.0, 30.0])
+        centers = fcc_lattice(radius=3.0, box_dim=box, mode="pack")
+        res = get_cross_lattice_nonintersecting_volumes(
+            current_lattice_centers=centers, current_lattice_grouped_part_pos=centers,
+            current_lattice_diam=6.0, other_lattice_centers=centers,
+            other_lattice_grouped_part_pos=centers, other_lattice_diam=6.0,
+            box_lengths=box)
+        free = [key for key, val in res.items() if all(val)]
+        self.assertEqual(free, [], msg="a lattice superposed on itself must not be free")
+
+    def test_orientation_vec_is_real_and_sign_pinned(self):
+        """P3: eig could return a complex type, and the sign was arbitrary."""
+        pos = np.array([[0.0, 0.0, 0.0], [1.0, 0.1, 0.05],
+                        [2.0, 0.2, 0.10], [3.0, 0.3, 0.15]])
+        axis = get_orientation_vec(pos)
+        self.assertEqual(axis.dtype.kind, 'f')
+        self.assertTrue(np.all(np.isfinite(axis)))
+        self.assertAlmostEqual(float(np.linalg.norm(axis)), 1.0, places=12)
+        # Deterministic, and oriented first -> last.
+        self.assertTrue(np.allclose(axis, get_orientation_vec(pos)))
+        self.assertGreater(float(np.dot(axis, pos[-1] - pos[0])), 0.0)
+        self.assertTrue(np.allclose(get_orientation_vec(pos[::-1]), -axis, atol=1e-10))
+
+    def test_part_dict_safe_strict_mode(self):
+        """C2: an integer-valued map must not auto-create a list for a typo."""
+        strict = PartDictSafe({'real': 1}, default_factory=None)
+        with self.assertRaises(KeyError):
+            strict['nonmang']
+        self.assertEqual(strict['real'], 1)
+        strict['virt'] = 2
+        self.assertEqual(dict(strict), {'real': 1, 'virt': 2})
+        # The list-valued bookkeeping keeps its default, which objects rely on.
+        lenient = PartDictSafe({'real': []})
+        self.assertEqual(lenient['virt'], [])
+
+    def test_random_unit_vectors_honour_the_supplied_rng(self):
+        """C14: the rng argument was accepted and then ignored."""
+        first = generate_random_unit_vectors(5, rng=np.random.default_rng(1234))
+        same = generate_random_unit_vectors(5, rng=np.random.default_rng(1234))
+        other = generate_random_unit_vectors(5, rng=np.random.default_rng(9999))
+        self.assertTrue(np.allclose(first, same))
+        self.assertFalse(np.allclose(first, other))
+        nested_a = random_nested_3d_vectors_like(np.zeros((4, 3)), rng=np.random.default_rng(7))
+        nested_b = random_nested_3d_vectors_like(np.zeros((4, 3)), rng=np.random.default_rng(7))
+        self.assertTrue(np.allclose(nested_a, nested_b))
+
+    def test_impossible_placement_raises_instead_of_hanging(self):
+        """C11: the retry loop had no cap and would spin forever."""
+        routine = RoutineWithArgs(func=make_centered_rand_orient_point_array,
+                                  num_monomers=4, monomer_size=100.0, spacing=1.0)
+        with self.assertRaises(ValueError) as ctx:
+            partition_cuboid_volume(box_lengths=np.array([30.0, 30.0, 30.0]),
+                                    num_spheres=20, sphere_diameter=6.0,
+                                    routine_per_volume=routine)
+        self.assertIn("without overlapping its neighbours", str(ctx.exception))
+
+    def test_partition_cuboid_volume_handles_a_non_cubic_box(self):
+        # Dense on purpose: at 8 volumes of diameter 5 the nearest inter-volume
+        # separation is ~3-4, so the invariant would hold even with the overlap
+        # rejection removed and the test would prove nothing. At these settings the
+        # worst separation lands at ~1.00-1.07, i.e. the rejection is load-bearing.
+        n_vol, n_mon, mono_size = 100, 4, 1.0
+        for box in (np.array([30.0, 30.0, 30.0]), np.array([30.0, 10.0, 60.0])):
+            routine = RoutineWithArgs(func=make_centered_rand_orient_point_array,
+                                      num_monomers=n_mon, monomer_size=mono_size,
+                                      spacing=mono_size)
+            rng_backup = np.random.get_state()
+            try:
+                np.random.seed(4242)
+                _, positions, orientations = partition_cuboid_volume(
+                    box_lengths=box, num_spheres=n_vol, sphere_diameter=3.0,
+                    routine_per_volume=routine)
+            finally:
+                np.random.set_state(rng_backup)
+
+            label = "cubic" if box[0] == box[1] == box[2] else "non-cubic"
+            with self.subTest(box=label):
+                self.assertEqual(np.asarray(positions).shape, (n_vol, n_mon, 3))
+                self.assertEqual(np.asarray(orientations).shape, (n_vol, n_mon, 3))
+                flat = np.asarray(positions).reshape(-1, 3)
+                owner = np.repeat(np.arange(n_vol), n_mon)
+                worst, worst_pair = np.inf, None
+                for i in range(len(flat)):
+                    for j in range(i + 1, len(flat)):
+                        if owner[i] == owner[j]:
+                            continue
+                        d = float(np.linalg.norm(
+                            min_img_dist(flat[i], flat[j], box_dim=box)))
+                        if d < worst:
+                            worst, worst_pair = d, (i, j)
+                self.assertGreater(
+                    worst, mono_size - 1e-9,
+                    msg=(f"{label} box: monomers from different volumes are "
+                         f"{worst:.4f} apart (< {mono_size}) at {worst_pair}"))
+
+    def test_check_free_cuboid_folds_drifted_positions(self):
+        """P4: espresso stores unfolded positions, so a drifted particle read as outside."""
+        cuboid = np.array([10.0, 10.0, 10.0])
+        try:
+            probe = sim_inst.sys.part.add(pos=[5.0, 5.0, 5.0], type=99)
+            self.assertFalse(check_free_cuboid(sim_inst.sys, cuboid),
+                             msg="a particle sitting inside the cuboid must be seen")
+            probe.pos = np.array([5.0, 5.0, 5.0]) + np.asarray(sim_inst.sys.box_l)
+            self.assertFalse(check_free_cuboid(sim_inst.sys, cuboid),
+                             msg="the same particle displaced by one box must still be seen")
+            probe.pos = [25.0, 25.0, 25.0]
+            self.assertTrue(check_free_cuboid(sim_inst.sys, cuboid),
+                            msg="a particle genuinely outside must leave the cuboid free")
+        finally:
+            self.cleanup()
+
+
+    def test_calculate_pair_distances_matches_index_pair_construction(self):
+        """3.4.2: broadcasting must reproduce the explicit N*M index list exactly."""
+        from itertools import product
+        from pressomancy.helper_functions import min_img_dist
+        rng = np.random.default_rng(11)
+        box = np.array([30.0, 25.0, 40.0])
+        for n, m in ((1, 1), (5, 5), (3, 7), (12, 4)):
+            a = rng.random((n, 3)) * box
+            b = rng.random((m, 3)) * box
+            combos = np.array(list(product(range(n), range(m))))
+            reference = np.linalg.norm(
+                min_img_dist(a[combos[:, 0]], b[combos[:, 1]], box_dim=box), axis=-1)
+            with self.subTest(shape=(n, m)):
+                got = calculate_pair_distances(a, b, box_lengths=box)
+                self.assertEqual(got.shape, reference.shape)
+                np.testing.assert_allclose(got, reference, rtol=0, atol=0)
+
+    def test_get_orientation_vec_matches_component_wise_tensor(self):
+        """3.4.3: the covariance product must reproduce the six component means."""
+        rng = np.random.default_rng(12)
+        for n in (3, 10, 50):
+            pos = np.cumsum(rng.random((n, 3)), axis=0)
+            cm = pos.mean(axis=0)
+            comp = np.array([[np.mean([(p[i] - cm[i]) * (p[j] - cm[j]) for p in pos])
+                              for j in range(3)] for i in range(3)])
+            res, egiv = np.linalg.eigh(comp)
+            expected = egiv[:, np.argmax(res)]
+            expected = expected / np.linalg.norm(expected)
+            if np.dot(expected, pos[-1] - pos[0]) < 0:
+                expected = -expected
+            with self.subTest(n=n):
+                np.testing.assert_allclose(get_orientation_vec(pos), expected, atol=1e-12)
+
 
 class PartitioningTest(BaseTestCase):
 

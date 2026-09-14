@@ -7,3 +7,4 @@ pressomancy
    pressomancy
    pressomancy.object_classes
    pressomancy.analysis
+   pressomancy.io

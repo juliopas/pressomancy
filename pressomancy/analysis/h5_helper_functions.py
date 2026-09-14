@@ -48,7 +48,7 @@ def _normalize_axis_index(index, length):
             "None (np.newaxis) is not supported for an HDF5 selection; insert "
             "new axes into the returned array instead."
         )
-    if isinstance(index, (bool, np.bool_)):
+    if isinstance(index, (bool, np.bool)):
         raise TypeError("Boolean scalars are not valid indices for an HDF5 selection.")
 
     if isinstance(index, (int, np.integer)):
@@ -168,7 +168,7 @@ def _apply_post_indices(data, normalized, post_indices):
         axis = active_axes[0]
         return np.take(data, kept[axis], axis=axis)
     # np.ix_ builds the correct index tuples to use in data[grid]
-    # np.arange(data.shape[axis]) keep the whole axies
+    # np.arange(data.shape[axis]) keep the whole axes
     grids = np.ix_(
         *[
             kept[axis] if kept[axis] is not None else np.arange(data.shape[axis])

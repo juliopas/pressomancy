@@ -1,3 +1,9 @@
+'''
+Point-dipole simulation objects: ``PointDipolePermanent`` (a fixed dipole
+moment), ``PointDipoleMagnetizable`` (susceptibility-parameterized, driven by
+one of the native magnetization models in :mod:`pressomancy.magnetodynamics`),
+and ``PointDipoleSuperparamagnetic`` (dipm/kT-parameterized Langevin dipole).
+'''
 from pressomancy.object_classes.object_class import Simulation_Object, ObjectConfigParams
 from pressomancy.helper_functions import PartDictSafe, SinglePairDict
 from pressomancy.magnetodynamics import (COMMON_FEATURES, configure_magnetization,
@@ -6,7 +12,7 @@ from pressomancy.magnetodynamics import (COMMON_FEATURES, configure_magnetizatio
 
 class PointDipolePermanent(metaclass=Simulation_Object):
     '''
-    Class that contains permanent magnetic point dipole particles relevant paramaters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a PointDipolePermanent. Therefore many relevant parameters are class specific, not instance specific.
+    Class that contains permanent magnetic point dipole particles relevant parameters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instance there will be only one type of a PointDipolePermanent. Therefore many relevant parameters are class specific, not instance specific.
     '''
 
     required_features=['DIPOLES', 'ROTATION']
@@ -25,12 +31,13 @@ class PointDipolePermanent(metaclass=Simulation_Object):
         self.params=config
         self.associated_objects=config['associated_objects']
         self.type_part_dict=PartDictSafe({key: [] for key in PointDipolePermanent.part_types.keys()})
-        assert self.associated_objects is None, "Point dipoles can not have associated objects. They are singular particles, as basic as possible."
+        if not (self.associated_objects is None):
+            raise ValueError("Point dipoles can not have associated objects. They are singular particles, as basic as possible.")
         PointDipolePermanent.numInstances += 1
 
     def set_object(self,  pos, ori):
         '''
-        Sets a n_parts sequence of particles in espresso, asserting that the dimensionality of the pos paramater passed is commesurate with n_part.Using a generator object with the particle enumeration logic, and a try catch paradigm. Particles created here are treated as real, non_magnetic, with enabled rotations. Indices of added particles stored in self.realz_indices.append attribute. Orientation of filament stored in self.orientor = self.get_orientation_vec()
+        Sets a n_parts sequence of particles in espresso, asserting that the dimensionality of the pos parameter passed is commensurate with n_part.Using a generator object with the particle enumeration logic, and a try catch paradigm. Particles created here are treated as real, non_magnetic, with enabled rotations. Indices of added particles stored in self.realz_indices.append attribute. Orientation of filament stored in self.orientor = self.get_orientation_vec()
 
         :param pos: np.array() | float, list of positions
         :return: None
@@ -43,7 +50,7 @@ class PointDipolePermanent(metaclass=Simulation_Object):
 
 class PointDipoleMagnetizable(metaclass=Simulation_Object):
     '''
-    Class that contains magnetizable point dipole particles relevant paramaters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a PointDipoleMagnetizable. Therefore many relevant parameters are class specific, not instance specific.
+    Class that contains magnetizable point dipole particles relevant parameters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instance there will be only one type of a PointDipoleMagnetizable. Therefore many relevant parameters are class specific, not instance specific.
 
     The dipole moment is carried by a virtual particle whose magnitude and
     direction are updated by espresso every timestep, following the
@@ -76,12 +83,13 @@ class PointDipoleMagnetizable(metaclass=Simulation_Object):
         self.required_features=required_features_for(config['magnetization_model'])
         self.associated_objects=config['associated_objects']
         self.type_part_dict=PartDictSafe({key: [] for key in PointDipoleMagnetizable.part_types.keys()})
-        assert self.associated_objects is None, "Point dipoles can not have associated objects. They are singular particles, as basic as possible."
+        if not (self.associated_objects is None):
+            raise ValueError("Point dipoles can not have associated objects. They are singular particles, as basic as possible.")
         PointDipoleMagnetizable.numInstances += 1
 
     def set_object(self,  pos, ori):
         '''
-        Sets a n_parts sequence of particles in espresso, asserting that the dimensionality of the pos paramater passed is commesurate with n_part.Using a generator object with the particle enumeration logic, and a try catch paradigm. A real anchor carries the steric interaction and the rotational degrees of freedom, while a virtual site bound to it carries the magnetic moment that espresso updates. The moment is seeded at saturation along ori, since a zero magnitude dipole cannot be used to infer an orientation on I/O.
+        Sets a n_parts sequence of particles in espresso, asserting that the dimensionality of the pos parameter passed is commensurate with n_part.Using a generator object with the particle enumeration logic, and a try catch paradigm. A real anchor carries the steric interaction and the rotational degrees of freedom, while a virtual site bound to it carries the magnetic moment that espresso updates. The moment is seeded at saturation along ori, since a zero magnitude dipole cannot be used to infer an orientation on I/O.
 
         :param pos: np.array() | float, list of positions
         :return: None
@@ -100,7 +108,7 @@ class PointDipoleMagnetizable(metaclass=Simulation_Object):
 
 class PointDipoleSuperparamagnetic(metaclass=Simulation_Object):
     '''
-    Class that contains superparamagnetic point dipole particles relevant paramaters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a PointDipoleSuperparamagnetic. Therefore many relevant parameters are class specific, not instance specific.
+    Class that contains superparamagnetic point dipole particles relevant parameters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instance there will be only one type of a PointDipoleSuperparamagnetic. Therefore many relevant parameters are class specific, not instance specific.
 
     Same machinery as PointDipoleMagnetizable, but parameterised the way a
     superparamagnetic particle is usually described: by the magnitude of its
@@ -138,12 +146,13 @@ class PointDipoleSuperparamagnetic(metaclass=Simulation_Object):
         self.required_features=required_features_for(config['magnetization_model'])
         self.associated_objects=config['associated_objects']
         self.type_part_dict=PartDictSafe({key: [] for key in PointDipoleSuperparamagnetic.part_types.keys()})
-        assert self.associated_objects is None, "Point dipoles can not have associated objects. They are singular particles, as basic as possible."
+        if not (self.associated_objects is None):
+            raise ValueError("Point dipoles can not have associated objects. They are singular particles, as basic as possible.")
         PointDipoleSuperparamagnetic.numInstances += 1
 
     def set_object(self,  pos, ori):
         '''
-        Sets a n_parts sequence of particles in espresso, asserting that the dimensionality of the pos paramater passed is commesurate with n_part. A real anchor carries the steric interaction and the rotational degrees of freedom, while a virtual site bound to it carries the magnetic moment that espresso updates. The moment is seeded at dipm along ori, since a zero magnitude dipole cannot be used to infer an orientation on I/O.
+        Sets a n_parts sequence of particles in espresso, asserting that the dimensionality of the pos parameter passed is commensurate with n_part. A real anchor carries the steric interaction and the rotational degrees of freedom, while a virtual site bound to it carries the magnetic moment that espresso updates. The moment is seeded at dipm along ori, since a zero magnitude dipole cannot be used to infer an orientation on I/O.
 
         :param pos: np.array() | float, list of positions
         :return: None

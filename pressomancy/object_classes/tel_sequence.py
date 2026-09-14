@@ -1,9 +1,17 @@
+'''
+``TelSeq``: folds a chain of ``brokenA``/``brokenB`` ``Quadriplex`` units into
+a G-quadruplex telomeric-sequence topology (``parallel``/``antiparallel``/
+``hybrid`` folds), via the ``_rule_maker``/``_telseq_block_offset``
+corner-bonding rules and ``wrap_into_Tel``.
+'''
+import os
 import espressomd
 import numpy as np
 import random
 from pressomancy.object_classes.quadriplex_class import *
 from pressomancy.object_classes.object_class import Simulation_Object, ObjectConfigParams
-from pressomancy.helper_functions import RoutineWithArgs, make_centered_rand_orient_point_array, PartDictSafe, SinglePairDict, BondWrapper, get_orientation_vec, get_perpendicular, align_vectors
+from pressomancy.object_classes.rigid_obj import GenericRigidObj
+from pressomancy.helper_functions import RoutineWithArgs, make_centered_rand_orient_point_array, PartDictSafe, SinglePairDict, BondWrapper, get_orientation_vec, get_perpendicular, align_vectors, load_coord_file
 import logging
 import warnings
 
@@ -19,6 +27,9 @@ TELSEQ_RULES = {
         'bottom': [243, 352, 362, 253],
     },
 }
+
+#: Aliases whose TELSEQ_RULES entry has already been checked against geometry.
+_VALIDATED_TELSEQ_ALIASES = set()
 
 
 def _telseq_block_offset(alias, corner_particles):
@@ -36,6 +47,7 @@ def _telseq_block_offset(alias, corner_particles):
         rule_params = TELSEQ_RULES[alias]
     except KeyError:
         raise ValueError(f"no TelSeq rule set is defined for alias '{alias}'; known aliases: {sorted(TELSEQ_RULES)}") from None
+    _validate_telseq_rules(alias)
     local_ids = sorted(rule_params['top'] + rule_params['bottom'])
     actual_ids = sorted(part.id for part in corner_particles)
     if len(actual_ids) != len(local_ids):
@@ -47,6 +59,73 @@ def _telseq_block_offset(alias, corner_particles):
             f"'{alias}' rule corners {local_ids} (inferred offset={offset}, expected {expected_ids}); "
             "the monomer layout does not match the rule block")
     return offset
+
+
+def _geometric_corner_local_ids(alias):
+    """
+    Independently recomputes which local indices of a Quartet's reference
+    geometry are corner particles, using the same diagonal-distance rule
+    ``Quartet.set_object`` uses to build ``corner_particles`` (both read the
+    distance from ``Quartet.CORNER_DIAGONAL``, so there is one definition).
+
+    Reads ``resources/<alias>.txt`` directly (via ``load_coord_file``, which
+    staples the CoM particle in at local index 0, matching how
+    ``GenericRigidObj``/``Quartet`` load it), rather than relying on a live
+    ``Quartet`` instance, so no espresso system is needed.
+
+    :param alias: str | a Quartet resource-file alias (e.g. 'quartet')
+    :return: set(int) | local indices of the geometric corner particles
+    """
+    path = os.path.join(GenericRigidObj._resources_dir, f"{alias}.txt")
+    sheet = load_coord_file(path)
+    separations = np.linalg.norm(sheet[:, None, :] - sheet[None, :, :], axis=-1)
+    rows, cols = np.nonzero(np.isclose(separations, Quartet.CORNER_DIAGONAL, atol=1e-6))
+    return set(rows.tolist()) | set(cols.tolist())
+
+
+def _validate_telseq_rules(alias):
+    """
+    Cross-checks one alias' TELSEQ_RULES entry against the corner geometry it
+    claims to describe.
+
+    TELSEQ_RULES and the resource-file geometry are two independently
+    hand-derived facts, with nothing else tying them together. This catches a
+    future edit to either one (a new/changed resource file, a typo in
+    TELSEQ_RULES, a changed ``Quartet.CORNER_DIAGONAL``) that silently
+    desynchronizes them, instead of only surfacing as a subtly wrong fold at
+    simulation time.
+
+    Called from :func:`_telseq_block_offset`, i.e. once TelSeq machinery is
+    actually used, and memoized per alias — deliberately not run at import
+    time, so an unrelated ``import pressomancy.simulation`` neither pays for
+    the geometry check nor fails outright on a missing resource file.
+
+    :param alias: str | a Quartet resource-file alias (e.g. 'quartet')
+    :raises ValueError: if the alias' 'top'/'bottom' ids, once shifted back
+        into single-Quartet-local space, don't match the corner particles
+        actually present in that alias' resource-file geometry
+    """
+    if alias in _VALIDATED_TELSEQ_ALIASES:
+        return
+    rule_params = TELSEQ_RULES[alias]
+    block_size = rule_params['block_size']
+    if block_size % 3 != 0:
+        raise ValueError(
+            f"TELSEQ_RULES['{alias}']['block_size']={block_size} is not divisible "
+            "by 3 (one Quadriplex monomer is always 3 Quartets)")
+    quartet_size = block_size // 3
+    expected = _geometric_corner_local_ids(alias)
+    for side, block_index in (('top', 1), ('bottom', 2)):
+        shift = block_index * quartet_size
+        side_local = {idx - shift for idx in rule_params[side]}
+        if side_local != expected:
+            raise ValueError(
+                f"TELSEQ_RULES['{alias}']['{side}'] does not match the corner particles "
+                f"of resources/{alias}.txt: expected local ids {sorted(expected)} (i.e. "
+                f"{side} ids {sorted(i + shift for i in expected)}), got "
+                f"{sorted(rule_params[side])}. Either TELSEQ_RULES or the resource "
+                f"file/Quartet.CORNER_DIAGONAL changed without updating the other.")
+    _VALIDATED_TELSEQ_ALIASES.add(alias)
 
 
 def _rule_maker(fold_type, choice_id, offset, n=3, alias=None):
@@ -129,7 +208,7 @@ def _rule_maker(fold_type, choice_id, offset, n=3, alias=None):
 
 class TelSeq(metaclass=Simulation_Object):
     '''
-    Class that contains TelSeq relevant paramaters and methods. At construction one must pass an espresso handle becaouse the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a TelSeq. Therefore many relevant parameters are class specific, not instance specific.
+    Class that contains TelSeq relevant parameters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instance there will be only one type of a TelSeq. Therefore many relevant parameters are class specific, not instance specific.
     '''
     required_features=['MORSE',]
     numInstances = 0
@@ -148,10 +227,11 @@ class TelSeq(metaclass=Simulation_Object):
         Initialisation of a TelSeq object requires the specification of particle size, number of parts and a handle to the espresso system
         '''
         self.sys=config['espresso_handle']
-        assert config['type'] in ['parallel', 'antiparallel','hybrid'], 'type must be either parallel, antiparallel or hybrid!!!'
+        if not (config['type'] in ['parallel', 'antiparallel','hybrid']):
+            raise ValueError('type must be either parallel, antiparallel or hybrid!!!')
         self.params=config
         if self.params['associated_objects'] is None:
-            warnings.warn('no associated_objects have been passed explicity. Creating objects required to initialise object implicitly!')
+            warnings.warn('no associated_objects have been passed explicitly. Creating objects required to initialise object implicitly!')
             configuration=Quartet.config.specify(espresso_handle=self.sys,type='brokenA')
             quartets=[Quartet(config=configuration) for _ in range(3*self.params['n_parts'])]
             grouped_quartets = [quartets[i:i+3]
@@ -189,7 +269,7 @@ class TelSeq(metaclass=Simulation_Object):
 
     def set_object(self,  pos, ori):
         '''
-        Sets a n_parts sequence of particles in espresso, asserting that the dimensionality of the pos paramater passed is commesurate with n_part.Using a generator object with the particle enumeration logic, and a try catch paradigm. Particles created here are treated as real, non_magnetic, with enabled rotations. Indices of added particles stored in self.realz_indices.append attribute. Orientation of TelSeq stored in self.orientor = self.get_orientation_vec()
+        Sets a n_parts sequence of particles in espresso, asserting that the dimensionality of the pos parameter passed is commensurate with n_part.Using a generator object with the particle enumeration logic, and a try catch paradigm. Particles created here are treated as real, non_magnetic, with enabled rotations. Indices of added particles stored in self.realz_indices.append attribute. Orientation of TelSeq stored in self.orientor = self.get_orientation_vec()
 
         :param pos: np.array() | float, list of positions
         :return: None
@@ -200,9 +280,11 @@ class TelSeq(metaclass=Simulation_Object):
             pos) == self.params['n_parts'], 'there is a missmatch between the pos lenth and TelSeq n_parts'
         self.orientor = get_orientation_vec(pos)
 
-        assert self.params['n_parts'] == len(
-            self.associated_objects), " there doest seem to be enough monomers stored!!! "
-        assert all([x.simulation_type==self.associated_objects[0].simulation_type for x in self.associated_objects[1:]]), 'all objects must have the same simulation type!'
+        if not (self.params['n_parts'] == len(
+            self.associated_objects)):
+            raise ValueError(" there doesn't seem to be enough monomers stored!!! ")
+        if not (all([x.simulation_type==self.associated_objects[0].simulation_type for x in self.associated_objects[1:]])):
+            raise ValueError('all objects must have the same simulation type!')
         local_orientor = self.orientor
         if self.params['type'] == 'antiparallel':
             phi_opt = self._choose_antiparallel_phi(self.orientor)
@@ -213,7 +295,7 @@ class TelSeq(metaclass=Simulation_Object):
 
     def wrap_into_Tel(self):
         '''
-        associated_objects contains monomer objects (assume quadriplex). We add cormer particles in each quadriplex pair to a pool of candidate corners: candidate1 and candidate2. Finaly checks which corner pairs have a distance self.params['sigma']-2*fene_r0. Relies on np.isclose().
+        associated_objects contains monomer objects (assume quadriplex). We add corner particles in each quadriplex pair to a pool of candidate corners: candidate1 and candidate2. Finally checks which corner pairs have a distance self.params['sigma']-2*fene_r0. Relies on np.isclose().
         :return: None
 
         '''

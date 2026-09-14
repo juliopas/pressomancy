@@ -13,6 +13,46 @@ per-step python loop. All models share the same setup contract:
 * the driving field is ``H_ext + dip_fld``, i.e. the sum of all
   ``HomogeneousMagneticField`` constraints plus the local dipolar field.
 
+.. warning::
+    **Measured usable regime.** The models are driven by one fixed-point iterate per
+    timestep, so the moments only reach their self-consistent value if the map
+    contracts. Measured with ``tools/magnetization_regime_sweep.py`` at a probe field
+    of H=0.01, prefactor 1, contact spacing, ``dipm_sat=1``:
+
+    =========================  ==================  ==================================
+    :math:`\\chi_0`             touching chain      elastomer + embedded dipoles
+    =========================  ==================  ==================================
+    0.05 - 0.2                 usable              usable (amplification 1.0)
+    0.3                        usable (amp 6.4)    usable (ratio 0.50-0.70)
+    0.35 - 0.4                 marginal, amp 31-99 --
+    >= 0.5                     saturates           **diverges**, ratio 1.05-1.16 (5/5)
+    1.0                        saturates, amp 84   **diverges**, ratio 1.003
+    =========================  ==================  ==================================
+
+    So **keep** :math:`\\chi_0 \\lesssim 0.3` for these geometries. The chain is the
+    conservative bound (dipolar fields reinforce head-to-tail); a disordered 3D
+    packing partially cancels and tolerates more. The contraction ratio scales
+    linearly with :math:`\\chi_0` and with the dipolar prefactor, so halving one
+    buys the same margin as halving the other.
+
+    This window is **empirical and specific to those geometries** -- it is not a
+    general law, and it was measured because no quantitative criterion exists in this
+    codebase. The elastomer measurement varies between random realizations (ratio
+    scatter of roughly +/-0.1), so treat a point near the boundary as undecided
+    rather than passing.
+
+    Two traps this encodes, both of which produce confident-looking wrong answers:
+
+    * **A small contraction ratio is not on its own a pass.** Saturation damps the
+      differential susceptibility, so the map also contracts around a spuriously
+      saturated fixed point -- at :math:`\\chi_0` = 1 the chain reports a healthy
+      ratio of 0.17 while sitting at 0.84 of saturation. Always check the moment too.
+    * **You cannot seed an initial magnetization.** ``dip`` is overwritten from
+      ``H_tot`` before ``dip_fld`` is computed from it, so a seeded value never
+      generates a field. Any initial-condition or branch-uniqueness study done that
+      way silently measures nothing; reaching a magnetized state requires an external
+      field.
+
 Two models are currently exposed, both parameterised by the saturation moment
 ``dipm_sat`` (:math:`m_{sat}`, must be > 0) and the initial susceptibility
 ``mag_susc_0`` (:math:`\\chi_0`, must be >= 0):
@@ -243,7 +283,7 @@ def configure_magnetization(part_hndl, model, dipm_sat, mag_susc_0, anchor=None)
     if anchor is not None:
         part_hndl.vs_auto_relate_to(anchor)
     else:
-        _assert_bound_virtual_site(part_hndl, anchor)
+        _assert_bound_virtual_site(part_hndl)
     if espressomd.version.major() == 5:
         _set_moment_carrier_propagation(part_hndl)
 

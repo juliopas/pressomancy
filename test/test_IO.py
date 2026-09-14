@@ -7,11 +7,11 @@ from pressomancy.analysis import H5DataSelector, H5ObservableSelector
 import h5py
 import tempfile
 import os
-from pressomancy.helper_functions import MissingFeature
 import logging
 import shutil
 from unittest.mock import patch
 import pressomancy.simulation as simulation_module
+import pressomancy.io.h5_writer as h5_writer_module
 import warnings
 
 class cestica():
@@ -82,7 +82,7 @@ class CommonH5DataSelectorTests:
         if hasattr(cls, "observable_name"):
             cls.observable_value = np.zeros(3, dtype=np.float64)
             cls.observable_values = []
-        with patch.object(simulation_module, "get_submission_creator_info", return_value=(cls.runner_script, cls.runner_script_repo)), patch.object(simulation_module, "get_repo_context", return_value=(cls.lib_path, cls.library_vers)):
+        with patch.object(h5_writer_module, "get_submission_creator_info", return_value=(cls.runner_script, cls.runner_script_repo)), patch.object(h5_writer_module, "get_repo_context", return_value=(cls.lib_path, cls.library_vers)):
             sim_inst.inscribe_part_group_to_h5(group_type=cls.group_types, h5_data_path=cls.h5_filename)
             if hasattr(cls, "observable_name"):
                 sim_inst.inscribe_observable_group_to_h5(
@@ -130,6 +130,8 @@ class CommonH5DataSelectorTests:
         sim_inst.io_dict["flat_part_view"].clear()
         sim_inst.io_dict["registered_observables"] = {}
         sim_inst.io_dict["registered_group_type"] = None
+        sim_inst.io_dict["bonds"] = False
+        sim_inst.io_dict["bond_links"] = {}
 
     @staticmethod
     def check_box_data(dataview, expected_edges, expected_boundary=("periodic", "periodic", "periodic")):
@@ -458,25 +460,6 @@ class CommonH5DataSelectorTests:
                             err_msg=f"{parent_key}_to_{child_key} parent IDs do not match for child {child.who_am_i}!",
                         )
 
-    def test_obsolete_IO(self):
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            target = os.path.join(tmpdirname, "testfile.p.gz")
-
-            path_to_dump, counter = sim_inst.init_pickle_dump(path_to_dump=target)
-            self.assertEqual(path_to_dump, target)
-            self.assertEqual(counter, 0)
-            self.assertTrue(os.path.exists(target))
-            self.assertGreater(os.path.getsize(target), 0)
-
-            dungeon_witch_list = list(sim_inst.sys.part.all())
-            try:
-                sim_inst.dump_to_init(path_to_dump, dungeon_witch_list, counter)
-            except MissingFeature as excp:
-                self.skipTest(f"Skipping depreciated IO pipeline tests because it requires a feature that is not available.  Caught exception {excp}")
-
-            _, next_counter = sim_inst.load_pickle_dump(target)
-            self.assertEqual(next_counter, counter + 1)
-
 class ElastomerFixture(CommonH5DataSelectorTests, BaseTestCase):
     box_dim = [5,5,20]
     layer_height = 4
@@ -562,3 +545,528 @@ class FilamentFixture(CommonH5DataSelectorTests, BaseTestCase):
                 )
             self.assertIsNone(missing_children)
             self.assertGreaterEqual(len(caught), 1)
+
+
+class BondTopologyIOTest(BaseTestCase):
+
+    n_parts = 5
+    n_filaments = 3
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.tmpdir = tempfile.TemporaryDirectory()
+        cls.h5_filename = os.path.join(cls.tmpdir.name, "bond_topology.h5")
+
+        bond = BondWrapper(espressomd.interactions.FeneBond(k=10., r_0=2., d_r_max=3.))
+        configs = [Filament.config.specify(sigma=2., size=2. * cls.n_parts,
+                                           n_parts=cls.n_parts,
+                                           espresso_handle=sim_inst.sys,
+                                           bond_handle=bond)
+                   for _ in range(cls.n_filaments)]
+        cls.filaments = [Filament(config=cfg) for cfg in configs]
+        sim_inst.store_objects(cls.filaments)
+        sim_inst.set_objects(cls.filaments)
+        for filament in cls.filaments:
+            filament.bond_center_to_center(type_name='real')
+        cls.live_links = sum(len(part.bonds) for part in sim_inst.sys.part.all())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.close_h5()
+        if getattr(cls, "tmpdir", None) is not None:
+            cls.tmpdir.cleanup()
+            cls.tmpdir = None
+        sim_inst.io_dict["bonds"] = False
+        sim_inst.io_dict["bond_links"] = {}
+        sim_inst.io_dict["flat_part_view"].clear()
+        sim_inst.io_dict["registered_group_type"] = None
+        BaseTestCase.cleanup()
+        super().tearDownClass()
+
+    @staticmethod
+    def close_h5():
+        handle = sim_inst.io_dict.get("h5_file")
+        if handle is not None:
+            handle.flush()
+            handle.close()
+        sim_inst.io_dict["h5_file"] = None
+
+    @staticmethod
+    def reopen(mode):
+        """Drop the in-memory view the way a fresh process would, then inscribe."""
+        sim_inst.io_dict["flat_part_view"].clear()
+        sim_inst.io_dict["bond_links"] = {}
+        return sim_inst.inscribe_part_group_to_h5(
+            group_type=[Filament], h5_data_path=BondTopologyIOTest.h5_filename, mode=mode)
+
+    def test_bond_topology_round_trip(self):
+        self.assertGreater(self.live_links, 0, msg="fixture built no bonds to write")
+        sim_inst.io_dict["bonds"] = True
+
+        # --- NEW -----------------------------------------------------------
+        counter = self.reopen('NEW')
+        self.assertEqual(counter, 0)
+        self.assertEqual(sim_inst.io_dict["bond_links"]["Filament"], self.live_links)
+        for step in range(3):
+            sim_inst.write_part_group_to_h5(step=step)
+        self.close_h5()
+
+        with h5py.File(self.h5_filename, "r") as h5_file:
+            bonds_grp = h5_file["connectivity/Filament/bonds"]
+            self.assertIn("links", bonds_grp)
+            self.assertIn("offsets", bonds_grp)
+            self.assertIn("particle_ids", bonds_grp)
+            self.assertEqual(int(bonds_grp.attrs["n_links"]), self.live_links)
+            self.assertTrue(bool(bonds_grp.attrs["static_topology"]))
+            self.assertEqual(h5_file["particles/Filament/pos/value"].shape[0], 3)
+
+        # --- LOAD ----------------------------------------------------------
+        self.assertEqual(self.reopen('LOAD'), 3)
+        self.assertEqual(sim_inst.io_dict["bond_links"]["Filament"], self.live_links)
+        sim_inst.write_part_group_to_h5(step=3)
+        self.close_h5()
+
+        # --- LOAD_NEW ------------------------------------------------------
+        self.assertEqual(self.reopen('LOAD_NEW'), 4)
+        self.assertEqual(sim_inst.io_dict["bond_links"]["Filament"], self.live_links)
+        self.close_h5()
+
+    def test_topology_change_after_inscription_is_caught(self):
+        """The guard only works because bond_links is populated at inscription."""
+        sim_inst.io_dict["bonds"] = True
+        self.reopen('NEW')
+        sim_inst.write_part_group_to_h5(step=0)
+
+        # Add a bond the file knows nothing about; topology has no time axis.
+        handles = self.filaments[0].type_part_dict['real']
+        handles[0].add_bond((self.filaments[0].params['bond_handle'].get_raw_handle(),
+                             handles[-1].id))
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                sim_inst.write_part_group_to_h5(step=1)
+            self.assertIn("changed after inscription", str(ctx.exception))
+        finally:
+            handles[0].delete_bond((self.filaments[0].params['bond_handle'].get_raw_handle(),
+                                    handles[-1].id))
+            self.close_h5()
+
+
+class BulkFrameReadTest(BaseTestCase):
+    """A ParticleSlice built from a non-monotonic id list is not self-consistent
+    about row order -- espresso routes `type`/`q`/`pos`/`pos_folded` through an
+    optimised path and everything else through a per-id loop, and those two
+    disagreed before espresso commit 45376706e. H5Writer sidesteps it by always
+    slicing on sorted ids and inverting the permutation. This pins that.
+    """
+
+    @classmethod
+    def tearDownClass(cls):
+        BaseTestCase.cleanup()
+        super().tearDownClass()
+
+    def test_bulk_read_matches_per_particle_loop_for_shuffled_ids(self):
+        rng = np.random.default_rng(4242)
+        for _ in range(120):
+            part = sim_inst.sys.part.add(pos=rng.random(3) * 20.0, type=int(rng.integers(0, 4)))
+            part.dip = rng.random(3) + 0.5
+        sim_inst.sys.integrator.run(5)
+
+        ids = [int(x) for x in rng.permutation([p.id for p in sim_inst.sys.part.all()])]
+        handles = [sim_inst.sys.part.by_id(i) for i in ids]
+        group = "ShuffledProbe"
+        sim_inst.io_dict['flat_part_view'][group] = handles
+        try:
+            writer = sim_inst._h5_writer
+            for prop, dim, dtype in sim_inst.io_dict['properties']:
+                expected = np.array(
+                    [np.atleast_1d(getattr(h, prop)) for h in handles], dtype=dtype)
+                got = writer._read_frame(group, prop, dim, dtype)
+                with self.subTest(prop=prop):
+                    self.assertEqual(got.shape, expected.shape)
+                    np.testing.assert_array_equal(got, expected)
+        finally:
+            sim_inst.io_dict['flat_part_view'].pop(group, None)
+            sim_inst._h5_writer._slice_cache.pop(group, None)
+
+    def test_duplicate_ids_are_rejected(self):
+        """The espresso-side reorder is keyed on id, so duplicates must not pass."""
+        part = sim_inst.sys.part.add(pos=[1.0, 1.0, 1.0], type=0)
+        group = "DupProbe"
+        sim_inst.io_dict['flat_part_view'][group] = [part, part]
+        try:
+            with self.assertRaises(ValueError) as ctx:
+                sim_inst._h5_writer._read_frame(group, 'pos', 3, np.float64)
+            self.assertIn("duplicate particle ids", str(ctx.exception))
+        finally:
+            sim_inst.io_dict['flat_part_view'].pop(group, None)
+            sim_inst._h5_writer._slice_cache.pop(group, None)
+
+
+class SourceSeedingTest(BaseTestCase):
+    """Only `set_prop_from_src` with an identity type map and pos->pos was covered
+    before, by a bare assert inside samples/poly_BRACO.py. `get_pos_ori_from_src`
+    (the `set_objects(mode='INIT_SRC')` path) had no exercise at all.
+
+    Note these tests read back onto the *same* objects that wrote the file.
+    Selection is keyed on `who_am_i`, which the metaclass allocates monotonically
+    and never resets, so a freshly constructed object can never carry a source
+    id within one process -- INIT_SRC across a real restart works because
+    numInstances starts from zero in a new interpreter.
+    """
+
+    n_parts = 4
+    n_filaments = 2
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.tmpdir = tempfile.TemporaryDirectory()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.close_open_file()
+        if getattr(cls, "tmpdir", None) is not None:
+            cls.tmpdir.cleanup()
+            cls.tmpdir = None
+        BaseTestCase.cleanup()
+        super().tearDownClass()
+
+    @staticmethod
+    def close_open_file():
+        handle = sim_inst.io_dict.get("h5_file")
+        if handle is not None:
+            handle.flush()
+            handle.close()
+        sim_inst.io_dict["h5_file"] = None
+        sim_inst.io_dict["flat_part_view"].clear()
+        sim_inst.io_dict["registered_group_type"] = None
+
+    def tearDown(self):
+        self.close_open_file()
+        BaseTestCase.cleanup()
+        super().tearDown()
+
+    def build_filaments(self, with_dipoles=False, with_anchors=False):
+        bond = BondWrapper(espressomd.interactions.FeneBond(k=10., r_0=2., d_r_max=3.))
+        configs = [Filament.config.specify(
+            sigma=2., size=2. * self.n_parts, n_parts=self.n_parts,
+            espresso_handle=sim_inst.sys, bond_handle=bond)
+            for _ in range(self.n_filaments)]
+        filaments = [Filament(config=cfg) for cfg in configs]
+        sim_inst.store_objects(filaments)
+        sim_inst.set_objects(filaments)
+        if with_anchors:
+            for filament in filaments:
+                filament.add_anchors(type_name='real')
+        if with_dipoles:
+            for index, part in enumerate(sim_inst.sys.part.all()):
+                part.dip = np.array([1.0, 0.5, 0.25]) * (index + 1)
+        return filaments
+
+    def write_source(self, filaments, name, properties=None):
+        """Write one frame and return its path, optionally with a custom schema."""
+        path = os.path.join(self.tmpdir.name, name)
+        original = sim_inst.io_dict["properties"]
+        if properties is not None:
+            sim_inst.io_dict["properties"] = properties
+        try:
+            sim_inst.inscribe_part_group_to_h5(
+                group_type=[Filament], h5_data_path=path, mode="NEW")
+            sim_inst.write_part_group_to_h5(step=0)
+            sim_inst.io_dict["h5_file"].flush()
+        finally:
+            if properties is not None:
+                sim_inst.io_dict["properties"] = original
+        return path
+
+    # -- get_pos_ori_from_src ---------------------------------------------
+    def test_get_pos_ori_returns_source_positions_and_directors(self):
+        filaments = self.build_filaments()
+        path = self.write_source(filaments, "geometry.h5")
+        expected = {f.who_am_i: ([p.pos.copy() for p in f.type_part_dict['real']],
+                                 [p.director.copy() for p in f.type_part_dict['real']])
+                    for f in filaments}
+        self.close_open_file()
+
+        sim_inst.set_init_src(path=path, pos_ori_src_type=['real'])
+        positions, orientations = sim_inst._get_pos_ori_from_src(filaments)
+
+        self.assertEqual(len(positions), len(filaments))
+        for filament, pos, ori in zip(filaments, positions, orientations):
+            want_pos, want_ori = expected[filament.who_am_i]
+            np.testing.assert_allclose(pos, np.array(want_pos), rtol=0, atol=1e-12)
+            np.testing.assert_allclose(ori, np.array(want_ori), rtol=0, atol=1e-12)
+
+    def test_set_objects_init_src_uses_the_source_reader(self):
+        filaments = self.build_filaments()
+        path = self.write_source(filaments, "routing.h5")
+        self.close_open_file()
+        sim_inst.set_init_src(path=path, pos_ori_src_type=['real'])
+
+        with patch.object(sim_inst._h5_init, "get_pos_ori_from_src",
+                          wraps=sim_inst._h5_init.get_pos_ori_from_src) as reader:
+            with patch.object(type(sim_inst.instance), "place_objects") as place:
+                sim_inst.set_objects(filaments, mode='INIT_SRC')
+            reader.assert_called_once()
+            place.assert_called_once()
+
+    def test_orientation_falls_back_to_normalised_dip(self):
+        """With no `director` column stored, orientation comes from `dip`."""
+        filaments = self.build_filaments(with_dipoles=True)
+        no_director = [entry for entry in sim_inst.io_dict["properties"]
+                       if entry[0] != "director"]
+        path = self.write_source(filaments, "dip_only.h5", properties=no_director)
+        expected = {f.who_am_i: [p.dip.copy() for p in f.type_part_dict['real']]
+                    for f in filaments}
+        self.close_open_file()
+
+        sim_inst.set_init_src(path=path, pos_ori_src_type=['real'])
+        _, orientations = sim_inst._get_pos_ori_from_src(filaments)
+        for filament, ori in zip(filaments, orientations):
+            dips = np.array(expected[filament.who_am_i])
+            want = dips / np.linalg.norm(dips, axis=1, keepdims=True)
+            np.testing.assert_allclose(ori, want, rtol=0, atol=1e-12)
+            np.testing.assert_allclose(np.linalg.norm(ori, axis=1), 1.0, atol=1e-12)
+
+    def test_zero_dip_raises_rather_than_producing_nan(self):
+        filaments = self.build_filaments()          # dip left at zero
+        no_director = [entry for entry in sim_inst.io_dict["properties"]
+                       if entry[0] != "director"]
+        path = self.write_source(filaments, "zero_dip.h5", properties=no_director)
+        self.close_open_file()
+
+        sim_inst.set_init_src(path=path, pos_ori_src_type=['real'])
+        with self.assertRaises(ValueError) as ctx:
+            sim_inst._get_pos_ori_from_src(filaments)
+        self.assertIn("dip moment magnitude is 0", str(ctx.exception))
+
+    # -- set_prop_from_src -------------------------------------------------
+    def test_set_prop_from_src_restores_positions(self):
+        filaments = self.build_filaments()
+        path = self.write_source(filaments, "props.h5")
+        written = sim_inst.sys.part.all().pos.copy()
+        self.close_open_file()
+
+        # Move everything, then put it back from the file.
+        for part in sim_inst.sys.part.all():
+            part.pos = part.pos + np.array([3.0, -2.0, 1.5])
+        self.assertFalse(np.allclose(sim_inst.sys.part.all().pos, written))
+
+        sim_inst.set_init_src(path=path,
+                              type_to_type_map=[('real', 'real')],
+                              prop_to_prop_map=[('pos', 'pos')])
+        sim_inst.set_prop_from_src(filaments)
+        np.testing.assert_allclose(sim_inst.sys.part.all().pos, written,
+                                   rtol=1e-10, atol=1e-10)
+
+    def test_non_identity_type_map_touches_only_the_target_type(self):
+        """poly_BRACO only ever maps a type onto itself, so this path was untested."""
+        filaments = self.build_filaments(with_anchors=True)
+        path = self.write_source(filaments, "remap.h5")
+        source_real = {f.who_am_i: [p.pos.copy() for p in f.type_part_dict['real']]
+                       for f in filaments}
+        self.close_open_file()
+
+        virt_before = {p.id: p.pos.copy()
+                       for f in filaments for p in f.type_part_dict['virt']}
+        # Copy the *real* particles' stored positions onto the *virt* particles.
+        sim_inst.set_init_src(path=path,
+                              type_to_type_map=[('real', 'virt')],
+                              prop_to_prop_map=[('pos', 'pos')])
+        sim_inst.set_prop_from_src(filaments)
+
+        for filament in filaments:
+            want = source_real[filament.who_am_i]
+            got = [p.pos for p in filament.type_part_dict['virt'][:len(want)]]
+            np.testing.assert_allclose(np.array(got), np.array(want),
+                                       rtol=1e-10, atol=1e-10)
+        moved = sum(1 for f in filaments for p in f.type_part_dict['virt']
+                    if not np.allclose(p.pos, virt_before[p.id]))
+        self.assertGreater(moved, 0, msg="the remap did not touch the target type")
+
+    # -- guards ------------------------------------------------------------
+    def test_mismatched_map_lengths_raise(self):
+        filaments = self.build_filaments()
+        path = self.write_source(filaments, "mismatch.h5")
+        self.close_open_file()
+        sim_inst.set_init_src(path=path,
+                              type_to_type_map=[('real', 'real'), ('real', 'real')],
+                              prop_to_prop_map=[('pos', 'pos')])
+        # ValueError, not AssertionError: the length guard is caller-facing, and a
+        # typed exception distinguishes it from the source-type validation that runs
+        # first and also used to raise AssertionError here.
+        with self.assertRaises(ValueError) as ctx:
+            sim_inst.set_prop_from_src(filaments)
+        self.assertIn("same length", str(ctx.exception))
+
+    def test_reading_before_declaring_a_source_raises(self):
+        filaments = self.build_filaments()
+        self.assertFalse(sim_inst.src_params_set)
+        # RuntimeError: using the reader before declaring a source is a state error.
+        with self.assertRaises(RuntimeError):
+            sim_inst.set_prop_from_src(filaments)
+        with self.assertRaises(RuntimeError):
+            sim_inst._get_pos_ori_from_src(filaments)
+
+
+class BondSerializationTest(BaseTestCase):
+    """Everything here was previously reached only through H5Writer, so the CSR
+    construction and the derived parameter schema were only ever exercised on
+    one shape of input: two-body FeneBonds, every partner inside the group.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.tmpdir = tempfile.TemporaryDirectory()
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "tmpdir", None) is not None:
+            cls.tmpdir.cleanup()
+            cls.tmpdir = None
+        BaseTestCase.cleanup()
+        super().tearDownClass()
+
+    def tearDown(self):
+        BaseTestCase.cleanup()
+        super().tearDown()
+
+    @staticmethod
+    def add_particles(n):
+        return [sim_inst.sys.part.add(pos=[1.0 + i, 1.0, 1.0], type=0) for i in range(n)]
+
+    # -- CSR construction --------------------------------------------------
+    def test_csr_invariants_for_two_body_bonds(self):
+        from pressomancy.io.bonds import collect_bond_links
+        parts = self.add_particles(4)
+        fene = espressomd.interactions.FeneBond(k=10., r_0=1., d_r_max=2.)
+        sim_inst.sys.bonded_inter.add(fene)
+        for a, b in zip(parts, parts[1:]):
+            a.add_bond((fene, b.id))
+
+        particle_ids, offsets, links, max_partners = collect_bond_links(parts)
+
+        np.testing.assert_array_equal(particle_ids, [p.id for p in parts])
+        self.assertEqual(len(offsets), len(parts) + 1)
+        self.assertEqual(offsets[0], 0)
+        self.assertTrue(np.all(np.diff(offsets) >= 0), msg="offsets must be monotonic")
+        self.assertEqual(int(offsets[-1]), links.shape[0])
+        self.assertEqual(int(offsets[-1]), 3)
+        self.assertEqual(max_partners, 1)
+        self.assertEqual(links.shape[1], 2 + max_partners)
+        # Every row: (bond_id, n_partners, partner...)
+        for row in links:
+            self.assertEqual(int(row[1]), 1)
+            self.assertIn(int(row[2]), [p.id for p in parts])
+
+    def test_multi_partner_bond_is_laid_out_and_padded(self):
+        """Angle bonds carry two partners; the fixtures elsewhere never do."""
+        from pressomancy.io.bonds import collect_bond_links
+        parts = self.add_particles(3)
+        angle = espressomd.interactions.AngleHarmonic(bend=1.0, phi0=np.pi)
+        sim_inst.sys.bonded_inter.add(angle)
+        parts[1].add_bond((angle, parts[0].id, parts[2].id))
+
+        _, offsets, links, max_partners = collect_bond_links(parts)
+        self.assertEqual(max_partners, 2)
+        self.assertEqual(links.shape[1], 4)
+        self.assertEqual(int(offsets[-1]), 1)
+        row = links[0]
+        self.assertEqual(int(row[1]), 2)
+        self.assertEqual({int(row[2]), int(row[3])}, {parts[0].id, parts[2].id})
+
+    def test_padding_uses_minus_one_when_partner_counts_differ(self):
+        from pressomancy.io.bonds import collect_bond_links
+        parts = self.add_particles(3)
+        fene = espressomd.interactions.FeneBond(k=10., r_0=1., d_r_max=2.)
+        angle = espressomd.interactions.AngleHarmonic(bend=1.0, phi0=np.pi)
+        sim_inst.sys.bonded_inter.add(fene)
+        sim_inst.sys.bonded_inter.add(angle)
+        parts[0].add_bond((fene, parts[1].id))
+        parts[1].add_bond((angle, parts[0].id, parts[2].id))
+
+        _, _, links, max_partners = collect_bond_links(parts)
+        self.assertEqual(max_partners, 2)
+        one_partner = [row for row in links if int(row[1]) == 1]
+        self.assertEqual(len(one_partner), 1)
+        # The unused partner slot is padded, not left as a stale id.
+        self.assertEqual(int(one_partner[0][3]), -1)
+
+    def test_partner_outside_the_group_is_kept_as_a_raw_id(self):
+        """The docstring promises a dangling partner stays visible."""
+        from pressomancy.io.bonds import collect_bond_links
+        inside = self.add_particles(2)
+        outside = sim_inst.sys.part.add(pos=[9.0, 9.0, 9.0], type=1)
+        fene = espressomd.interactions.FeneBond(k=10., r_0=1., d_r_max=2.)
+        sim_inst.sys.bonded_inter.add(fene)
+        inside[0].add_bond((fene, outside.id))
+
+        _, _, links, _ = collect_bond_links(inside)
+        self.assertEqual(links.shape[0], 1)
+        self.assertEqual(int(links[0][2]), outside.id)
+        self.assertNotIn(outside.id, [p.id for p in inside])
+
+    # -- parameter schema round trip ---------------------------------------
+    def test_bond_params_round_trip(self):
+        from pressomancy.io.bonds import (h5_dtype_for, write_bond_params,
+                                          read_bond_params, _bond_id_of)
+        fene = espressomd.interactions.FeneBond(k=11.5, r_0=1.25, d_r_max=2.5)
+        harmonic = espressomd.interactions.HarmonicBond(k=3.75, r_0=0.5)
+        sim_inst.sys.bonded_inter.add(fene)
+        sim_inst.sys.bonded_inter.add(harmonic)
+
+        dtype = h5_dtype_for(fene)
+        self.assertIn("bond_id", dtype.names)
+        for name in ("k", "r_0", "d_r_max"):
+            self.assertIn(name, dtype.names)
+
+        path = os.path.join(self.tmpdir.name, "params.h5")
+        with h5py.File(path, "w") as handle:
+            write_bond_params(handle.require_group("bonds"), sim_inst.sys)
+        with h5py.File(path, "r") as handle:
+            table = read_bond_params(handle["bonds"])
+
+        for original in (fene, harmonic):
+            cls, kw = table[_bond_id_of(original)]
+            self.assertIs(cls, type(original))
+            live = original.get_params()
+            for name, value in kw.items():
+                self.assertAlmostEqual(float(value), float(live[name]), places=5,
+                                       msg=f"{type(original).__name__}.{name}")
+            rebuilt = cls(**kw)
+            self.assertIsInstance(rebuilt, type(original))
+
+    # -- read_bonds --------------------------------------------------------
+    def test_read_bonds_recovers_topology(self):
+        from pressomancy.io.bonds import write_bonds, read_bonds, _bond_id_of
+        parts = self.add_particles(3)
+        fene = espressomd.interactions.FeneBond(k=10., r_0=1., d_r_max=2.)
+        angle = espressomd.interactions.AngleHarmonic(bend=1.0, phi0=np.pi)
+        sim_inst.sys.bonded_inter.add(fene)
+        sim_inst.sys.bonded_inter.add(angle)
+        parts[0].add_bond((fene, parts[1].id))
+        parts[1].add_bond((angle, parts[0].id, parts[2].id))
+
+        path = os.path.join(self.tmpdir.name, "topology.h5")
+        with h5py.File(path, "w") as handle:
+            n_links = write_bonds(handle.require_group("connectivity"),
+                                  particles=parts, sys=sim_inst.sys, step=0)
+        self.assertEqual(n_links, 2)
+
+        with h5py.File(path, "r") as handle:
+            recovered = list(read_bonds(handle["connectivity/bonds"]))
+            live = list(read_bonds(handle["connectivity/bonds"], instantiate=True))
+
+        self.assertEqual(len(recovered), 2)
+        by_particle = {pid: (tuple(partners), bond) for pid, partners, bond in recovered}
+        self.assertEqual(by_particle[parts[0].id][0], (parts[1].id,))
+        self.assertEqual(by_particle[parts[0].id][1], _bond_id_of(fene))
+        self.assertEqual(set(by_particle[parts[1].id][0]), {parts[0].id, parts[2].id})
+        self.assertEqual(by_particle[parts[1].id][1], _bond_id_of(angle))
+
+        # instantiate=True must hand back live espresso objects, not ids.
+        kinds = {type(bond) for _, _, bond in live}
+        self.assertEqual(kinds, {espressomd.interactions.FeneBond,
+                                 espressomd.interactions.AngleHarmonic})

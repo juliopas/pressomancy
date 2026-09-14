@@ -1,3 +1,18 @@
+'''
+Grab-bag of core infrastructure shared across pressomancy.
+
+Covers the ``ManagedSimulation`` singleton decorator; the
+``MissingFeature``/``SimulationExistsException`` exceptions; guarded
+container types (``SinglePairDict``, ``PartDictSafe``); ``RoutineWithArgs``;
+geometry/lattice generation (``fcc_lattice``, ``partition_cuboid_volume``,
+``partition_cubic_volume_oriented_rectangles``); a from-scratch cell-list
+neighbor search (``get_neighbours``, ``get_neighbours_cross_lattice``); vector
+math (``align_vectors``, ``get_perpendicular``, ``normalize_vectors``,
+``min_img_dist``); box-wall helpers (``add_box_constraints_func``/
+``remove_box_constraints_func``); ``api_agnostic_feature_check`` for
+ESPResSo v4/v5-agnostic feature detection; ``BondWrapper``; and git
+provenance helpers (``get_repo_context``, ``get_submission_creator_info``).
+'''
 import numpy as np
 from itertools import product
 from collections import defaultdict
@@ -12,6 +27,17 @@ import subprocess
 from pathlib import Path
 
 from numpy.typing import ArrayLike
+
+#: Soft cap on the transient candidate buffers inside the cell-list neighbour
+#: search, in bytes.
+#: 8 MiB, tuned against dense elastomers where the previous unbounded buffers
+#: exhausted memory. Raising it trades memory for fewer chunk iterations;
+#: results are unaffected either way.
+DEFAULT_MAX_CANDIDATE_BYTES = 8 << 20
+
+#: How many times partition_cuboid_volume redraws a volume's contents before
+#: giving up on placing it without overlapping its neighbours.
+MAX_PLACEMENT_ATTEMPTS = 1000
 
 class MissingFeature(Exception):
     pass
@@ -104,6 +130,9 @@ class ManagedSimulation:
             # Instantiate the decorated class and set its system attribute
             self.instance = self.aClass(*args, **kwargs)
             self.instance.sys = self._espressomd_system
+            # Back-reference so Simulation.rebind_sys can keep the cached handle
+            # here in step after a checkpoint load.
+            self.instance._manager = self
             self.init_args = args
             self.init_kwargs = kwargs
         else:
@@ -134,6 +163,9 @@ class ManagedSimulation:
             self.instance.partitioned = None
             self.instance = self.aClass(*self.init_args, **self.init_kwargs)
             self.instance.sys = self._espressomd_system
+            # Back-reference so Simulation.rebind_sys can keep the cached handle
+            # here in step after a checkpoint load.
+            self.instance._manager = self
             self.instance.sys.part.clear()
             self.instance.sys.non_bonded_inter.reset()
             self.instance.sys.bonded_inter.clear()
@@ -326,7 +358,7 @@ class SinglePairDict(dict):
         """
         raise TypeError("SinglePairDict does not support item deletion.")
 
-    # Gaurd against dict funtions that could set/remove entries
+    # Guard against dict functions that could set/remove entries
     def update(self, *args, **kwargs):
         raise TypeError("SinglePairDict does not support update after initialization.")
 
@@ -441,9 +473,13 @@ class PartDictSafe(dict):
         Retrieves the value for a key, initializing it with the default value if the key does not exist.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, default_factory=list, **kwargs):
         """
         Initializes the dictionary with optional initial data and a default factory.
+
+        `default_factory=None` makes the mapping strict: a missing key raises
+        `KeyError` rather than being auto-created. Use it for value types where
+        the factory's output is not a meaningful value, such as integer type ids.
 
         Parameters
         ----------
@@ -461,7 +497,7 @@ class PartDictSafe(dict):
             raise TypeError(
                 f"PartDictSafe expected at most 1 positional argument, got {len(args)}"
             )
-        self.default_factory = list
+        self.default_factory = default_factory
         super().__init__()
         self.update(*args, **kwargs)
 
@@ -481,7 +517,7 @@ class PartDictSafe(dict):
         RuntimeError
             If the key already exists with a different value or the value is already associated with another key.
         """
-        if value == self.default_factory():
+        if self.default_factory is not None and value == self.default_factory():
             return
         current_value = self.get(key)
         if current_value == value:
@@ -549,6 +585,17 @@ class PartDictSafe(dict):
         """
         Retrieves the value for a key, initializing it with the default value if the key does not exist.
 
+        A missing key is auto-created only when a `default_factory` is set, which
+        is the case for the list-valued `type_part_dict` bookkeeping: asking an
+        object for a particle type it did not build returns an empty list, and
+        iterating over it is a harmless no-op.
+
+        With `default_factory=None` -- used for `Simulation.part_types`, whose
+        values are integer espresso type ids -- a missing key raises `KeyError`
+        instead. An empty list is not a meaningful type id, and silently
+        inserting one turns a mistyped type name into a corrupt entry that later
+        reaches espresso as `non_bonded_inter[[], []]`.
+
         Parameters
         ----------
         key : object
@@ -557,13 +604,23 @@ class PartDictSafe(dict):
         Returns
         -------
         object
-            The value associated with the key or the default value if the key does not exist.
+            The value associated with the key, or the default value if the key
+            does not exist and a default factory is set.
+
+        Raises
+        ------
+        KeyError
+            If the key is absent and no default factory is set.
         """
         if key not in self:
+            if self.default_factory is None:
+                raise KeyError(
+                    f"'{key}' is not a known entry. Known entries: {sorted(self.keys())}."
+                )
             self[key] = self.default_factory()
         return super().__getitem__(key)
 
-    # guard against dict funcitons that could set/remove entries
+    # guard against dict functions that could set/remove entries
     def setdefault(self, key, default=None):
         """
         Insert `key` with `default` if absent, validating like `__setitem__`.
@@ -636,6 +693,15 @@ class RoutineWithArgs:
             The function to encapsulate. If not provided, `generic_routine_per_volume` is used.
         num_monomers : int, optional
             The number of monomers or items to process. Defaults to 1.
+            partition_cuboid_volume only runs the routine when this exceeds 1; otherwise
+            it just places one point at each volume centre.
+        monomer_size : float, optional
+            Diameter of a single monomer, used by partition_cuboid_volume as the minimum
+            allowed separation when rejecting overlapping placements. Defaults to 1.0.
+        spacing : float, optional
+            Fixed centre-to-centre distance between consecutive monomers, passed through to
+            the routine. If None, the routine spreads the monomers across the volume radius
+            instead. Defaults to None.
         """
         if func is None:
             self.func = self.generic_routine_per_volume
@@ -691,18 +757,28 @@ def load_coord_file(file_path):
     return coordinates
 
 def fold_coords(points, box_dim):
+    """
+    Wraps points back into the primary periodic box.
+
+    :param points: array_like | coordinates, shape (..., ndim)
+    :param box_dim: array_like or float | box lengths, shape (ndim,) or scalar
+    :return: np.ndarray | points folded into [0, box_dim) along each axis
+    """
     box_dim = _as_box(box_dim)
     return np.mod(points, box_dim)
 
-def min_img_dist(s, t, box_dim):
+def min_img_dist(source, target, box_dim):
     """
-    Compute minimum image distance between s and t under periodic boundary conditions.
+    Compute the minimum image displacement from source to target under periodic boundary conditions.
+
+    Despite the name this returns *vectors*, not scalars: target - source reduced to the nearest
+    periodic image. Take np.linalg.norm(..., axis=-1) for the distance.
 
     Parameters
     ----------
-    s : iterable of float, shape (..., ndim) or float
+    source : iterable of float, shape (..., ndim) or float
         Source points.
-    t : iterable of float, shape (..., ndim) or float
+    target : iterable of float, shape (..., ndim) or float
         Target points.
     box_dim : interable of float, shape (ndim,) or float
         e.g. Cuboid box dimensions [Lx, Ly, Lz].
@@ -713,23 +789,48 @@ def min_img_dist(s, t, box_dim):
         Minimum image displacement vectors.
     """
     box_dim = np.asarray(box_dim)
-    s = np.asarray(s); t = np.asarray(t)
+    source = np.asarray(source); target = np.asarray(target)
     # Ensure consistent dimensions
-    if box_dim.ndim > 0 and (s.shape[-1] != t.shape[-1] or s.shape[-1] != box_dim.shape[-1]):
-        raise ValueError("Last dimension of s, t, and box_dim must match")
-    distance = t - s
+    if box_dim.ndim > 0 and (source.shape[-1] != target.shape[-1] or source.shape[-1] != box_dim.shape[-1]):
+        raise ValueError("Last dimension of source, target, and box_dim must match")
+    distance = target - source
     box_half = box_dim*0.5
     return np.remainder(distance + box_half, box_dim) - box_half
 
-def generate_random_unit_vectors(N_PART):
-    z = np.random.uniform(-1, 1, N_PART)
+def generate_random_unit_vectors(N_PART, rng=None):
+    """
+    Draws unit vectors uniformly distributed on the unit sphere.
+
+    Samples z uniformly on [-1, 1] and the azimuth uniformly on [0, 2*pi).
+    That is area-uniform on the sphere (and not merely uniform in the polar
+    angle) because the sphere's projection onto the enclosing cylinder
+    preserves area, so equal slabs in z carry equal area.
+
+    :param N_PART: int | number of vectors to draw
+    :param rng: np.random.Generator (=None) | source of randomness. Defaults to
+        the legacy global np.random state, which is what Simulation.set_sys seeds.
+        Pass a Generator for a reproducible draw independent of that global state.
+    :return: np.ndarray | shape (N_PART, 3), unit vectors
+    """
+    source = np.random if rng is None else rng
+    z = source.uniform(-1, 1, N_PART)
     r = np.sqrt(1 - z*z)
-    phi = np.random.uniform(0, 2*np.pi, N_PART)
+    phi = source.uniform(0, 2*np.pi, N_PART)
     x = r * np.cos(phi)
     y = r * np.sin(phi)
     return np.column_stack((x, y, z))
 
 def normalize_vectors(vectors, axis=-1):
+    """
+    Normalizes one or many vectors to unit length.
+
+    Zero-norm entries are left unnormalized (their norm is treated as 1)
+    rather than raising a division-by-zero error.
+
+    :param vectors: array_like | a single vector or an array of vectors
+    :param axis: int (=-1) | axis along which the norm is taken
+    :return: np.ndarray | same shape as ``vectors``, normalized along ``axis``
+    """
     array_of_vectors= np.asarray(vectors)
     norms_array = np.atleast_1d(np.linalg.norm(array_of_vectors, axis=axis))
     norms_array[norms_array==0] = 1
@@ -746,6 +847,9 @@ def random_nested_3d_vectors_like(item, rng=None):
     - NumPy arrays with last dimension == 3 => generate array of random unit vectors with same shape.
     - Otherwise recurse.
     Raises error if a scalar or other unsupported leaf is found.
+
+    :param rng: np.random.Generator (=None) | source of randomness, threaded down
+        into every leaf draw. Defaults to a fresh default_rng().
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -753,7 +857,7 @@ def random_nested_3d_vectors_like(item, rng=None):
     if isinstance(item, (list, tuple)):
         # Check if it is a 3D vector (leaf)
         if len(item) == 3 and all(isinstance(x, (float, int)) for x in item):
-            return generate_random_unit_vectors(1).flatten().tolist()
+            return generate_random_unit_vectors(1, rng=rng).flatten().tolist()
         else:
             return [random_nested_3d_vectors_like(sub, rng) for sub in item]
 
@@ -762,7 +866,7 @@ def random_nested_3d_vectors_like(item, rng=None):
             raise ValueError(f"Expected last dimension to be 3 for 3D vectors, got shape {item.shape}")
 
         n_vectors = np.prod(item.shape[:-1])
-        vectors = generate_random_unit_vectors(n_vectors)
+        vectors = generate_random_unit_vectors(n_vectors, rng=rng)
         vectors = vectors.reshape(item.shape)
         # Just to be sure normalize (your function is safe)
         return normalize_vectors(vectors, axis=-1)
@@ -770,55 +874,8 @@ def random_nested_3d_vectors_like(item, rng=None):
     else:
         raise ValueError(f"Expected last dimension to be 3 for 3D vectors, got {item}")
 
-def build_grid_and_adjacent(lattice_points, volume_side, cell_size):
-    """
-    Builds a grid dictionary mapping each cell id (tuple) to a list of particle indices, and
-    an adjacent-cells dictionary mapping each occupied cell id to a list of its adjacent cell ids (including itself),
-    taking periodic boundary conditions into account.
-
-    Parameters
-    ----------
-    lattice_points : np.ndarray of shape (N, 3)
-        Array of particle positions.
-    volume_side : float or array-like of shape (3,)
-        The side length of the cubic volume or the side lengths of a rectangular volume.
-    cell_size : float
-        The grid cell size (typically set equal to the cutoff distance).
-    Returns
-    -------
-    grid : defaultdict(list)
-        Dictionary mapping cell id (tuple of ints) to a list of particle indices in that cell.
-    num_cells : int
-        The number of cells per dimension.
-    adjacent : dict
-        Dictionary mapping each occupied cell id to a list of adjacent cell ids (as tuples), with periodic boundaries.
-    """
-    volume_side = np.asarray(volume_side)
-    if volume_side.ndim == 0:
-        volume_side = np.ones(3) * volume_side
-    num_cells = np.floor(volume_side / cell_size).astype(int)
-    num_cells = np.maximum(num_cells, 1)
-    effective_cell_size = volume_side / num_cells
-    # Compute cell indices for all points in one go using vectorized operations.
-    cells = np.floor(lattice_points / effective_cell_size).astype(int) % num_cells
-    grid = defaultdict(list)
-    # Group indices by cell ID.
-    for idx, cell in enumerate(cells):
-        grid[tuple(cell)].append(idx)
-    # Precompute neighbor offsets (all combinations of -1, 0, 1 in 3 dimensions).
-    neighbor_offsets = list(product([-1, 0, 1], repeat=3))
-
-    # Build the adjacent cells dictionary only for the occupied cells.
-    adjacent = {}
-    for cell in grid.keys():
-        cell_arr = np.array(cell)
-        # For each offset, compute the neighboring cell id with periodic wrapping.
-        adjacent[cell] = [tuple((cell_arr + np.array(offset)) % num_cells) for offset in neighbor_offsets]
-
-    return grid, adjacent
-
 def get_neighbours(points: np.ndarray, box_dim: ArrayLike, cutoff: float = 1., sort: bool = True,
-                   max_bytes: int = 256 << 15, cells_per_cutoff: int | None = None):
+                   max_bytes: int = DEFAULT_MAX_CANDIDATE_BYTES, cells_per_cutoff: int | None = None):
     """Symmetric neighbour lists within one lattice under PBC. Numpy only.
 
     Every index 0..N-1 is a key, isolated particles map to [], j is in
@@ -831,8 +888,10 @@ def get_neighbours(points: np.ndarray, box_dim: ArrayLike, cutoff: float = 1., s
         True gives ascending neighbour lists; False leaves the order
         unspecified but deterministic, and is slightly cheaper.
     max_bytes : int
-        Soft cap on the transient candidate buffers, default 256 MB. Lower it
-        on a memory-constrained machine; results are unaffected.
+        Soft cap on the transient candidate buffers, default
+        DEFAULT_MAX_CANDIDATE_BYTES (8 MiB). Lower it on a memory-constrained
+        machine, raise it to trade memory for fewer chunk iterations; results
+        are unaffected either way.
     cells_per_cutoff : int or None
         Cells per cutoff length along each axis. None (default) auto-selects by
         minimising a cost model over k = 1, 2, 3, 4, 6, 8; pass an integer only
@@ -874,7 +933,7 @@ def get_neighbours(points: np.ndarray, box_dim: ArrayLike, cutoff: float = 1., s
 
 def get_neighbours_cross_lattice(points_a: np.ndarray, points_b: np.ndarray, box_dim: ArrayLike,
     cutoff: float = 1.0, sort: bool = True,
-    max_bytes: int = 256 << 15, cells_per_cutoff: bool = None):
+    max_bytes: int = DEFAULT_MAX_CANDIDATE_BYTES, cells_per_cutoff: int | None = None):
     """Neighbours of each lattice1 point among the lattice2 points. Numpy only.
 
     Keys index lattice1, values index lattice2. Nothing is excluded: a
@@ -933,33 +992,19 @@ def calculate_pair_distances(points_a, points_b, box_lengths):
     if isinstance(box_lengths, float):
         box_lengths = box_lengths * np.ones(3)
     box_lengths = np.asarray(box_lengths)
+    if not (box_lengths.shape == (3,)):
+        raise ValueError("box_lengths must be an array-like of shape (3,)")
 
     # Ensure inputs are numpy arrays
     points_a = np.atleast_2d(points_a)
     points_b = np.atleast_2d(points_b)
 
-    # Get the number of points in each set
-    num_a = len(points_a)
-    num_b = len(points_b)
-
-    # Create index combinations for pair comparisons
-    indices_a = np.arange(num_a)
-    indices_b = np.arange(num_b)
-
-    # Create a grid of all pair combinations of indices
-    index_combinations = np.array(list(product(indices_a, indices_b)))
-
-    # Extract corresponding points for each pair
-    point_pairs_a = points_a[index_combinations[:, 0]]  # Points from the first set
-    point_pairs_b = points_b[index_combinations[:, 1]]  # Points from the second set
-
-    box_lengths = np.asarray(box_lengths)
-    assert box_lengths.shape == (3,), "box_lengths must be an array-like of shape (3,)"
-    # Calculate the minimum image distance with periodic boundary conditions
-    distances = np.linalg.norm(min_img_dist(point_pairs_a, point_pairs_b, box_dim=box_lengths), axis=-1)
-    # distances = np.linalg.norm(point_pairs_a-point_pairs_b, axis=-1)
-
-    return distances
+    # Pair up every a with every b by broadcasting rather than materialising an
+    # explicit N*M index list; the row-major ordering (a-major, b-minor) is the
+    # same either way, so dist(i,j) is still distances[i*M + j].
+    displacements = min_img_dist(points_a[:, None, :], points_b[None, :, :],
+                                 box_dim=box_lengths)
+    return np.linalg.norm(displacements, axis=-1).ravel()
 
 def fcc_lattice(radius: float, box_dim, scaling_factor: float = 1.0,
                 max_points_per_side: int = 100, mode: str = "pack") -> np.ndarray:
@@ -1051,6 +1096,8 @@ def make_centered_rand_orient_point_array(center=np.array([0,0,0]), sphere_radiu
         The number of points to generate
     spacing : float, optional
         If provided, sets fixed spacing between points. The total chain length will be spacing * (num_monomers - 1), and the points will be centered around center.
+    box_lengths : Unused
+        Accepted for `build_function` signature compatibility.
     Returns
     -------
     tuple
@@ -1064,7 +1111,11 @@ def make_centered_rand_orient_point_array(center=np.array([0,0,0]), sphere_radiu
         positions = spacing * (np.arange(num_monomers) - (num_monomers - 1)/2)
 
     ensuring that the distance between consecutive points is exactly 'spacing' and that the center of mass is at 0.
-    The points are then rotated by a random orientation (given by theta and phi) and shifted by 'center'.
+    The points are then rotated by a random orientation and shifted by 'center'.
+
+    The orientation is drawn uniformly on the unit sphere: the azimuth theta is
+    uniform on [0, 2*pi) and cos(phi) -- not phi -- is uniform on [-1, 1].
+    Drawing phi uniformly instead would oversample the poles.
     """
 
     if spacing is not None:
@@ -1074,10 +1125,14 @@ def make_centered_rand_orient_point_array(center=np.array([0,0,0]), sphere_radiu
         positions = np.linspace(-sphere_radius,
                         sphere_radius, num_monomers + 1)[:-1] + shift
     theta = np.random.uniform(0, 2 * np.pi)
-    phi = np.random.uniform(0, np.pi)
-    x_points = center[0] + positions * np.sin(phi) * np.cos(theta)
-    y_points = center[1] + positions * np.sin(phi) * np.sin(theta)
-    z_points = center[2] + positions * np.cos(phi)
+    # cos(phi) is drawn uniformly, not phi itself: equal slabs in cos(phi) carry
+    # equal area on the sphere, so this is the area-uniform choice. See
+    # generate_random_unit_vectors for the same argument spelled out.
+    cos_phi = np.random.uniform(-1, 1)
+    sin_phi = np.sqrt(1 - cos_phi * cos_phi)
+    x_points = center[0] + positions * sin_phi * np.cos(theta)
+    y_points = center[1] + positions * sin_phi * np.sin(theta)
+    z_points = center[2] + positions * cos_phi
     points = np.column_stack((x_points, y_points, z_points))
     direction_vector=points[-1]-points[0]
     orientation_vector = direction_vector / np.linalg.norm(direction_vector)
@@ -1105,14 +1160,23 @@ def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_p
 
     Returns
     -------
-    list of tuples
-        Each tuple contains:
-        - center (array-like): The coordinates of the sphere's center
-        - points (array-like): The generated points within the sphere (or center if no routine)
-        - orientation (array-like): The orientation vector for the sphere
+    sphere_centers : np.ndarray, shape (num_spheres, 3)
+        Centers of the chosen lattice sites.
+    positions : np.ndarray
+        Shape (num_spheres, num_monomers, 3) when the routine generates more than one monomer per
+        volume, otherwise (num_spheres, 3) -- the centers themselves.
+    orientations : np.ndarray
+        Same leading shape as `positions`; the orientation vector for each volume's contents.
+
+    Raises
+    ------
+    ValueError
+        If the box cannot hold `num_spheres` sites even at the minimum packing scale, or if a
+        volume's contents cannot be placed without overlap within MAX_PLACEMENT_ATTEMPTS draws.
     """
     box_lengths = np.asarray(box_lengths)
-    assert box_lengths.shape == (3,), "box_lengths must be an array-like of shape (3,)"
+    if not (box_lengths.shape == (3,)):
+        raise ValueError("box_lengths must be an array-like of shape (3,)")
     sphere_radius = sphere_diameter * 0.5
     scaling = 1.0
 
@@ -1124,13 +1188,13 @@ def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_p
         logging.info('num_spheres_needed, num_spheres_got: %s', (num_spheres, volumes_to_fill))
         if  volumes_to_fill>= num_spheres:
             break
-        if scaling - 0.1 < scaling_floor:
+        if scaling <= scaling_floor:
             raise ValueError(
                 f"Cannot fit {num_spheres} spheres of diameter {sphere_diameter} into a box of "
                 f"{box_lengths}: only {volumes_to_fill} lattice sites exist at the minimum "
                 f"packing scale ({scaling_floor}). Reduce num_spheres or sphere_diameter, "
                 f"or enlarge the box.")
-        scaling -= 0.1
+        scaling = max(scaling - 0.1, scaling_floor)
     logging.info('scaling used: %s', scaling)
 
     # Center point distribution in box
@@ -1149,14 +1213,12 @@ def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_p
     res_orientations = [None] * num_spheres
     # Perform the point generation routine if `num_monomers` not 0
     if routine_per_volume.num_monomers>1:
-        if not np.all(box_lengths==box_lengths[0]):
-            warnings.warn("this methods assumes cubic system box for num_monomers > 1")
         grouped_positions = defaultdict(list)
         #grouped_volumes is a dictionary that contains all neighouring lattice sites sphere_diameter
         grouped_volumes=get_neighbours(sphere_centers,box_dim=box_lengths,cutoff=sphere_diameter)
         for i, center in enumerate(sphere_centers):
             valid_placement = False
-            while not valid_placement:
+            for attempt in range(MAX_PLACEMENT_ATTEMPTS):
                 orientations, points = routine_per_volume(
                     center=center, num_monomers=routine_per_volume.num_monomers, sphere_radius=sphere_radius, spacing=routine_per_volume.spacing,
                     box_lengths=box_lengths)
@@ -1175,6 +1237,15 @@ def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_p
                     results[i] = points
                     res_orientations[i] = orientations
                     valid_placement = True
+                    break
+            if not valid_placement:
+                raise ValueError(
+                    f"Could not place the contents of volume {i} of {len(sphere_centers)} "
+                    f"(center {center}) without overlapping its neighbours after "
+                    f"{MAX_PLACEMENT_ATTEMPTS} random attempts. The lattice is too dense for "
+                    f"{routine_per_volume.num_monomers} monomers of size "
+                    f"{routine_per_volume.monomer_size} per volume of diameter {sphere_diameter}. "
+                    f"Reduce num_spheres, monomer size or monomer count, or enlarge the box.")
     else:
         results=sphere_centers
         res_orientations=generate_random_unit_vectors(len(sphere_centers))
@@ -1257,8 +1328,8 @@ def partition_cubic_volume_oriented_rectangles(big_box_dim, num_spheres, small_b
         for i in range(1, len(sphere_centers), 2):
             sphere_centers[i, 2] = big_box_dim[2] - 0.5 * z_len
 
-    assert len(sphere_centers) >= num_spheres, \
-        'Must be enough possible volumes. Introduce a scaling factor.'
+    if not (len(sphere_centers) >= num_spheres):
+        raise ValueError('Must be enough possible volumes. Introduce a scaling factor.')
 
     take_index = np.arange(len(sphere_centers))
     np.random.shuffle(take_index)
@@ -1270,43 +1341,61 @@ def partition_cubic_volume_oriented_rectangles(big_box_dim, num_spheres, small_b
     for i, iid in enumerate(take_index):
         center = sphere_centers[iid]
         theta = np.random.uniform(0, 2 * np.pi)
-        phi = 0.
-        x_points = center[0] + alphas * np.sin(phi) * np.cos(theta)
-        y_points = center[1] + alphas * np.sin(phi) * np.sin(theta)
-        z_points = center[2] + alphas * np.cos(phi)
+        cos_phi = np.random.uniform(-1, 1)
+        sin_phi = np.sqrt(1 - cos_phi * cos_phi)
+        x_points = center[0] + alphas * sin_phi * np.cos(theta)
+        y_points = center[1] + alphas * sin_phi * np.sin(theta)
+        z_points = center[2] + alphas * cos_phi
         result[i] = np.column_stack((x_points, y_points, z_points))
 
     return sphere_centers[take_index], result
 
 def get_orientation_vec(pos):
     '''
-    Calculates the principal gyration axis of a filement as the orientation of a filament. Sometimes the np.linalg.eig() returns a complex number with 0 complex part wich confuses espresso. Therefore the ret values is cast to float explicitly
+    Calculates the principal gyration axis of a filament as the orientation of a filament.
 
-    :return: float | normalised principal gyration axis
+    The gyration tensor is real symmetric by construction, so np.linalg.eigh is
+    used: it is guaranteed to return real eigenvalues and eigenvectors, which is
+    what espresso needs. (np.linalg.eig would occasionally hand back a complex
+    type with zero imaginary part.)
+
+    An eigenvector is only defined up to sign, so the returned axis is pinned to
+    point from the first to the last position. Callers rely on this: the vector
+    decides which end of a filament carries the 'front' virtual sites, so an
+    arbitrary sign would make that assignment a coin flip.
+
+    :param pos: array_like, shape (N, 3) | positions, in order along the object
+    :return: np.ndarray, shape (3,) | normalised principal gyration axis
 
     '''
-    dip_3d = np.array(pos)
-    r_cm = np.mean(dip_3d, axis=0)
-    gyration_tensor_xx = np.mean(
-        [(x-r_cm[0])*(x-r_cm[0]) for (x, y, z) in dip_3d])
-    gyration_tensor_yy = np.mean(
-        [(y-r_cm[1])*(y-r_cm[1]) for (x, y, z) in dip_3d])
-    gyration_tensor_zz = np.mean(
-        [(z-r_cm[2])*(z-r_cm[2]) for (x, y, z) in dip_3d])
-    gyration_tensor_xy = np.mean(
-        [(x-r_cm[0])*(y-r_cm[1]) for (x, y, z) in dip_3d])
-    gyration_tensor_xz = np.mean(
-        [(x-r_cm[0])*(z-r_cm[2]) for (x, y, z) in dip_3d])
-    gyration_tensor_yz = np.mean(
-        [(y-r_cm[1])*(z-r_cm[2]) for (x, y, z) in dip_3d])
-    gyration_tensor_element = [[gyration_tensor_xx, gyration_tensor_xy, gyration_tensor_xz],
-                               [gyration_tensor_xy, gyration_tensor_yy,
-                                   gyration_tensor_yz],
-                               [gyration_tensor_xz, gyration_tensor_yz, gyration_tensor_zz]]
-    res, egiv = np.linalg.eig(gyration_tensor_element)
+    dip_3d = np.asarray(pos, dtype=float)
+    deviations = dip_3d - dip_3d.mean(axis=0)
+    gyration_tensor_element = (deviations.T @ deviations) / len(dip_3d)
+    # r_cm = np.mean(dip_3d, axis=0)
+    # gyration_tensor_xx = np.mean(
+    #     [(x-r_cm[0])*(x-r_cm[0]) for (x, y, z) in dip_3d])
+    # gyration_tensor_yy = np.mean(
+    #     [(y-r_cm[1])*(y-r_cm[1]) for (x, y, z) in dip_3d])
+    # gyration_tensor_zz = np.mean(
+    #     [(z-r_cm[2])*(z-r_cm[2]) for (x, y, z) in dip_3d])
+    # gyration_tensor_xy = np.mean(
+    #     [(x-r_cm[0])*(y-r_cm[1]) for (x, y, z) in dip_3d])
+    # gyration_tensor_xz = np.mean(
+    #     [(x-r_cm[0])*(z-r_cm[2]) for (x, y, z) in dip_3d])
+    # gyration_tensor_yz = np.mean(
+    #     [(y-r_cm[1])*(z-r_cm[2]) for (x, y, z) in dip_3d])
+    # gyration_tensor_element = [[gyration_tensor_xx, gyration_tensor_xy, gyration_tensor_xz],
+    #                            [gyration_tensor_xy, gyration_tensor_yy,
+    #                                gyration_tensor_yz],
+    #                            [gyration_tensor_xz, gyration_tensor_yz, gyration_tensor_zz]]
+    
+    res, egiv = np.linalg.eigh(gyration_tensor_element)
     pr_comp = egiv[:, np.argmax(res)]
     pr_comp /= np.linalg.norm(pr_comp)
-    return np.array(pr_comp, float)
+    # Pin the otherwise arbitrary eigenvector sign to the first->last direction.
+    if np.dot(pr_comp, dip_3d[-1] - dip_3d[0]) < 0:
+        pr_comp = -pr_comp
+    return pr_comp
 
 def get_cross_lattice_nonintersecting_volumes(current_lattice_centers, current_lattice_grouped_part_pos, current_lattice_diam,other_lattice_centers, other_lattice_grouped_part_pos,other_lattice_diam,box_lengths, mode='cross_volumes'):
     """
@@ -1348,7 +1437,8 @@ def get_cross_lattice_nonintersecting_volumes(current_lattice_centers, current_l
     """
 
     box_lengths = np.asarray(box_lengths)
-    assert box_lengths.shape == (3,), "box_lengths must be an array-like of shape (3,)"
+    if not (box_lengths.shape == (3,)):
+        raise ValueError("box_lengths must be an array-like of shape (3,)")
     neigh=get_neighbours_cross_lattice(current_lattice_centers,other_lattice_centers,
     box_lengths, cutoff=(current_lattice_diam+other_lattice_diam)*0.5)
     aranged_cross_lattice_options={}
@@ -1369,7 +1459,7 @@ def get_cross_lattice_nonintersecting_volumes(current_lattice_centers, current_l
         if associated_vol_ids:
             for as_vol_id in associated_vol_ids:
                 res=calculate_pair_distances(current_lattice_dat[vol_id], other_lattice_dat[as_vol_id], box_lengths=box_lengths)
-                mask.append(all([x>=new_crit for x in res if not np.isclose(x,0.)]))
+                mask.append(all(x >= new_crit for x in res))
         aranged_cross_lattice_options[vol_id]=mask
     return aranged_cross_lattice_options
 
@@ -1395,7 +1485,7 @@ def align_vectors(v1, v2):
     if np.isclose(cos_theta, 1.0):
         return np.eye(3)
     if np.isclose(cos_theta, -1.0):
-        orthogonal_vector = np.array([1.0, 0.0, 0.0]) if not np.isclose(v1[0], 1.0) else np.array([0.0, 1.0, 0.0])
+        orthogonal_vector = np.array([1.0, 0.0, 0.0]) if not np.isclose(np.abs(v1[0]), 1.0) else np.array([0.0, 1.0, 0.0])
         orthogonal_vector -= v1 * np.dot(orthogonal_vector, v1)
         orthogonal_vector /= np.linalg.norm(orthogonal_vector)
         return -np.eye(3) + 2 * np.outer(orthogonal_vector, orthogonal_vector)
@@ -1411,6 +1501,19 @@ def align_vectors(v1, v2):
     return rotation_matrix
 
 def get_perpendicular(vec, phi=None):
+    """
+    Returns a unit vector perpendicular to ``vec``.
+
+    A reference direction is projected off ``vec`` to get one perpendicular
+    vector, which is then rotated by ``phi`` about ``vec`` (Rodrigues'
+    rotation formula), so every azimuthal angle around ``vec`` is reachable.
+
+    :param vec: array_like, shape (3,) | the axis to be perpendicular to; must be non-zero
+    :param phi: float (=None) | rotation angle around ``vec``, in radians. If
+        None, drawn uniformly from [0, 2*pi)
+    :return: np.ndarray, shape (3,) | unit vector perpendicular to ``vec``
+    :raises ValueError: if ``vec`` is (numerically) the zero vector
+    """
     vec = np.asarray(vec, dtype=float)
     norm = np.linalg.norm(vec)
     if np.isclose(norm, 0.0):
@@ -1433,6 +1536,16 @@ def get_perpendicular(vec, phi=None):
     return perp
 
 def api_agnostic_feature_check(feature_name):
+    """
+    Checks whether an ESPResSo build has a given compile-time feature enabled,
+    across the v4/v5 API split.
+
+    :param feature_name: str | name of the ESPResSo feature (e.g. 'DIPOLES')
+    :return: bool | True if the feature is compiled in, False if it is not or
+        if the check itself fails (e.g. the feature name is unknown to this
+        ESPResSo build, which is logged as a warning rather than raised)
+    :raises ValueError: if the installed ESPResSo major version is neither 4 nor 5
+    """
     ret_val=None
     espresso_major_version=espressomd.version.major()
     try:
@@ -1448,6 +1561,15 @@ def api_agnostic_feature_check(feature_name):
     return ret_val
 
 def particle_attribute_check(part_hndl, attribute_name):
+    """
+    Checks that a particle handle exposes a given attribute.
+
+    :param part_hndl: ParticleHandle | particle to check
+    :param attribute_name: str | name of the attribute to look up
+    :return: None
+    :raises MissingFeature: if the attribute is not present, e.g. because the
+        ESPResSo build lacks the feature that would expose it
+    """
     try:
         getattr(part_hndl,attribute_name)
     except AttributeError:
@@ -1462,7 +1584,7 @@ def add_box_constraints_func(sys, wall_type=0, sides=['all'], inter=None, types_
     By default:
         bottom - z=0; top - z=sys.box_l[2];
         left - y=0  ; right - y=sys.box_l[1];
-        back - x=0  ; front - z=sys.box_l[0];
+        back - x=0  ; front - x=sys.box_l[0];
 
     Parameters
     ----------
@@ -1480,9 +1602,13 @@ def add_box_constraints_func(sys, wall_type=0, sides=['all'], inter=None, types_
             - 'wca': Weeks–Chandler–Andersen potential with large epsilon.
     types_ : list of int, optional
         Particle types that will interact with the walls. If None, all non-wall types in the system are used.
+    object_types : list of type, optional
+        Object classes whose `part_types['real']` should interact with the walls. Consulted only when
+        `types_` is None; if both are None, every non-wall type in the system is used.
     bottom, top, left, right, back, front : float, optional
         Position of each wall, defined as the distance to the xOy plane (for top/bottom), xOz plane (for left/right),
         or yOz plane (for front/back). If not specified, the position defaults to the corresponding boundary of the simulation box.
+        Passing any of them implicitly adds that side to `sides`.
 
 
     Returns
@@ -1497,6 +1623,7 @@ def add_box_constraints_func(sys, wall_type=0, sides=['all'], inter=None, types_
     - The wall interaction can be configured by specifying `inter` and, optionally, `types_`.
     - Walls are defined using outward-pointing normals and placed at specified distances from the origin.
     - The method adds constraints to `sys.constraints` directly.
+    - `wall_type` must be given again to `remove_box_constraints_func` to find these walls later.
     """
     existing_part_types = set(sys.part.all().type)
     if wall_type in existing_part_types:
@@ -1588,6 +1715,8 @@ def add_box_constraints_func(sys, wall_type=0, sides=['all'], inter=None, types_
 
         if 'wca' in inter:
             for type_ in types_:
+                # The extra /2**(1/6) softened sigma is what keeps particles sitting at
+                # their equilibrium distance from the wall instead of a stiff overlap.
                 sigma = sys.non_bonded_inter[type_,type_].wca.sigma/2 / 2**(1/6)
                 if sigma < 0.001:
                     warnings.warn(f"Interaction of type {type_} with wall is 0, has these particles have no interaction defined. If you would like to have no interactions between particles, but only with wall, then hange this function or do it with normal espresso constraints.")
@@ -1633,16 +1762,33 @@ def remove_box_constraints_func(sys, wall_type=0, wall_constraints=None, part_ty
             sys.non_bonded_inter[box_type, type_].reset()
 
 def check_free_cuboid(sys, cuboid_l, cuboid_l_shift=None):
+    """
+    Checks that no existing particle lies inside a given cuboid region.
+
+    :param sys: espressomd.System | the simulation system to inspect
+    :param cuboid_l: array_like, shape (3,) | cuboid side lengths
+    :param cuboid_l_shift: array_like, shape (3,) (=None) | cuboid's lower
+        corner; defaults to the origin
+    :return: bool | True if the cuboid is empty of particles (or the system
+        has no particles at all), False if at least one particle lies inside it
+
+    Positions are folded, so a particle that has drifted a box length does not
+    read as outside the cuboid while its image sits squarely inside it.
+    """
     if cuboid_l_shift is None:
         cuboid_l_shift = np.zeros((3))
-    pos = sys.part.all().pos
+    pos = sys.part.all().pos_folded
     if len(pos) == 0:
         return True
     else:
         return np.all(np.any((pos < cuboid_l_shift) | (pos > cuboid_l_shift + cuboid_l), axis=1))
 
 class BondWrapper:
-    """Transparent proxy around an espresso bond."""
+    """Transparent proxy around an espresso bond.
+    """
+
+    #: Attributes that belong to the wrapper, not to the wrapped espresso bond.
+    _wrapper_attrs = frozenset({"_bond_handle", "name"})
 
     def __init__(self, bond_handle):
         self._bond_handle = bond_handle
@@ -1652,7 +1798,7 @@ class BondWrapper:
         return getattr(self._bond_handle, name)
 
     def __setattr__(self, name, value):
-        if name == "_bond_handle":
+        if name in BondWrapper._wrapper_attrs:
             super().__setattr__(name, value)
         else:
             setattr(self._bond_handle, name, value)
@@ -1906,7 +2052,12 @@ def _choose_grid(box, cutoff, n_target, cells_per_cutoff=None, max_cells=10_000_
         if best is None or score < best[0]:
             best = (score, n, size, stencil)
     if best is None:  # all divisons had > max_cells cells
-        np.clip(np.floor(box / cutoff).astype(np.int64), 1, max_cells, out=n)
+        n = np.maximum(np.floor(box / cutoff).astype(np.int64), 1)
+        while n.prod() > max_cells:
+            reducible = n > 1
+            if not reducible.any():
+                break
+            n[np.argmax(np.where(reducible, n, -1))] -= 1
         size = box / n
         return n, size, _stencil(n, size, cutoff, ndim)
     return best[1], best[2], best[3]

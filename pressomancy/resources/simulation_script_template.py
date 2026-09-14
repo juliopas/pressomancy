@@ -63,7 +63,8 @@ sim_inst.set_sys()
 
 # //////////////////////////////////////////////////////////////////////////////
 if args.MODE == 'INIT_SRC':
-    assert args.SRC_PATH, 'MODE INIT_SRC requires that SRC_PATH is specified'
+    if not (args.SRC_PATH):
+        raise ValueError('MODE INIT_SRC requires that SRC_PATH is specified')
     CONTEXT_STRING_SRC = '_'.join([
         str(val) for key, val in parser_dict.items() if key not in STANDARD_ARG_DESTINATIONS
     ])
@@ -144,8 +145,10 @@ else:
 # //////////////////////////////////////////////////////////////////////////////
 if os.getenv("MK_SRC_MODE") in {"1", "true", "yes", "on"}:
     logging.info('MK_SRC_MODE environmental variable found and enabled the MK_SRC mode')
-    assert args.SRC_PATH, 'MK_SRC_MODE requires that SRC_PATH is specified'
-    assert args.SRC_PATH != args.path_data, 'path_data and src path must not be the same in MK_SRC mode. You are accidentally attempting to overwrite data!'
+    if not (args.SRC_PATH):
+        raise ValueError('MK_SRC_MODE requires that SRC_PATH is specified')
+    if not (args.SRC_PATH != args.path_data):
+        raise ValueError('path_data and src path must not be the same in MK_SRC mode. You are accidentally attempting to overwrite data!')
     sim_inst.mk_src_file(H5_DATA_PATH, os.path.join(args.SRC_PATH, f'custom_data_wip_{CONTEXT_STRING}.h5'), prop_dim=[('director', 3), ('image_box', 3)])
     logging.info('sucessfuly wrote SRC files and exited')
     sysos.exit(0)

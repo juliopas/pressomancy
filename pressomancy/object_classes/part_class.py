@@ -1,4 +1,7 @@
-from pressomancy.object_classes.object_class import Simulation_Object, ObjectConfigParams 
+'''
+``GenericPart``: the simplest simulation object, a single rotatable particle.
+'''
+from pressomancy.object_classes.object_class import Simulation_Object, ObjectConfigParams
 from pressomancy.helper_functions import PartDictSafe, SinglePairDict
 
 class GenericPart(metaclass=Simulation_Object):

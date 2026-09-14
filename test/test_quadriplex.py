@@ -208,7 +208,7 @@ class QuartetTest(BaseTestCase):
                 if quartet.params['type'] == 'solid':
                     expected_no_excl = len(parts) - 1
                 else:
-                    recipe = quartet.recepie_dictA if quartet.params['type'] == 'brokenA' else quartet.recepie_dictB
+                    recipe = quartet.recipe_dictA if quartet.params['type'] == 'brokenA' else quartet.recipe_dictB
                     expected_no_excl = len(next(iter(recipe['assoc'].values())))
 
                 for type_name, expected_type in quartet.part_types.items():

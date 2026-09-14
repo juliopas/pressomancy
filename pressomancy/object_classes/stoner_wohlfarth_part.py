@@ -1,3 +1,8 @@
+'''
+``SWPart``: a magnetic particle driven by ESPResSo's thermal Stoner-Wohlfarth
+(tSW) kinetic Monte Carlo magnetization model. Requires ESPResSo to be built
+with ``THERMAL_STONER_WOHLFARTH`` (which itself requires NLOPT).
+'''
 from pressomancy.object_classes.part_class import GenericPart
 from pressomancy.object_classes.object_class import ObjectConfigParams
 from pressomancy.helper_functions import PartDictSafe, SinglePairDict
@@ -12,7 +17,7 @@ if espressomd.version.major() == 5:
 class SWPart(GenericPart):
 
     '''
-    Class that contains quadriplex relevant paramaters and methods. At construction one must pass an espresso handle becaouse the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a Quadriplex. Therefore many relevant parameters are class specific, not instance specific.
+    Class that contains SWPart relevant parameters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instance there will be only one type of a SWPart. Therefore many relevant parameters are class specific, not instance specific.
     '''
     required_features=GenericPart.required_features + ['THERMAL_STONER_WOHLFARTH', 'DIPOLES', 'VIRTUAL_SITES_RELATIVE']
 
@@ -31,16 +36,11 @@ class SWPart(GenericPart):
         '''
         Initialisation of a SWPart object requires the specification of particle size and a handle to the espresso system
         '''
-
-        self.sys=config['espresso_handle']
-        self.params=config
-        self.associated_objects=self.params['associated_objects']
-        self.type_part_dict=PartDictSafe({key: [] for key in SWPart.part_types.keys()})
-        SWPart.numInstances += 1
+        super().__init__(config)
 
     def set_object(self,  pos, ori):
         '''
-        Sets a n_parts sequence of particles in espresso, asserting that the dimensionality of the pos paramater passed is commesurate with n_part.Using a generator object with the particle enumeration logic, and a try catch paradigm. Particles created here are treated as real, non_magnetic, with enabled rotations. Indices of added particles stored in self.realz_indices.append attribute. Orientation of filament stored in self.orientor = self.get_orientation_vec()
+        Sets a n_parts sequence of particles in espresso, asserting that the dimensionality of the pos parameter passed is commensurate with n_part.Using a generator object with the particle enumeration logic, and a try catch paradigm. Particles created here are treated as real, non_magnetic, with enabled rotations. Indices of added particles stored in self.realz_indices.append attribute. Orientation of filament stored in self.orientor = self.get_orientation_vec()
 
         :param pos: np.array() | float, list of positions
         :return: None
@@ -51,12 +51,18 @@ class SWPart(GenericPart):
         particl_real=self.add_particle(type_name='sw_real', pos=pos, rotation=(True, True, True), director=ori)
 
         particl_virt=self.add_particle(type_name='sw_virt', pos=pos, rotation=(False, False, False), dip=self.params['sat_mag']*ori)
-        particl_virt.magnetodynamics.tsw = magnetodynamics_setup
+        particl_virt.magnetodynamics = magnetodynamics_setup
         particl_virt.vs_auto_relate_to(particl_real)
         if espressomd.version.major() == 5:
             particl_virt.propagation = Propagation.TRANS_VS_RELATIVE | Propagation.ROT_VS_INDEPENDENT
 
-        if np.allclose(particl_virt.dipm, particl_virt.magnetodynamics.tsw['sat_mag']) == False:
-            raise ValueError(f"Error in setting dipole moment for virtual particle. Expected {particl_virt.magnetodynamics.tsw['sat_mag']}, got {particl_virt.dipm}. Check the parameters passed to the config object and the logic in this method.")
+        written = particl_virt.magnetodynamics
+        assert written['is_enabled'], \
+                f"The magnetization model was not enabled on particle {particl_virt.id}. " \
+                f"Espresso ignores a magnetodynamics dict it does not recognise instead of " \
+                f"raising, so this usually means the parameter names have changed. " \
+                f"Wrote {magnetodynamics_setup}, read back {written}."
+        if not np.allclose(particl_virt.dipm, written['sat_mag']):
+            raise ValueError(f"Error in setting dipole moment for virtual particle. Expected {written['sat_mag']}, got {particl_virt.dipm}. Check the parameters passed to the config object and the logic in this method.")
 
         return self

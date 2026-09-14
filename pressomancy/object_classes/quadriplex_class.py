@@ -1,3 +1,9 @@
+'''
+``Quartet`` (a 25-particle G-quartet sheet, in ``solid``/``brokenA``/
+``brokenB`` corner-connectivity recipes, with H-bond patch particles) and
+``Quadriplex`` (a stack of three ``Quartet``s, bonded center-to-center or
+corner-to-corner with dihedral/bending potentials).
+'''
 from itertools import combinations, product
 import random
 import warnings
@@ -12,30 +18,39 @@ from pressomancy.helper_functions import BondWrapper
 class Quartet(GenericRigidObj):
 
     '''
-    Class that contains quartet relevant paramaters and methods. At construction one must pass an espresso handle becaouse the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a Quartet. Therefore many relevant parameters are class specific, not instance specific.
+    Class that contains quartet relevant parameters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instance there will be only one type of a Quartet. Therefore many relevant parameters are class specific, not instance specific.
+
+    ``config['size']`` (inherited from ``ObjectConfigParams.common_keys``) has **no
+    effect** on Quartet/Quadriplex geometry: ``set_object`` never scales the reference
+    sheet loaded from the resource file, so the particle layout is always at that
+    file's fixed physical scale (verified: ``resources/quartet.txt``'s bounding box is
+    exactly 4x4x0, matching the ``w,d,h=4,4,0``/``diag=sqrt(2)*4`` constants used for
+    the 'solid' rotational inertia and corner detection below). ``size`` is present in
+    ``self.params`` only because every object class inherits it by default; setting it
+    on a Quartet silently does nothing.
     '''
     required_features = GenericRigidObj.required_features + ['EXCLUSIONS']
     numInstances = 0
 
-    recepie_dictA = {'assoc': {1: [2, 3, 6, 7, 8],
-                               5: [4, 9, 10, 13, 14], 
-                               20: [11, 12, 15, 16, 21], 
-                               24: [17, 18, 19, 22, 23]}, 
+    recipe_dictA = {'assoc': {1: [2, 3, 6, 7, 8],
+                              5: [4, 9, 10, 13, 14],
+                              20: [11, 12, 15, 16, 21],
+                              24: [17, 18, 19, 22, 23]},
                     'circ': [8, 13, 12, 17], 
                     'squareA': [6, 4, 21, 19], 
                     'squareB': [11, 3, 22, 14], 
                     'squareC': [7, 9, 16, 18]}
     
-    recepie_dictB = {'assoc': {1: [2, 6, 7, 11, 12], 
-                               5: [4, 9, 10, 8, 3], 
-                               20: [15, 16, 21, 22, 17], 
-                               24: [18, 19, 23, 13, 14]}, 
+    recipe_dictB = {'assoc': {1: [2, 6, 7, 11, 12], 
+                              5: [4, 9, 10, 8, 3],
+                              20: [15, 16, 21, 22, 17],
+                              24: [18, 19, 23, 13, 14]},
                     'circ': [8, 13, 12, 17], 
                     'squareA': [2, 10, 15, 23], 
                     'squareB': [11, 3,  22, 14], 
                     'squareC': [7, 9, 16, 18]}
 
-    recepie_dictA_11x11 = {
+    recipe_dictA_11x11 = {
         'assoc': {
             1: [2, 3, 4, 5, 6, 12, 13, 14, 15, 16, 17, 23, 24, 25, 26, 27, 28, 34, 35, 36, 37, 38, 39, 45, 46, 47, 48, 49, 50],
             110: [56, 57, 58, 59, 60, 66, 67, 68, 69, 70, 77, 78, 79, 80, 81, 88, 89, 90, 91, 92, 99, 100, 101, 102, 103, 111, 112, 113, 114],
@@ -48,7 +63,7 @@ class Quartet(GenericRigidObj):
         'squareC': [13, 100, 108, 21],
     }
 
-    recepie_dictB_11x11 = {
+    recipe_dictB_11x11 = {
         'assoc': {
             1: [2, 3, 4, 5, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 34, 35, 36, 37, 38, 45, 46, 47, 48, 49, 56, 57, 58, 59, 60],
             110: [66, 67, 68, 69, 70, 71, 77, 78, 79, 80, 81, 82, 88, 89, 90, 91, 92, 93, 99, 100, 101, 102, 103, 104, 111, 112, 113, 114, 115],
@@ -61,10 +76,14 @@ class Quartet(GenericRigidObj):
         'squareC': [13, 100, 108, 21],
     }
 
-    recepie_dicts_by_alias = {
-        'quartet': (recepie_dictA, recepie_dictB),
-        'quartet_11x11': (recepie_dictA_11x11, recepie_dictB_11x11),
+    recipe_dicts_by_alias = {
+        'quartet': (recipe_dictA, recipe_dictB),
+        'quartet_11x11': (recipe_dictA_11x11, recipe_dictB_11x11),
     }
+
+    # TelSeq's rule table is validated against this.
+    # Do not change
+    CORNER_DIAGONAL = np.sqrt(2) * 4
 
     part_types = PartDictSafe()
     config = ObjectConfigParams(
@@ -78,14 +97,17 @@ class Quartet(GenericRigidObj):
         Initialisation of a quartet object requires the specification of particle size, number of parts and a handle to the espresso system
         '''
         super().__init__(config)
-        assert config['type'] in ['solid', 'brokenA', 'brokenB'], 'type must be either solid, brokenA or brokenB!!!'
+        if not (config['type'] in ['solid', 'brokenA', 'brokenB']):
+            raise ValueError('type must be either solid, brokenA or brokenB!!!')
         if config['type'] == 'solid':
             self.required_features = Quartet.required_features + ['ROTATIONAL_INERTIA']
         else:
             self.required_features = Quartet.required_features + ['ELECTROSTATICS']
-        assert self.params['alias'] in ['quartet', 'quartet_11x11'], 'unsupported quartet alias!!!'
-        assert config['n_parts'] == len(self._reference_sheet[self.params['alias']]), 'n_parts must be equal to the number of parts in the reference sheet!!!'
-        self.recepie_dictA, self.recepie_dictB = self.__class__.recepie_dicts_by_alias[self.params['alias']]
+        if not (self.params['alias'] in ['quartet', 'quartet_11x11']):
+            raise ValueError('unsupported quartet alias!!!')
+        if not (config['n_parts'] == len(self._reference_sheet[self.params['alias']])):
+            raise ValueError('n_parts must be equal to the number of parts in the reference sheet!!!')
+        self.recipe_dictA, self.recipe_dictB = self.__class__.recipe_dicts_by_alias[self.params['alias']]
         if self.params['type'] in ['brokenA', 'brokenB']:
             Quartet.part_types.update({'circ': 28,
                   'squareA': 24, 'squareB': 25, 'cation': 27})
@@ -95,7 +117,7 @@ class Quartet(GenericRigidObj):
 
     def set_object(self,  pos, ori, triplet=None):
         '''
-        Sets a n_parts sequence of particles in espresso, asserting that the dimensionality of the pos paramater passed is commesurate with n_part. Using a generator object with the particle enumeration logic, and a try catch paradigm. Particles created here are treated as real, non_magnetic, with enabled rotations. Indices of added particles stored in self.realz_indices.append attribute. Orientation of filament stored in self.orientor = self.get_orientation_vec()
+        Sets a n_parts sequence of particles in espresso, asserting that the dimensionality of the pos parameter passed is commensurate with n_part. Using a generator object with the particle enumeration logic, and a try catch paradigm. Particles created here are treated as real, non_magnetic, with enabled rotations. Indices of added particles stored in self.realz_indices.append attribute. Orientation of filament stored in self.orientor = self.get_orientation_vec()
 
         :param pos: np.array() | float, list of positions
         :return: None
@@ -105,7 +127,7 @@ class Quartet(GenericRigidObj):
         positions = np.dot(self._reference_sheet[self.params['alias']],rotation_matrix.T) + pos 
         particles=[self.add_particle(type_name='virt',pos=pos) for pos in positions]
         self.unperturbed_particles=particles
-        diag = np.sqrt(2)*4
+        diag = Quartet.CORNER_DIAGONAL
         self.corner_particles = [part for part0, part in product(
             particles, particles) if np.isclose(np.linalg.norm(part0.pos - part.pos), diag, atol=1e-06)]
         if self.params['type'] == 'solid':
@@ -134,11 +156,11 @@ class Quartet(GenericRigidObj):
                 part.rotation = (True, True, True)
                 part.director = ori
 
-            for part in particles[np.array(self.recepie_dictA['circ'])]:
+            for part in particles[np.array(self.recipe_dictA['circ'])]:
                 self.change_part_type(part,'circ')
                 part.q = -0.25
 
-            for key, values in self.recepie_dictA['assoc'].items():
+            for key, values in self.recipe_dictA['assoc'].items():
                 np.vectorize(lambda real, virts: virts.vs_auto_relate_to(real))(
                     particles[key], particles[values])
                 for ii, jj in combinations([particles[key],]+[x for x in particles[values]], 2):
@@ -154,11 +176,11 @@ class Quartet(GenericRigidObj):
                 part.rotation = (True, True, True)
                 part.director = ori
 
-            for part in particles[np.array(self.recepie_dictB['circ'])]:
+            for part in particles[np.array(self.recipe_dictB['circ'])]:
                 self.change_part_type(part,'circ')
                 part.q = -0.25
 
-            for key, values in self.recepie_dictB['assoc'].items():
+            for key, values in self.recipe_dictB['assoc'].items():
                 np.vectorize(lambda real, virts: virts.vs_auto_relate_to(real))(
                     particles[key], particles[values])
                 for ii, jj in combinations([particles[key],]+[x for x in particles[values]], 2):
@@ -172,9 +194,26 @@ class Quartet(GenericRigidObj):
         logging.info(f'covalent corners marked for {self.__class__.__name__}s with part_type {part_type}')
     
     def add_h_bond_patches(self):
-        recepie_dict = self.recepie_dictA if self.params['type'] == 'brokenA' else self.recepie_dictB
-        square_b_set = recepie_dict['squareB']
-        square_a_set = recepie_dict['squareA']
+        """
+        Adds a squareA/squareB pair of virtual "cation" patch particles near
+        each corner of the quartet, related to that corner via vs_relative.
+
+        For each corner, the patches are placed just beyond the corner's
+        existing squareA/squareB neighbors (per the active recipe dict, see
+        ``recipe_dictA``/``recipe_dictB``), then nudged further out and
+        excluded from each other, and the corner itself is pushed slightly
+        outward to make room. These patches are what
+        ``Quadriplex._add_dihedrals_between``/``add_extra_bendings`` bond
+        across corners once quartets are stacked into a broken-type
+        ``Quadriplex``.
+
+        :return: None
+        :raises ValueError: if a corner does not have exactly one squareA and
+            one squareB associate in the active recipe dict
+        """
+        recipe_dict = self.recipe_dictA if self.params['type'] == 'brokenA' else self.recipe_dictB
+        square_b_set = recipe_dict['squareB']
+        square_a_set = recipe_dict['squareA']
         cation_offset = 0.5
         cation_radius = 0.2
         particle_spacing = 1.0
@@ -185,7 +224,7 @@ class Quartet(GenericRigidObj):
 
         # For each corner, place its associated cation just beyond the squareB site along the corner->squareB direction.
         particles=self.unperturbed_particles
-        for corner_idx, assoc_indices in recepie_dict['assoc'].items():
+        for corner_idx, assoc_indices in recipe_dict['assoc'].items():
             square_b_matches = [idx for idx in assoc_indices if idx in square_b_set]
             square_a_matches = [idx for idx in assoc_indices if idx in square_a_set]
             if len(square_b_matches) != 1 or len(square_a_matches) != 1:
@@ -223,7 +262,7 @@ class Quartet(GenericRigidObj):
 class Quadriplex(metaclass=Simulation_Object):
 
     '''
-    Class that contains quadriplex relevant paramaters and methods. At construction one must pass an espresso handle becaouse the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instanse there will be only one type of a Quadriplex. Therefore many relevant parameters are class specific, not instance specific.
+    Class that contains quadriplex relevant parameters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instance there will be only one type of a Quadriplex. Therefore many relevant parameters are class specific, not instance specific.
     '''
     required_features=['VIRTUAL_SITES_RELATIVE', 'ROTATION']
     numInstances = 0
@@ -244,11 +283,12 @@ class Quadriplex(metaclass=Simulation_Object):
         self.sys=config['espresso_handle']
         self.params=config
         if self.params['associated_objects']==None:
-            warnings.warn('no associated_objects have been passed explicity. Creating objects required to initialise object implicitly!')
+            warnings.warn('no associated_objects have been passed explicitly. Creating objects required to initialise object implicitly!')
             configuration=Quartet.config.specify(espresso_handle=self.sys)
             self.params['associated_objects']=[Quartet(config=configuration) for _ in range(3)]
         self.associated_objects=self.params['associated_objects']
-        assert config['n_parts'] == len(config['associated_objects']), f'n_parts must be equal to the number of associated objects!!! {config["n_parts"], len(config["associated_objects"])}'
+        if not (config['n_parts'] == len(config['associated_objects'])):
+            raise ValueError(f'n_parts must be equal to the number of associated objects!!! {config["n_parts"], len(config["associated_objects"])}')
         self.has_been_set=False
         self.orientor = np.empty(shape=3, dtype=float)
         self.type_part_dict=PartDictSafe({key: [] for key in Quadriplex.part_types.keys()})
@@ -256,7 +296,7 @@ class Quadriplex(metaclass=Simulation_Object):
 
     def set_object(self,  pos, ori):
         '''
-        Sets a n_parts sequence of particles in espresso, asserting that the dimensionality of the pos paramater passed is commesurate with n_part.Using a generator object with the particle enumeration logic, and a try catch paradigm. Particles created here are treated as real, non_magnetic, with enabled rotations. Indices of added particles stored in self.realz_indices.append attribute. Orientation of filament stored in self.orientor = self.get_orientation_vec()
+        Sets a n_parts sequence of particles in espresso, asserting that the dimensionality of the pos parameter passed is commensurate with n_part.Using a generator object with the particle enumeration logic, and a try catch paradigm. Particles created here are treated as real, non_magnetic, with enabled rotations. Indices of added particles stored in self.realz_indices.append attribute. Orientation of filament stored in self.orientor = self.get_orientation_vec()
 
         :param pos: np.array() | float, list of positions
         :return: None
@@ -264,8 +304,10 @@ class Quadriplex(metaclass=Simulation_Object):
         '''
         if self.has_been_set:
             raise RuntimeError(f'object {self.__class__.__name__} with id {self.who_am_i} was attempted to be set but it already exists!!!')
-        assert self.params['n_parts'] == 3, "a quadriplex can only be created from 3 quartets!!! "
-        assert all([x.simulation_type==self.associated_objects[0].simulation_type for x in self.associated_objects[1:]]), 'all objects must have the same simulation type!'
+        if not (self.params['n_parts'] == 3):
+            raise ValueError("a quadriplex can only be created from 3 quartets!!! ")
+        if not (all([x.simulation_type==self.associated_objects[0].simulation_type for x in self.associated_objects[1:]])):
+            raise ValueError('all objects must have the same simulation type!')
         type_str=self.associated_objects[0].simulation_type.key
 
         p_central = self.associated_objects[0].set_object(
@@ -293,17 +335,21 @@ class Quadriplex(metaclass=Simulation_Object):
         part_hndl_a.add_exclusion(part_hndl_b.id)        
  
     def _bond_quartets_center_to_center(self):
-        assert len(
-            self.associated_objects) == 3, "a quadriplex can only be created from 3 quartets!!! "
-        assert self.params['bonding_mode'] == 'ctc', 'this method is only valid for center to center bonding!!!'
+        if not (len(
+            self.associated_objects) == 3):
+            raise ValueError("a quadriplex can only be created from 3 quartets!!! ")
+        if not (self.params['bonding_mode'] == 'ctc'):
+            raise RuntimeError('this method is only valid for center to center bonding!!!')
         self.bond_owned_part_pair(self.associated_objects[0].type_part_dict['real'][0], self.associated_objects[1].type_part_dict['real'][0])   
 
         self.bond_owned_part_pair(self.associated_objects[0].type_part_dict['real'][0], self.associated_objects[2].type_part_dict['real'][0])
 
     def _bond_quartets_corner_to_corner(self):
-        assert len(
-            self.associated_objects) == 3, "a quadriplex can only be created from 3 quartets!!! "
-        assert self.params['bonding_mode'] == 'ftf', 'this method is only valid for corner to corner bonding!!!'
+        if not (len(
+            self.associated_objects) == 3):
+            raise ValueError("a quadriplex can only be created from 3 quartets!!! ")
+        if not (self.params['bonding_mode'] == 'ftf'):
+            raise RuntimeError('this method is only valid for corner to corner bonding!!!')
         candidate1, candidate2, candidate3, pair_distances = self.associated_objects[
             0].corner_particles, self.associated_objects[1].corner_particles, self.associated_objects[2].corner_particles, []
 
@@ -348,8 +394,9 @@ class Quadriplex(metaclass=Simulation_Object):
                     (self.bending_potential_handle, top,  bottom))
 
     def mark_covalent_bonds(self, part_type=666):
-        assert len(
-            self.associated_objects) == 3, "a quadriplex can only be created from 3 quartets!!! "
+        if not (len(
+            self.associated_objects) == 3):
+            raise ValueError("a quadriplex can only be created from 3 quartets!!! ")
         self.associated_objects[1].mark_covalent_corner(
             part_type=part_type)
         self.associated_objects[2].mark_covalent_corner(
@@ -383,6 +430,20 @@ class Quadriplex(metaclass=Simulation_Object):
         return np.abs(np.arctan2(np.sin(delta), np.cos(delta)))
 
     def _build_corner_patch_map(self, quartet):
+        """
+        Maps each corner particle of a (patched) quartet to its nearest
+        squareA/squareB patch particles.
+
+        Requires ``quartet.add_h_bond_patches`` to have already been called,
+        so every corner has virtual sites related to it via vs_relative of
+        type ``squareA``/``squareB``. When a corner has more than one patch of
+        a given type, the nearest one (by Euclidean distance, ties broken by
+        particle id) is chosen.
+
+        :param quartet: Quartet | a broken-type quartet with h-bond patches
+        :return: dict | ``{corner_particle_id: {'squareA': part, 'squareB': part}}``
+        :raises ValueError: if a corner is missing a squareA or squareB patch
+        """
         parts, _ = quartet.get_owned_part()
         square_a_type = quartet.part_types['squareA']
         square_b_type = quartet.part_types['squareB']
@@ -431,6 +492,24 @@ class Quadriplex(metaclass=Simulation_Object):
                 raise RuntimeError(f'{method_name} requires squareA and squareB patch particle types to be declared on each quartet.')
 
     def _add_dihedrals_between(self, q_src, q_dst, dihedral_handle, target_phase=np.pi/2.):
+        """
+        Adds one dihedral bond across each pair of nearest corners between
+        two stacked quartets.
+
+        For every corner of ``q_src``, the nearest corner of ``q_dst`` is
+        found, then the squareA/squareB patch combination (and bond
+        direction) whose signed dihedral angle comes closest to
+        ``target_phase`` is picked and bonded on. Candidate combinations are
+        tried in a fixed tie-break order so the choice is deterministic when
+        multiple combinations tie on error.
+
+        :param q_src: Quartet | source quartet, iterated corner by corner
+        :param q_dst: Quartet | destination quartet, matched by nearest corner
+        :param dihedral_handle: BondWrapper | dihedral bond potential to apply
+        :param target_phase: float (=pi/2) | target signed dihedral angle, in radians
+        :return: None
+        :raises RuntimeError: if no dihedral candidate can be evaluated for a corner pair
+        """
         src_patch_map = self._build_corner_patch_map(q_src)
         dst_patch_map = self._build_corner_patch_map(q_dst)
         dst_corners = q_dst.corner_particles
@@ -497,6 +576,20 @@ class Quadriplex(metaclass=Simulation_Object):
         self._add_dihedrals_between(center_quartet, bottom_quartet, dihedral_potential_handle, target_phase=np.pi/2.)
 
     def add_extra_bendings(self, bending_potential_handle):
+        """
+        Adds bending bonds between each corner's h-bond patches and the
+        nearest corner of the adjacent quartet, for every quartet-quartet
+        interface of the stack (top-center and bottom-center).
+
+        Requires ``bonding_mode == 'ftf'`` broken-type quartets with h-bond
+        patches already added (see ``add_h_bond_patches``), same as
+        ``add_dihedrals``, but adds two bending bonds per corner (one via
+        squareB, one via squareA) instead of one dihedral.
+
+        :param bending_potential_handle: BondWrapper | 3-body bending bond potential to apply
+        :return: None
+        :raises RuntimeError: if the quadriplex isn't made of broken quartets with patches declared
+        """
         self._require_broken_quartets_with_patches('add_extra_bendings')
         center_quartet = self.associated_objects[0]
         top_quartet = self.associated_objects[1]

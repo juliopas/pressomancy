@@ -75,7 +75,7 @@ config_pdp = PointDipolePermanent.config.specify(dipm=1., espresso_handle=sim_in
 n_pdp = N_PART
 if HAS_MAGNETIZABLE_FEATURES:
     config_pdm = PointDipoleMagnetizable.config.specify(
-        magnetization_model=MODEL, dipm_sat=1., mag_susc_0=1.,
+        magnetization_model=MODEL, dipm_sat=1., mag_susc_0=0.1,
         espresso_handle=sim_inst.sys)
     n_pdp = int(N_PART/2)
     n_pdm = N_PART - n_pdp

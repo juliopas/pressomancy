@@ -1,3 +1,14 @@
+'''
+Read-side API for pressomancy's HDF5 (H5MD-style) simulation output.
+
+``H5DataSelector`` provides chainable, lazy timestep/particle slicing over a
+stored simulation (``.timestep``/``.particles``/``.bonds``/``.get_property``/
+``.select_particles_by_object``/``.get_connectivity_values``/``.at_time``);
+``H5ObservableSelector`` does the same for arbitrary recorded observables.
+``TimestepAccessor``/``ParticleAccessor`` back the chained slicing. The
+low-level fancy-indexing engine lives in
+:mod:`pressomancy.analysis.h5_helper_functions`.
+'''
 import h5py
 import numpy as np
 import warnings
@@ -66,9 +77,6 @@ class H5DataSelector:
 
         # Get step array (from particle 0)
         self._times_array = read_h5_selection(h5_file[f"particles/{particle_group}/id/time"], self.ts_slice)
-
-        # Set sys group in its little wrapper to be nicer and more seperate from the rest of the suspicious looking groups - like connectivity, for real, what is that supossed to mean. We are indeed all connected, in a way, I guess, so why separate connections based on some set and arbitrary rule. And I stopped there. Long day of coding.
-        # TO IMPLEMENT
 
     def __getitem__(self, key):
         raise TypeError(
@@ -595,25 +603,6 @@ class H5DataSelector:
         except KeyError as exc:
             raise AttributeError(f"{type(self).__name__!r} object has no attribute {attr!r}") from exc
 
-    # def __setattr__(self, name, value): # does this make sense here? It seems much more convinient to use the funcitons, anyway
-    #     """
-    #     Block direct mutation of properties.
-
-    #     Args:
-    #         name (str): The attribute name.
-    #         value (str): The value to set the attribute.
-
-    #     Returns:
-    #         The property data if available.
-
-    #     Raises:
-    #         AttributeError: If the property does not exist.
-    #     """
-    #     # allow internal properties (start with "_")
-    #     if name.startswith('_'):
-    #         object.__setattr__(self, name, value)
-    #     else:
-    #         raise AttributeError(f"Cannot set '{name}' directly. Use appropriate methods.")
 
     def __repr__(self):
         return (f"<H5DataSelector(particle_group={self.particle_group}, "
@@ -963,16 +952,16 @@ def _convert_index_to_list(index):
 
 def _slice_to_list(slice_, len_=None):
         if not isinstance(slice_, slice):
-            raise TypeError(f"Funciton expected a slice as an input: {type(slice_)}")
+            raise TypeError(f"Function expected a slice as an input: {type(slice_)}")
 
         if len_ is not None:
-            # if the lenght of the final list is know
+            # if the length of the final list is known
             return list(range(*slice_.indices(len_)))
 
-        # if the lenght is not know
+        # if the length is not known
 
         if slice_.stop is None:
-            raise ValueError(f"Cannot convert slices with None end values to list, wihtout knowin the lenght: {slice_}")
+            raise ValueError(f"Cannot convert slices with None end values to list, without knowing the length: {slice_}")
 
         # get slice start
         if slice_.start is None:
@@ -994,7 +983,7 @@ def _join_slices(slice_1, slice_2):
     elif max(slice_1.step, slice_2.step) % min(slice_1.step, slice_2.step) == 0:
         step = min(slice_1.step, slice_2.step)
     else:
-        max_len = 2_147_483_647 # chatgpt told me something about a max lenght to be possible. Not feeling like doing it now. If you are reading this, I never really felt like doing it ...
+        max_len = 2_147_483_647 # chatgpt told me something about a max length to be possible. Not feeling like doing it now. If you are reading this, I never really felt like doing it ...
         raise NotImplementedError
 
     if slice_1.start is None or slice_2.start is None:

@@ -1,3 +1,8 @@
+'''
+``GenericRigidObj``: a rigid body made of one real center-of-mass particle
+plus a fixed arrangement of virtual sites loaded from a geometry file in
+:mod:`pressomancy.resources`, related to the CoM via ``vs_relative``.
+'''
 from pressomancy.object_classes.object_class import Simulation_Object, ObjectConfigParams
 from pressomancy.helper_functions import PartDictSafe, SinglePairDict, load_coord_file
 import os
@@ -6,7 +11,15 @@ import numpy as np
 class GenericRigidObj(metaclass=Simulation_Object):
     """
     General-purpose rigid simulation object with one real center-of-mass (CoM)
-    particle and a rigid arrangement of virtual particles. At construction, the object infers its virtual-particle geometry from a resource file selected by the provided alias. Resource file should 
+    particle and a rigid arrangement of virtual particles. At construction, the object infers its virtual-particle geometry from a resource file selected by the provided alias. See the Resource File Specification below for the expected file format.
+
+    ``set_object`` translates the reference geometry by ``pos`` but does **not**
+    rotate it by ``ori`` — only the CoM particle's ``director`` is set to ``ori``.
+    This is the right behavior for orientation-agnostic bodies (see
+    ``RaspberrySphere``/``MulticorePart``, where the virtual-site pattern's absolute
+    orientation is arbitrary), but it means a subclass whose geometry must actually be
+    steerable by ``ori`` (e.g. ``Quartet``) cannot extend ``set_object`` — it has to
+    override it entirely, rotating the reference sheet itself before placing particles.
 
     Parameters
     ----------
@@ -105,10 +118,9 @@ class GenericRigidObj(metaclass=Simulation_Object):
         AssertionError
             If ``config['alias']`` is ``None``.
         """
-        assert config['alias'] is not None, (
-            'Generic rigid object must have an alias; it is used to locate the '
-            'reference geometry file in resources!'
-        )
+        if not (config['alias'] is not None):
+            raise ValueError('Generic rigid object must have an alias; it is used to locate the '
+            'reference geometry file in resources!')
         alias = config['alias']
 
         # Cache file path and reference coordinates per alias
@@ -142,7 +154,7 @@ class GenericRigidObj(metaclass=Simulation_Object):
             Translation applied to the reference coordinates to place the rigid
             object in space. Typically a 3-vector.
         ori : array_like, shape (3,)
-            Orientation/director vector to assign to the real particle. Virtual orientation is coalligned but should be taken as arbitrary!
+            Orientation/director vector to assign to the real particle. Virtual orientation is coaligned but should be taken as arbitrary!
 
         Returns
         -------

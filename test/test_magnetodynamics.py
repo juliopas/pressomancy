@@ -97,6 +97,20 @@ class ConfigureMagnetizationTest(BaseTestCase):
         self.assertFalse(getattr(virt, MAGNETIZATION_MODELS[first][1]),
                          'switching models must clear the previous one')
 
+    def test_anchor_none_reuses_existing_binding(self):
+        anchor, virt = self._make_pair()
+        model = AVAILABLE_MODELS[0]
+        virt.vs_auto_relate_to(anchor)
+        configure_magnetization(virt, model, self.m_sat, self.chi_0, anchor=None)
+        self.assertEqual(virt.dipm_sat, self.m_sat)
+        self.assertTrue(getattr(virt, MAGNETIZATION_MODELS[model][1]))
+
+    def test_anchor_none_rejects_unbound_virtual_site(self):
+        _, virt = self._make_pair()
+        model = AVAILABLE_MODELS[0]
+        with self.assertRaises(ValueError):
+            configure_magnetization(virt, model, self.m_sat, self.chi_0, anchor=None)
+
     def test_parameter_validation_precedes_espresso(self):
         anchor, virt = self._make_pair()
         model = AVAILABLE_MODELS[0]
@@ -409,3 +423,55 @@ class MissingFeatureTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+@unittest.skipIf('langevin' not in AVAILABLE_MODELS,
+                 'the langevin magnetization model is not compiled in this espresso build')
+class MagnetizationRegimeTest(BaseTestCase):
+    """Pins the measured usable window documented in magnetodynamics.py.
+
+    The window exists because the models take one fixed-point iterate per timestep,
+    so the moments only reach their self-consistent value where the map contracts.
+    These two points anchor opposite sides of it; if either moves, the documented
+    table and tools/magnetization_regime_sweep.py need re-measuring.
+    """
+
+    PROBE_FIELD = 0.01
+
+    def _settled_chain(self, chi0, n_particles=6):
+        from espressomd.magnetostatics import DipolarDirectSum
+        spacing = 2.0 ** (1.0 / 6.0)
+        cfg = PointDipoleMagnetizable.config.specify(
+            magnetization_model='langevin', dipm_sat=1., mag_susc_0=chi0,
+            espresso_handle=sim_inst.sys)
+        objs = [PointDipoleMagnetizable(config=cfg) for _ in range(n_particles)]
+        sim_inst.store_objects(objs)
+        centre = 0.5 * sim_inst.sys.box_l[2] - 0.5 * spacing * (n_particles - 1)
+        mid = 0.5 * sim_inst.sys.box_l[0]
+        sim_inst.place_objects(
+            objs,
+            [np.array([mid, mid, centre + i * spacing]) for i in range(n_particles)],
+            [np.array([0., 0., 1.]) for _ in range(n_particles)])
+        sim_inst.init_magnetic_inter(DipolarDirectSum(prefactor=1.0))
+        sim_inst.set_H_ext(H=(0, 0, self.PROBE_FIELD))
+        virt = [p for o in objs for p in o.get_owned_part()[0]
+                if int(p.type) == PointDipoleMagnetizable.part_types['pdm_virt']]
+        ratios = sim_inst.probe_magnetization_convergence(virt, n_iter=40)
+        moment = float(np.mean([float(np.linalg.norm(p.dip)) for p in virt]))
+        return (float(ratios[-1]) if len(ratios) else 0.0), moment
+
+    def tearDown(self):
+        self.cleanup()
+        super().tearDown()
+
+    def test_in_window_chi0_converges_without_saturating(self):
+        """chi0=0.1 is inside the window: contracts, and barely magnetised."""
+        ratio, moment = self._settled_chain(0.1)
+        self.assertLess(ratio, 1.0, msg="in-window point must contract")
+        self.assertLess(moment, 0.5, msg="in-window point must not be saturated")
+
+    def test_out_of_window_chi0_is_saturated_despite_a_small_ratio(self):
+        """chi0=1.0 is outside it, and shows exactly the documented false positive.
+        """
+        _, moment = self._settled_chain(1.0)
+        self.assertGreater(moment, 0.5,
+                           msg="but the moments are saturated, so that ratio is meaningless")

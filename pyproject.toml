@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pressomancy"
+version = "0.1.0"
+description = "Simulation package wrapping Espresso objects"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Deniz Mostarac", email = "deniz.mostarac@uniroma1.it" },
+    { name = "Júlio P. A. Santos", email = "julio.palma.de.assuncao.santos@univie.ac.at" },
+]
+# Python floor is set by real usage in the codebase, not an arbitrary choice.
+# Support for oldest version still maintained by python (see https://devguide.python.org/versions/)
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    # numpy >=2.0 is only needed for np.bool (instead of np.bool_)
+    # Kept as it is generally a good thing to use the newer version
+    "numpy>=2.0",
+    # h5py's own API floor is 2.10 (`string_dtype`), but h5py 3.0 changed how
+    # string data reads back and only 3.x has ever been exercised here.
+    "h5py>=3.0",
+]
+# NOTE: `espressomd` (ESPResSo) is a required runtime dependency but is
+# deliberately NOT listed here: it is not pip-installable. It must be built
+# from source (see README's Installation section) and made available on
+# PYTHONPATH, typically by invoking scripts through ESPResSo's `pypresso`
+# launcher rather than a plain `python`/`pip`-installed interpreter.
+
+[project.urls]
+Homepage = "https://github.com/stekajack/pressomancy"
+Documentation = "https://stekajack.github.io/pressomancy/"
+
+[tool.setuptools.packages.find]
+exclude = ["test", "test.*", "samples", "samples.*", "tools", "tools.*"]
+
+[tool.setuptools.package-data]
+pressomancy = ["resources/*.txt", "resources/*.py"]
