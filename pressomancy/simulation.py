@@ -624,52 +624,53 @@ class Simulation():
         """
         try:
             part_types_group = h5_file["parameters/pressomancy/part_types"]
-        except KeyError:
-            part_types_group = None
 
-        if part_types_group is not None:
+        except KeyError:
+            observed_numeric_types = set()
+            for grp_typ in group_type:
+                data_view = H5DataSelector(h5_file, particle_group=grp_typ.__name__)
+                observed_numeric_types.update(
+                    int(val) for val in np.unique(data_view.timestep[-1].type)
+                )
+
+            object_names = set()
+            connectivity_root = h5_file.get("connectivity")
+            for particle_group in connectivity_root.values():
+                for dataset_name in particle_group.keys():
+                    if not dataset_name.startswith("ParticleHandle_to_"):
+                        continue
+                    object_names.add(dataset_name.removeprefix("ParticleHandle_to_"))
+
+            recovered = {}
+            unmatched = []
+            for numeric_type in sorted(observed_numeric_types):
+                matched_key = None
+                for object_name in sorted(object_names):
+                    object_cls = globals().get(object_name)
+                    for key, value in object_cls.part_types.items():
+                        if value == numeric_type:
+                            matched_key = key
+                            self.part_types.update({key: int(value)})
+                            break
+                    if matched_key is not None:
+                        recovered[matched_key] = numeric_type
+                        break
+                if matched_key is None:
+                    unmatched.append(numeric_type)
+
+            if recovered or unmatched:
+                logging.warning(
+                    "Recovered part types from H5 fallback. Matched=%s Unmatched numeric types=%s",
+                    recovered,
+                    unmatched,
+                )
+
+        else:
             for key, value in part_types_group.attrs.items():
                 self.part_types.update({key: int(value)})
-            return
 
-        observed_numeric_types = set()
-        for grp_typ in group_type:
-            data_view = H5DataSelector(h5_file, particle_group=grp_typ.__name__)
-            observed_numeric_types.update(
-                int(val) for val in np.unique(data_view.timestep[-1].type)
-            )
-
-        object_names = set()
-        connectivity_root = h5_file.get("connectivity")
-        for particle_group in connectivity_root.values():
-            for dataset_name in particle_group.keys():
-                if not dataset_name.startswith("ParticleHandle_to_"):
-                    continue
-                object_names.add(dataset_name.removeprefix("ParticleHandle_to_"))
-
-        recovered = {}
-        unmatched = []
-        for numeric_type in sorted(observed_numeric_types):
-            matched_key = None
-            for object_name in sorted(object_names):
-                object_cls = globals().get(object_name)
-                for key, value in object_cls.part_types.items():
-                    if value == numeric_type:
-                        matched_key = key
-                        self.part_types.update({key: int(value)})
-                        break
-                if matched_key is not None:
-                    recovered[matched_key] = numeric_type
-                    break
-            if matched_key is None:
-                unmatched.append(numeric_type)
-
-        if recovered or unmatched:
-            logging.warning(
-                "Recovered part types from H5 fallback. Matched=%s Unmatched numeric types=%s",
-                recovered,
-                unmatched,
-            )
+        if not any(isinstance(value, (int, np.integer)) for value in self.part_types.values()):
+            raise RuntimeError("LOAD_NEW could not restore any particle-type aliases from HDF5.")
 
     def _inscribe_h5_stream(self, mode, force_resize_to_size, setup, new_kernel,load_new_kernel, load_kernel, resize_kernel):
         """Run the shared HDF5 inscription mode and resize lifecycle."""
@@ -939,9 +940,9 @@ class Simulation():
             - 'NEW' : create a fresh observable structure when opening a file.
             - 'LOAD': reopen existing observable datasets and validate them
               against `observable_defs`.
-            - 'LOAD_NEW': same observable behavior as 'LOAD'; the file is the
-              source of the saved frame count, while `observable_defs` supplies
-              the live value references for future writes.
+            - 'LOAD_NEW': restore particle-type aliases from HDF5 metadata, then
+              perform the same observable loading as 'LOAD'; `observable_defs`
+              supplies the live value references for future writes.
             - 'INIT_SRC': create a new observable structure, matching the
               shared HDF5 inscription lifecycle.
         force_resize_to_size : int or None, optional
@@ -964,6 +965,9 @@ class Simulation():
             observable is missing in load modes, if its stored shape does not
             match the requested shape, or if registered observables have
             mismatched saved step counts.
+        RuntimeError
+            If 'LOAD_NEW' cannot restore or otherwise find any valid integer
+            particle-type aliases.
         AssertionError
             If `force_resize_to_size` is used outside load modes, is not an
             integer, or exceeds the number of saved frames.
@@ -1002,7 +1006,6 @@ class Simulation():
                     raise ValueError("h5_data_path must be provided when no HDF5 file is currently open.")
                 file_mode = "w" if mode in ('NEW', 'INIT_SRC') else "a"
                 self.io_dict['h5_file'] = h5py.File(h5_data_path, file_mode)
-
 
         normalised_defs = []
 
@@ -1043,6 +1046,10 @@ class Simulation():
                 raise ValueError(f"Inconsistent step counts across observables: {candidate_lens}")
             return candidate_lens[0]
 
+        def load_new_kernel():
+            self._restore_part_types_from_metadata(self.io_dict['h5_file'],[])
+            return load_kernel()
+
         def resize_kernel(force_resize_to_size):
             observables_group = self.io_dict['h5_file'].require_group("observables")
             for name, _, _, _ in normalised_defs:
@@ -1053,7 +1060,7 @@ class Simulation():
                 step_dataset.resize((force_resize_to_size,))
                 time_dataset.resize((force_resize_to_size,))
                 value_dataset.resize((force_resize_to_size, *value_dataset.shape[1:]))
-        GLOBAL_COUNTER = self._inscribe_h5_stream(mode, force_resize_to_size, setup, new_kernel, load_kernel, load_kernel, resize_kernel)
+        GLOBAL_COUNTER = self._inscribe_h5_stream(mode, force_resize_to_size, setup, new_kernel, load_new_kernel, load_kernel, resize_kernel)
         return GLOBAL_COUNTER
 
     def write_part_group_to_h5(self, time_step=None):

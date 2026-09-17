@@ -328,11 +328,15 @@ class CommonH5DataSelectorTests:
                             err_msg=f"{mode} flat_part_view for {group_name} does not match live object order.",
                         )
                     if hasattr(self, "observable_name"):
+                        if mode == "LOAD_NEW":
+                            sim_inst.part_types.clear()
                         observable_counter = sim_inst.inscribe_observable_group_to_h5(
                             observable_defs=[(self.observable_name, self.observable_value.shape, self.observable_value.dtype, self.observable_value)],
                             h5_data_path=h5_filename,
                             mode=mode,
                         )
+                        if mode == "LOAD_NEW":
+                            self.assertEqual(dict(sim_inst.part_types), saved_part_types)
                         self.assertEqual(observable_counter, len(self.written_steps))
                         registered = sim_inst.io_dict['registered_observables']
                         self.assertIn(self.observable_name, registered)
