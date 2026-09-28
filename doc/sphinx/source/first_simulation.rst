@@ -5,7 +5,7 @@ The quickest way to understand pressomancy is to run through one complete
 cycle. Create a :class:`~pressomancy.simulation.Simulation`, instantiate one
 object family, store it, place it in the box, run a little dynamics, write
 one HDF5 frame, and inspect that frame with
-:class:`~pressomancy.analysis.data_analysis.H5DataSelector`. This chapter
+:class:`~pressomancy.io.read.H5DataSelector`. This chapter
 keeps the scientific model deliberately simple so that the workflow itself is
 easy to see. The same sequence later scales to more structured top-level
 objects.
@@ -31,7 +31,7 @@ Minimal Example
    import numpy as np
    from pressomancy.simulation import Simulation
    from pressomancy.object_classes.part_class import GenericPart
-   from pressomancy.analysis import H5DataSelector
+   from pressomancy.io import H5DataSelector
 
    box_dim = np.array([40.0, 40.0, 40.0])
 
@@ -61,7 +61,7 @@ Minimal Example
 
        for _ in range(10):
            sim.sys.integrator.run(10)
-           sim.write_part_group_to_h5(time_step=step_index)
+           sim.write_part_group_to_h5(step=step_index)
            step_index += 1
 
        data = H5DataSelector(sim.io_dict["h5_file"], particle_group="GenericPart")
@@ -89,7 +89,7 @@ the simulation manager need to agree on.
 
 Particle creation begins when you call
 :meth:`~pressomancy.simulation.Simulation.set_objects`. The simulation first
-uses :func:`~pressomancy.helper_functions.partition_cuboid_volume` to generate
+uses :func:`~pressomancy.geometry.partition_cuboid_volume` to generate
 candidate regions in the box. That helper uses an FCC lattice as a dense and
 regular scaffold for placement. For each chosen region, the simulation calls
 the object's ``build_function`` to obtain the local pattern appropriate for

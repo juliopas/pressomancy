@@ -1,34 +1,36 @@
 '''
-Grab-bag of core infrastructure shared across pressomancy.
+Geometry, lattice and box helpers used to build and inspect configurations.
 
-Covers the ``ManagedSimulation`` singleton decorator; the
-``MissingFeature``/``SimulationExistsException`` exceptions; guarded
-container types (``SinglePairDict``, ``PartDictSafe``); ``RoutineWithArgs``;
-geometry/lattice generation (``fcc_lattice``, ``partition_cuboid_volume``,
-``partition_cubic_volume_oriented_rectangles``); a from-scratch cell-list
-neighbor search (``get_neighbours``, ``get_neighbours_cross_lattice``); vector
-math (``align_vectors``, ``get_perpendicular``, ``normalize_vectors``,
-``min_img_dist``); box-wall helpers (``add_box_constraints_func``/
-``remove_box_constraints_func``); ``api_agnostic_feature_check`` for
-ESPResSo v4/v5-agnostic feature detection; ``BondWrapper``; and git
-provenance helpers (``get_repo_context``, ``get_submission_creator_info``).
+Covers lattice/volume generation (``fcc_lattice``, ``partition_cuboid_volume``,
+``partition_cubic_volume_oriented_rectangles``,
+``make_centered_rand_orient_point_array``);
+a from-scratch cell-list neighbour search (``get_neighbours``,
+``get_neighbours_cross_lattice``, ``calculate_pair_distances``,
+``get_cross_lattice_nonintersecting_volumes``);
+vector math (``align_vectors``, ``get_perpendicular``, ``normalize_vectors``,
+``generate_random_unit_vectors``, ``random_nested_3d_vectors_like``,
+``get_orientation_vec``, ``fold_coords``, ``min_img_dist``);
+and the box helpers (``add_box_constraints_func``/``remove_box_constraints_func``,
+``check_free_cuboid``, ``require_min_global_cut``).
 '''
-import numpy as np
-from itertools import product
-from collections import defaultdict
-import inspect
 import logging
 import warnings
-import espressomd.version
-import sys as sysos
-import h5py
-import warnings
-import subprocess
-from pathlib import Path
+from collections import defaultdict
 
+import numpy as np
 from numpy.typing import ArrayLike
 
-#: Soft cap on the transient candidate buffers inside the cell-list neighbour
+import espressomd.constraints
+import espressomd.shapes
+
+from pressomancy.infra import RoutineWithArgs
+
+#: Ratio between the WCA/Lennard-Jones contact distance and sigma: the minimum
+#: of the LJ well. Objects are parameterised by their contact
+#: ("size") diameter, so the sigma that reproduces a wanted size is
+#: ``size / WCA_CONTACT_FACTOR``.
+WCA_CONTACT_FACTOR = 2 ** (1 / 6)
+
 #: search, in bytes.
 #: 8 MiB, tuned against dense elastomers where the previous unbounded buffers
 #: exhausted memory. Raising it trades memory for fewer chunk iterations;
@@ -39,722 +41,11 @@ DEFAULT_MAX_CANDIDATE_BYTES = 8 << 20
 #: giving up on placing it without overlapping its neighbours.
 MAX_PLACEMENT_ATTEMPTS = 1000
 
-class MissingFeature(Exception):
-    pass
-
-class ManagedSimulation:
-    """
-    A decorator class to manage a singleton instance of a simulation object.
-
-    The `ManagedSimulation` class enforces that only one instance of a decorated simulation class can exist at a time. It provides methods to initialize, reinitialize, and manage the instance, while maintaining a shared `espressomd.System` object. This class is especially useful for simulations where global state must be consistent across multiple components.
-
-    Attributes
-    ----------
-    aClass : type
-        The class being decorated and managed as a singleton.
-    instance : object, optional
-        The single instance of the decorated class. Initially set to `None`.
-    init_args : tuple
-        Arguments used during the initialization of the decorated class.
-    init_kwargs : dict
-        Keyword arguments used during the initialization of the decorated class.
-    _espressomd_system : espressomd.System
-        The shared ESPResSo system object, initialized during the first instantiation.
-    __name__ : str
-        The name of the singleton instance, including the decorated class name.
-    __qualname__ : str
-        The qualified name of the singleton instance, including the decorated class's qualified name.
-
-    Methods
-    -------
-    __call__(*args, **kwargs):
-        Creates and initializes the singleton instance, or raises an exception if it already exists.
-    reinitialize_instance():
-        Recreates the instance while preserving the shared ESPResSo system object and resets the system state.
-    __getattr__(name):
-        Forwards attribute access to the instance, raising an error if the instance is uninitialized.
-    """
-
-    # Internal attributes that belong to ManagedSimulation itself
-    internal_attrs = {"aClass", "instance", "init_args", "init_kwargs", "_espressomd_system", "__name__", "__qualname__"}
-
-    def __init__(self, aClass):
-        """
-        Initializes the ManagedSimulation decorator.
-
-        Parameters
-        ----------
-        aClass : type
-            The class to be decorated and managed as a singleton.
-        """
-        self.aClass = aClass
-        setattr(aClass, 'reinitialize_instance', self.reinitialize_instance)
-        self.instance = None
-        self.init_args = ()
-        self.init_kwargs = {}
-        self._espressomd_system = None  # Shared espressomd.System instance
-        self.__name__ = f"Singleton({aClass.__name__})"
-        self.__qualname__ = f"Singleton({aClass.__qualname__})"
-
-    def __call__(self, *args, **kwargs):
-        """
-        Creates and initializes the singleton instance, or raises an exception if it already exists.
-
-        If the instance does not exist, initializes the shared ESPResSo system object and the decorated class.
-        If the instance already exists, raises a `SimulationExistsException`.
-
-        Parameters
-        ----------
-        *args : tuple
-            Positional arguments for the decorated class constructor.
-        **kwargs : dict
-            Keyword arguments for the decorated class constructor. Includes optional `box_dim` to specify the
-            simulation box dimensions.
-
-        Returns
-        -------
-        ManagedSimulation
-            The ManagedSimulation instance (not the decorated class instance).
-
-        Raises
-        ------
-        SimulationExistsException
-            If an instance of the decorated class already exists.
-        """
-        if self.instance is None:
-            # Initialize the ESPResSo system object
-            if self._espressomd_system is None:
-                box_dim = kwargs.get('box_dim', [10, 10, 10])  # Default box dimensions
-                self._espressomd_system = self.aClass._sys(box_l=box_dim)
-
-            # Instantiate the decorated class and set its system attribute
-            self.instance = self.aClass(*args, **kwargs)
-            self.instance.sys = self._espressomd_system
-            # Back-reference so Simulation.rebind_sys can keep the cached handle
-            # here in step after a checkpoint load.
-            self.instance._manager = self
-            self.init_args = args
-            self.init_kwargs = kwargs
-        else:
-            # Raise exception if a second instance is attempted
-            frame = inspect.currentframe().f_back
-            raise SimulationExistsException(
-                f"An instance of {self.aClass.__name__} already exists at {frame.f_code.co_filename}, line {frame.f_lineno}"
-            )
-        return self  # Return the ManagedSimulation instance
-
-    def reinitialize_instance(self):
-        """
-        Recreates the singleton instance without affecting the shared ESPResSo system object.
-
-        This method resets the decorated class instance while preserving the ESPResSo system object.
-        It releases registered simulation objects and clears particles,
-        interactions, and thermostat settings in the system, ensuring a clean state.
-        """
-        if self.instance is not None:
-            for obj in self.instance.objects:
-                obj.delete_owned_parts()
-            self.instance.objects = []
-            self.instance.no_objects = 0
-            self.instance.part_types.clear()
-            self.instance.part_positions = []
-            self.instance.volume_centers = []
-            self.instance.volume_size = None
-            self.instance.partitioned = None
-            self.instance = self.aClass(*self.init_args, **self.init_kwargs)
-            self.instance.sys = self._espressomd_system
-            # Back-reference so Simulation.rebind_sys can keep the cached handle
-            # here in step after a checkpoint load.
-            self.instance._manager = self
-            self.instance.sys.part.clear()
-            self.instance.sys.non_bonded_inter.reset()
-            self.instance.sys.bonded_inter.clear()
-            self.instance.sys.constraints.clear()
-            self.instance.sys.thermostat.turn_off()
-            self.instance.sys.integrator.set_vv()
-            if espressomd.version.major() == 4:
-                self.instance.sys.actors.clear()
-            else:
-                self.instance.sys.lb = None
-                self.instance.sys.magnetostatics.clear()
-            self.instance.sys.periodicity = (True, True, True)
-            self.instance.sys.time = 0.
-
-
-    def __getattr__(self, name):
-        """
-        Forwards attribute access to the singleton instance.
-
-        Parameters
-        ----------
-        name : str
-            The name of the attribute to access.
-
-        Returns
-        -------
-        object
-            The requested attribute from the instance.
-
-        Raises
-        ------
-        AttributeError
-            If the singleton instance has not been initialized.
-        """
-        if self.instance is None:
-            raise AttributeError(f"Instance of {self.aClass.__name__} has not been initialized.")
-        return getattr(self.instance, name)
-
-    def __setattr__(self, name, value):
-        """
-        Forwards attribute setting to the singleton instance.
-        Does not forward attributes intended for ManagedSimulation, as defined in the self.internal_attrs set.
-
-        Parameters
-        ----------
-        name : str
-            The name of the attribute to set.
-        value :
-            Value to set the attribute to.
-
-        Raises
-        ------
-        AttributeError
-            If the singleton instance has not been initialized.
-        """
-        if name in self.internal_attrs:
-            object.__setattr__(self, name, value)
-        elif self.instance is None:
-            raise AttributeError(f"Instance of {self.aClass.__name__} has not been initialized.")
-        else:
-            # Forward to Simulation instance
-            setattr(self.instance, name, value)
-
-    def __dir__(self):
-        """
-        Returns the list of attributes for the singleton instance and the ManagedSimulation class.
-
-        This method combines the attributes of the singleton instance (if initialized) and the class itself,
-        allowing for introspection of both the wrapped object's methods and the management-related methods
-        provided by the decorator.
-
-        Returns
-        -------
-        list
-            A list of attribute names for the singleton instance and the ManagedSimulation class, including
-            all attributes of both.
-
-        Notes
-        -----
-        - This method is useful for introspection or debugging, providing a full list of methods and attributes
-        available for the object managed by the decorator.
-        - The singleton instance's attributes will be included in the result if it has been initialized; otherwise,
-        only the `ManagedSimulation` class attributes will be returned.
-        """
-        if self.instance is not None:
-            return dir(self.instance)  # Return attributes of the original class
-        return dir(type(self))  # Return attributes of the decorator itself
-
-
-class SimulationExistsException(Exception):
-    def __init__(self, message):
-        super().__init__(message)
-
-class SinglePairDict(dict):
-    """
-    A dictionary wrapper that enforces unique key-value pairs across all instances.
-
-    The `SinglePairDict` class ensures that each key and value are unique globally across all instances of the class.
-    The dictionary is immutable after initialization, preventing modification or deletion of the stored key-value pair.
-
-    Attributes
-    ----------
-    _global_registry : dict
-        A class-level dictionary that tracks all key-value pairs globally across instances.
-
-    Methods
-    -------
-    get_all_pairs():
-        Returns a copy of the globally registered key-value pairs across all instances.
-
-    Properties
-    ----------
-    key : object
-        The single key stored in the dictionary.
-    value : object
-        The single value stored in the dictionary.
-
-    Examples
-    --------
-    Creating a new `SinglePairDict`:
-    >>> spd1 = SinglePairDict('key1', 'value1')
-    >>> spd1.key
-    'key1'
-    >>> spd1.value
-    'value1'
-
-    Attempting to reuse an existing key or value:
-    >>> spd2 = SinglePairDict('key1', 'value2')
-    ValueError: Key 'key1' already exists in another instance.
-
-    Retrieving all globally registered pairs:
-    >>> SinglePairDict.get_all_pairs()
-    {'key1': 'value1'}
-    """
-
-    # Class-level dictionary to track all unique key-value pairs across instances
-    _global_registry = {}
-    # Class-level dictionary tracking which instance (by id()) registered each key.
-    _registry_owners = {}
-
-    def __init__(self, key, value):
-        """
-        Initializes the dictionary with a single key-value pair.
-
-        Parameters
-        ----------
-        key : object
-            The key to store in the dictionary. Must be globally unique.
-        value : object
-            The value to store in the dictionary. Must be globally unique.
-
-        Raises
-        ------
-        ValueError
-            If the key or value already exists in another instance.
-        """
-        # Enforce global uniqueness for key and value
-        if key in SinglePairDict._global_registry:
-            raise ValueError(f"Key '{key}' already exists in another instance.")
-        if value in SinglePairDict._global_registry.values():
-            raise ValueError(f"Value '{value}' already exists in another instance.")
-
-        # Initialize as a single-item dictionary
-        super().__init__({key: value})
-
-        # Register the key-value pair globally, and record that *this* instance is
-        # the one that owns the registration (see __del__).
-        SinglePairDict._global_registry[key] = value
-        SinglePairDict._registry_owners[key] = id(self)
-
-    def __setitem__(self, key, value):
-        """
-        Overrides the default method to prevent modification of the dictionary.
-
-        Raises
-        ------
-        TypeError
-            Always raised because item assignment is not supported.
-        """
-        raise TypeError("SinglePairDict does not support item assignment after initialization.")
-
-    def __delitem__(self, key):
-        """
-        Overrides the default method to prevent deletion from the dictionary.
-
-        Raises
-        ------
-        TypeError
-            Always raised because item deletion is not supported.
-        """
-        raise TypeError("SinglePairDict does not support item deletion.")
-
-    # Guard against dict functions that could set/remove entries
-    def update(self, *args, **kwargs):
-        raise TypeError("SinglePairDict does not support update after initialization.")
-
-    def setdefault(self, *args, **kwargs):
-        raise TypeError("SinglePairDict does not support setdefault after initialization.")
-
-    def pop(self, *args, **kwargs):
-        raise TypeError("SinglePairDict does not support item deletion.")
-
-    def popitem(self):
-        raise TypeError("SinglePairDict does not support item deletion.")
-
-    def clear(self):
-        raise TypeError("SinglePairDict does not support item deletion.")
-
-    @classmethod
-    def unregister(cls, key):
-        """
-        Drop `key` from the global registry, freeing it for reuse.
-        """
-        cls._global_registry.pop(key, None)
-        cls._registry_owners.pop(key, None)
-
-    def __del__(self):
-        try:
-            key = next(iter(dict.keys(self)))
-            registry = getattr(SinglePairDict, "_global_registry", None)
-            owners = getattr(SinglePairDict, "_registry_owners", None)
-            if registry is None or owners is None:
-                return
-            if owners.get(key) == id(self):
-                registry.pop(key, None)
-                owners.pop(key, None)
-        except (StopIteration, RuntimeError):
-            return
-
-    @property
-    def key(self):
-        """
-        Retrieves the single key stored in the dictionary.
-
-        Returns
-        -------
-        object
-            The single key stored in the dictionary.
-        """
-        return next(iter(self.keys()))
-
-    @property
-    def value(self):
-        """
-        Retrieves the single value stored in the dictionary.
-
-        Returns
-        -------
-        object
-            The single value stored in the dictionary.
-        """
-        return next(iter(self.values()))
-
-    @classmethod
-    def get_all_pairs(cls):
-        """
-        Returns all globally registered key-value pairs across instances.
-
-        Returns
-        -------
-        dict
-            A copy of the globally registered key-value pairs.
-        """
-        return cls._global_registry.copy()
-
-    def __repr__(self):
-        """
-        Returns a string representation of the dictionary.
-
-        Returns
-        -------
-        str
-            A string representation in the format `SinglePairDict(key: value)`.
-        """
-        return f"SinglePairDict({self.key!r}: {self.value!r})"
-
-class PartDictSafe(dict):
-    """
-    A safe dictionary wrapper to enforce consistency and uniqueness of keys and values.
-
-    `PartDictSafe` ensures that:
-    - Keys are unique and cannot be reassigned once set.
-    - Values are unique and cannot be associated with multiple keys.
-    - A default value is provided for missing keys using a customizable default factory.
-
-    This is especially useful for managing mappings where both the keys and values must remain consistent,
-    such as particle types and their properties in simulations.
-
-    Attributes
-    ----------
-    default_factory : callable
-        A function that returns the default value for missing keys. Defaults to `list`.
-
-    Methods
-    -------
-    sanity_check(key, value):
-        Validates that the key and value do not violate uniqueness constraints.
-    set_default_factory(factory):
-        Updates the default factory used to generate default values for missing keys.
-    __setitem__(key, value):
-        Sets a key-value pair in the dictionary after passing a sanity check.
-    update(*args, **kwargs):
-        Updates the dictionary with key-value pairs from another dictionary or iterable, enforcing sanity checks.
-    __getitem__(key):
-        Retrieves the value for a key, initializing it with the default value if the key does not exist.
-    """
-
-    def __init__(self, *args, default_factory=list, **kwargs):
-        """
-        Initializes the dictionary with optional initial data and a default factory.
-
-        `default_factory=None` makes the mapping strict: a missing key raises
-        `KeyError` rather than being auto-created. Use it for value types where
-        the factory's output is not a meaningful value, such as integer type ids.
-
-        Parameters
-        ----------
-        *args : tuple
-            Positional arguments passed to the `dict` constructor.
-        **kwargs : dict
-            Keyword arguments passed to the `dict` constructor.
-
-        Raises
-        ------
-        RuntimeError
-            If the initial data violates the uniqueness constraints.
-        """
-        if len(args) > 1:
-            raise TypeError(
-                f"PartDictSafe expected at most 1 positional argument, got {len(args)}"
-            )
-        self.default_factory = default_factory
-        super().__init__()
-        self.update(*args, **kwargs)
-
-    def sanity_check(self, key, value):
-        """
-        Ensures the key and value do not violate uniqueness constraints.
-
-        Parameters
-        ----------
-        key : object
-            The key to validate.
-        value : object
-            The value to validate.
-
-        Raises
-        ------
-        RuntimeError
-            If the key already exists with a different value or the value is already associated with another key.
-        """
-        if self.default_factory is not None and value == self.default_factory():
-            return
-        current_value = self.get(key)
-        if current_value == value:
-            return
-
-        if current_value is not None:
-            raise RuntimeError(
-                f"Key '{key}' already exists in `part_types` with a different value '{current_value}'. "
-                f"Attempted to reset it to '{value}', which is not allowed."
-            )
-
-        if value in self.values():
-            existing_key = next(k for k, v in self.items() if v == value)
-            raise RuntimeError(
-                f"Value '{value}' is already associated with key '{existing_key}' in `part_types`. "
-                f"New entries must have unique values: {key}"
-            )
-
-    def __setitem__(self, key, value):
-        """
-        Sets a key-value pair in the dictionary after validating with a sanity check.
-
-        Parameters
-        ----------
-        key : object
-            The key to add or update.
-        value : object
-            The value to associate with the key.
-
-        Raises
-        ------
-        RuntimeError
-            If the key or value violates the uniqueness constraints.
-        """
-        self.sanity_check(key, value)
-        super().__setitem__(key, value)
-
-    def update(self, *args, **kwargs):
-        """
-        Updates the dictionary with key-value pairs from another dictionary or iterable.
-
-        Parameters
-        ----------
-        *args : tuple
-            Positional arguments passed to the `dict.update` method.
-        **kwargs : dict
-            Keyword arguments passed to the `dict.update` method.
-
-        Raises
-        ------
-        RuntimeError
-            If any key-value pair violates the uniqueness constraints.
-        """
-        if args:
-            iterable = args[0]
-            for key, value in (iterable.items() if isinstance(iterable, dict) else iterable):
-                self.sanity_check(key, value)
-                super().__setitem__(key, value)
-
-        for key, value in kwargs.items():
-            self.sanity_check(key, value)
-            super().__setitem__(key, value)
-
-    def __getitem__(self, key):
-        """
-        Retrieves the value for a key, initializing it with the default value if the key does not exist.
-
-        A missing key is auto-created only when a `default_factory` is set, which
-        is the case for the list-valued `type_part_dict` bookkeeping: asking an
-        object for a particle type it did not build returns an empty list, and
-        iterating over it is a harmless no-op.
-
-        With `default_factory=None` -- used for `Simulation.part_types`, whose
-        values are integer espresso type ids -- a missing key raises `KeyError`
-        instead. An empty list is not a meaningful type id, and silently
-        inserting one turns a mistyped type name into a corrupt entry that later
-        reaches espresso as `non_bonded_inter[[], []]`.
-
-        Parameters
-        ----------
-        key : object
-            The key to retrieve.
-
-        Returns
-        -------
-        object
-            The value associated with the key, or the default value if the key
-            does not exist and a default factory is set.
-
-        Raises
-        ------
-        KeyError
-            If the key is absent and no default factory is set.
-        """
-        if key not in self:
-            if self.default_factory is None:
-                raise KeyError(
-                    f"'{key}' is not a known entry. Known entries: {sorted(self.keys())}."
-                )
-            self[key] = self.default_factory()
-        return super().__getitem__(key)
-
-    # guard against dict functions that could set/remove entries
-    def setdefault(self, key, default=None):
-        """
-        Insert `key` with `default` if absent, validating like `__setitem__`.
-        """
-        if key not in self:
-            self[key] = default
-        return super().__getitem__(key)
-
-    def set_default_factory(self, factory):
-        """
-        Updates the default factory used to generate default values for missing keys.
-
-        Parameters
-        ----------
-        factory : callable
-            A function that returns the new default value for missing keys.
-        """
-        self.default_factory = factory
-
-    def key_for(self, value):
-        """
-        Return the key(s) mapping to `value`.
-
-        `value` may be a scalar or an array-like of values; the returned list holds
-        the key found for each of them, in order.
-
-        Raises:
-            KeyError:   if no key maps to one of the requested values.
-        """
-        rek_keys = []
-        for val in np.atleast_1d(value):
-            matches = [k for k, v in self.items() if v == val]
-            if not matches:
-                raise KeyError(f"No key found for value {val}")
-            rek_keys.extend(matches)
-
-        return rek_keys
-
-class RoutineWithArgs:
-    """
-    A wrapper class to manage callable routines with configurable arguments.
-
-    The `RoutineWithArgs` class provides a way to encapsulate a callable function,
-    allowing it to be called with predefined arguments. If no function is provided
-    during initialization, a default routine (`generic_routine_per_volume`) is used.
-
-    Attributes
-    ----------
-    func : callable
-        The function to be called. Defaults to `generic_routine_per_volume`.
-    num_monomers : int
-        The number of monomers or items to process within the routine.
-
-    Methods
-    -------
-    __call__(**kwargs)
-        Invokes the encapsulated function with the provided keyword arguments.
-    generic_routine_per_volume(**kwargs)
-        A default routine to generate points within a spherical volume. Must be
-        implemented by subclasses or overridden.
-    """
-
-    def __init__(self, func=None, num_monomers=1, monomer_size=1., spacing=None):
-        """
-        Initializes the RoutineWithArgs instance.
-
-        Parameters
-        ----------
-        func : callable, optional
-            The function to encapsulate. If not provided, `generic_routine_per_volume` is used.
-        num_monomers : int, optional
-            The number of monomers or items to process. Defaults to 1.
-            partition_cuboid_volume only runs the routine when this exceeds 1; otherwise
-            it just places one point at each volume centre.
-        monomer_size : float, optional
-            Diameter of a single monomer, used by partition_cuboid_volume as the minimum
-            allowed separation when rejecting overlapping placements. Defaults to 1.0.
-        spacing : float, optional
-            Fixed centre-to-centre distance between consecutive monomers, passed through to
-            the routine. If None, the routine spreads the monomers across the volume radius
-            instead. Defaults to None.
-        """
-        if func is None:
-            self.func = self.generic_routine_per_volume
-        else:
-            self.func = func
-        self.num_monomers = num_monomers
-        self.spacing = spacing
-        self.monomer_size = monomer_size
-
-    def __call__(self, **kwargs):
-        """
-        Invokes the encapsulated function with the provided keyword arguments.
-
-        Parameters
-        ----------
-        **kwargs : dict
-            The arguments to pass to the encapsulated function.
-
-        Returns
-        -------
-        object
-            The result of the encapsulated function call.
-        """
-        return self.func(**kwargs)
-    @staticmethod
-    def generic_routine_per_volume(**kwargs):
-        """
-        A placeholder for a default routine to generate points within a spherical volume.
-
-        This method must be implemented by subclasses or overridden by specific instances.
-
-        Parameters
-        ----------
-        **kwargs : dict
-            The arguments required for the routine.
-
-        Raises
-        ------
-        NotImplementedError
-            If the method is called without being overridden.
-        """
-        raise NotImplementedError("Implement point generation method within a sphere.")
-
 def load_coord_file(file_path):
     '''
-    load coordinates from a text file. the function allways staples a (0,0,0) as the first row!
+    load the comma-separated x,y,z coordinates of a text file, one point per line, as an (N, 3) array.
     '''
-    coordinates = np.zeros((1, 3), dtype=float)
-    with open(file_path, mode='r') as source:
-        for line in source:
-            x, y, z = map(float, line.strip().split(','))
-            coordinates = np.vstack([coordinates, [x, y, z]])
-    return coordinates
+    return np.loadtxt(file_path, delimiter=',', ndmin=2)
 
 def fold_coords(points, box_dim):
     """
@@ -853,14 +144,12 @@ def random_nested_3d_vectors_like(item, rng=None):
     """
     if rng is None:
         rng = np.random.default_rng()
-
     if isinstance(item, (list, tuple)):
         # Check if it is a 3D vector (leaf)
         if len(item) == 3 and all(isinstance(x, (float, int)) for x in item):
             return generate_random_unit_vectors(1, rng=rng).flatten().tolist()
         else:
             return [random_nested_3d_vectors_like(sub, rng) for sub in item]
-
     elif isinstance(item, np.ndarray):
         if item.shape[-1] != 3:
             raise ValueError(f"Expected last dimension to be 3 for 3D vectors, got shape {item.shape}")
@@ -870,7 +159,6 @@ def random_nested_3d_vectors_like(item, rng=None):
         vectors = vectors.reshape(item.shape)
         # Just to be sure normalize (your function is safe)
         return normalize_vectors(vectors, axis=-1)
-
     else:
         raise ValueError(f"Expected last dimension to be 3 for 3D vectors, got {item}")
 
@@ -906,14 +194,12 @@ def get_neighbours(points: np.ndarray, box_dim: ArrayLike, cutoff: float = 1., s
             "The minimum image convention breaks down above L/2: a particle "
             "would be counted as its own periodic neighbour."
         )
-
     # simple cases (avoid wrappign and building cell)
     n_points = pts.shape[0]
     if n_points == 0:
         return {}
     if n_points == 1:
         return {0: []}
-
     wrapped = np.ascontiguousarray(fold_coords(pts, box_dim))
     i, j = _pairs_from_cells(
         wrapped,
@@ -925,18 +211,18 @@ def get_neighbours(points: np.ndarray, box_dim: ArrayLike, cutoff: float = 1., s
         max_bytes=max_bytes,
         cells_per_cutoff=cells_per_cutoff,
     )
-
     # Mirror the half list into the symmetric form.
     rows = np.concatenate([i, j])
     cols = np.concatenate([j, i])
     return _pairs_rows_cols_to_dict(rows, cols, n_points, sort=sort)
 
 def get_neighbours_cross_lattice(points_a: np.ndarray, points_b: np.ndarray, box_dim: ArrayLike,
-    cutoff: float = 1.0, sort: bool = True,
-    max_bytes: int = DEFAULT_MAX_CANDIDATE_BYTES, cells_per_cutoff: int | None = None):
-    """Neighbours of each lattice1 point among the lattice2 points. Numpy only.
+        cutoff: float = 1.0, sort: bool = True,
+        max_bytes: int = DEFAULT_MAX_CANDIDATE_BYTES, cells_per_cutoff: int | None = None
+    ):
+    """Neighbours of each points_a point among the points_b points.
 
-    Keys index lattice1, values index lattice2. Nothing is excluded: a
+    Keys index points_a, values index points_b. Nothing is excluded: a
     coincident pair is reported at distance zero. max_bytes and
     cells_per_cutoff behave as in get_neighbours.
     """
@@ -950,14 +236,12 @@ def get_neighbours_cross_lattice(points_a: np.ndarray, points_b: np.ndarray, box
             "The minimum image convention breaks down above L/2: a particle "
             "would be counted as its own periodic neighbour."
         )
-
     n_a = pts_a.shape[0]
     n_b = pts_b.shape[0]
     if n_a == 0:
         return {}
     if n_b == 0:
         return {i: [] for i in range(n_a)}
-
     i, j = _pairs_from_cells(
         np.ascontiguousarray(fold_coords(pts_a, box_dim)),
         np.ascontiguousarray(fold_coords(pts_b, box_dim)),
@@ -971,7 +255,7 @@ def get_neighbours_cross_lattice(points_a: np.ndarray, points_b: np.ndarray, box
     # _pairs_from_cells emits i in ascending order, so grouping is already done.
     return _pairs_rows_cols_to_dict(i, j, n_a, sort=sort)
 
-def calculate_pair_distances(points_a, points_b, box_lengths):
+def calculate_pair_distances(points_a, points_b, box_dim):
     """
     Calculate the pairwise distances between two sets of points under periodic boundary conditions.
 
@@ -981,7 +265,7 @@ def calculate_pair_distances(points_a, points_b, box_lengths):
         An array of points where N is the number of points in the first set.
     points_b : np.array of shape (M, 3)
         An array of points where M is the number of points in the second set.
-    box_lengths : array-like of shape (3,)
+    box_dim : array-like of shape (3,)
         The side lengths of the periodic box.
 
     Returns
@@ -989,21 +273,15 @@ def calculate_pair_distances(points_a, points_b, box_lengths):
     distances : np.ndarray, shape (N*M,)
         1D array of distances between all pairs (a_i, b_j). dist(i,j) = distances[i*M + j]
     """
-    if isinstance(box_lengths, float):
-        box_lengths = box_lengths * np.ones(3)
-    box_lengths = np.asarray(box_lengths)
-    if not (box_lengths.shape == (3,)):
-        raise ValueError("box_lengths must be an array-like of shape (3,)")
-
+    box_dim = _as_box(box_dim)
     # Ensure inputs are numpy arrays
     points_a = np.atleast_2d(points_a)
     points_b = np.atleast_2d(points_b)
-
-    # Pair up every a with every b by broadcasting rather than materialising an
+    # Pair up every `a` with every `b` by broadcasting rather than materialising an
     # explicit N*M index list; the row-major ordering (a-major, b-minor) is the
     # same either way, so dist(i,j) is still distances[i*M + j].
     displacements = min_img_dist(points_a[:, None, :], points_b[None, :, :],
-                                 box_dim=box_lengths)
+                                 box_dim=box_dim)
     return np.linalg.norm(displacements, axis=-1).ravel()
 
 def fcc_lattice(radius: float, box_dim, scaling_factor: float = 1.0,
@@ -1082,7 +360,7 @@ def fcc_lattice(radius: float, box_dim, scaling_factor: float = 1.0,
 
     return points
 
-def make_centered_rand_orient_point_array(center=np.array([0,0,0]), sphere_radius=1., num_monomers=1, spacing=None, box_lengths=None):
+def make_centered_rand_orient_point_array(center=np.array([0,0,0]), sphere_radius=1., num_monomers=1, spacing=None, box_dim=None):
     """
     Creates an array of points centered at a given position with random orientation.This function generates a linear array of points in 3D space, centered at a specified position with random orientation. It also returns the normalized orientation vector of the array.
 
@@ -1096,7 +374,7 @@ def make_centered_rand_orient_point_array(center=np.array([0,0,0]), sphere_radiu
         The number of points to generate
     spacing : float, optional
         If provided, sets fixed spacing between points. The total chain length will be spacing * (num_monomers - 1), and the points will be centered around center.
-    box_lengths : Unused
+    box_dim : Unused
         Accepted for `build_function` signature compatibility.
     Returns
     -------
@@ -1114,8 +392,7 @@ def make_centered_rand_orient_point_array(center=np.array([0,0,0]), sphere_radiu
     The points are then rotated by a random orientation and shifted by 'center'.
 
     The orientation is drawn uniformly on the unit sphere: the azimuth theta is
-    uniform on [0, 2*pi) and cos(phi) -- not phi -- is uniform on [-1, 1].
-    Drawing phi uniformly instead would oversample the poles.
+    uniform on [0, 2*pi) and cos(phi) is uniform on [-1, 1].
     """
 
     if spacing is not None:
@@ -1125,9 +402,6 @@ def make_centered_rand_orient_point_array(center=np.array([0,0,0]), sphere_radiu
         positions = np.linspace(-sphere_radius,
                         sphere_radius, num_monomers + 1)[:-1] + shift
     theta = np.random.uniform(0, 2 * np.pi)
-    # cos(phi) is drawn uniformly, not phi itself: equal slabs in cos(phi) carry
-    # equal area on the sphere, so this is the area-uniform choice. See
-    # generate_random_unit_vectors for the same argument spelled out.
     cos_phi = np.random.uniform(-1, 1)
     sin_phi = np.sqrt(1 - cos_phi * cos_phi)
     x_points = center[0] + positions * sin_phi * np.cos(theta)
@@ -1139,7 +413,7 @@ def make_centered_rand_orient_point_array(center=np.array([0,0,0]), sphere_radiu
     orientation_vectors = np.broadcast_to(orientation_vector, points.shape).copy()
     return orientation_vectors,points
 
-def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_per_volume=RoutineWithArgs(), flag='rand'):
+def partition_cuboid_volume(box_dim, num_spheres, sphere_diameter, routine_per_volume=RoutineWithArgs(), flag='rand'):
     """
     Partitions a cuboid volume into spherical regions and generates points within them.
     This function creates a face-centered cubic (FCC) lattice of spheres within a cuboid volume and optionally
@@ -1147,7 +421,7 @@ def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_p
 
     Parameters
     ----------
-    box_lengths : array-like of shape (3,)
+    box_dim : array-like of shape (3,)
         The side lengths of the cuboid volume.
     num_spheres : int
         The desired number of spherical regions to create.
@@ -1174,16 +448,14 @@ def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_p
         If the box cannot hold `num_spheres` sites even at the minimum packing scale, or if a
         volume's contents cannot be placed without overlap within MAX_PLACEMENT_ATTEMPTS draws.
     """
-    box_lengths = np.asarray(box_lengths)
-    if not (box_lengths.shape == (3,)):
-        raise ValueError("box_lengths must be an array-like of shape (3,)")
+    box_dim =  _as_box(box_dim)
     sphere_radius = sphere_diameter * 0.5
     scaling = 1.0
 
     # Adjust scaling until we have enough sphere centers
     scaling_floor = 0.85
     while True:
-        sphere_centers = fcc_lattice(radius=sphere_radius, box_dim=box_lengths, scaling_factor=scaling, mode="pack")
+        sphere_centers = fcc_lattice(radius=sphere_radius, box_dim=box_dim, scaling_factor=scaling, mode="pack")
         volumes_to_fill=len(sphere_centers)
         logging.info('num_spheres_needed, num_spheres_got: %s', (num_spheres, volumes_to_fill))
         if  volumes_to_fill>= num_spheres:
@@ -1191,7 +463,7 @@ def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_p
         if scaling <= scaling_floor:
             raise ValueError(
                 f"Cannot fit {num_spheres} spheres of diameter {sphere_diameter} into a box of "
-                f"{box_lengths}: only {volumes_to_fill} lattice sites exist at the minimum "
+                f"{box_dim}: only {volumes_to_fill} lattice sites exist at the minimum "
                 f"packing scale ({scaling_floor}). Reduce num_spheres or sphere_diameter, "
                 f"or enlarge the box.")
         scaling = max(scaling - 0.1, scaling_floor)
@@ -1200,7 +472,7 @@ def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_p
     # Center point distribution in box
     min_centers = np.min(sphere_centers, axis=0)
     max_centers = np.max(sphere_centers, axis=0)
-    sphere_centers += box_lengths/2 - (min_centers + max_centers)/2
+    sphere_centers += box_dim/2 - (min_centers + max_centers)/2
 
     # Randomly shuffle the available centers and select the required number of centers
     take_index = np.arange(len(sphere_centers))
@@ -1215,19 +487,19 @@ def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_p
     if routine_per_volume.num_monomers>1:
         grouped_positions = defaultdict(list)
         #grouped_volumes is a dictionary that contains all neighouring lattice sites sphere_diameter
-        grouped_volumes=get_neighbours(sphere_centers,box_dim=box_lengths,cutoff=sphere_diameter)
+        grouped_volumes=get_neighbours(sphere_centers,box_dim=box_dim,cutoff=sphere_diameter)
         for i, center in enumerate(sphere_centers):
             valid_placement = False
             for attempt in range(MAX_PLACEMENT_ATTEMPTS):
                 orientations, points = routine_per_volume(
                     center=center, num_monomers=routine_per_volume.num_monomers, sphere_radius=sphere_radius, spacing=routine_per_volume.spacing,
-                    box_lengths=box_lengths)
+                    box_dim=box_dim)
                 should_proceed = True
 
                 # Check for overlaps with points in neighboring spheres
                 for volume_id in grouped_volumes[i]:
                     if grouped_positions[volume_id]:
-                        distances = calculate_pair_distances(points, grouped_positions[volume_id], box_lengths=box_lengths)
+                        distances = calculate_pair_distances(points, grouped_positions[volume_id], box_dim=box_dim)
                         if np.any(distances <= routine_per_volume.monomer_size):
                             should_proceed = False
                             break
@@ -1251,7 +523,7 @@ def partition_cuboid_volume(box_lengths, num_spheres, sphere_diameter, routine_p
         res_orientations=generate_random_unit_vectors(len(sphere_centers))
     return sphere_centers, np.asarray(results), np.asarray(res_orientations)
 
-def partition_cubic_volume_oriented_rectangles(big_box_dim, num_spheres, small_box_dim, num_monomers):
+def partition_cubic_volume_oriented_rectangles(box_dim, num_spheres, small_box_dim, num_monomers):
     """
     Partition a cubic volume into smaller rectangular regions and generate oriented points within each region.
 
@@ -1261,7 +533,7 @@ def partition_cubic_volume_oriented_rectangles(big_box_dim, num_spheres, small_b
 
     Parameters
     ----------
-    big_box_dim : array-like of shape (3,)
+    box_dim : array-like of shape (3,)
         Dimensions of the larger cubic box (lengths along x, y, and z axes).
     num_spheres : int
         Number of smaller rectangular volumes to generate within the larger box.
@@ -1279,7 +551,7 @@ def partition_cubic_volume_oriented_rectangles(big_box_dim, num_spheres, small_b
 
     Raises
     ------
-    AssertionError
+    ValueError
         If the number of available rectangular volumes is less than `num_spheres`.
 
     Notes
@@ -1292,25 +564,27 @@ def partition_cubic_volume_oriented_rectangles(big_box_dim, num_spheres, small_b
     Examples
     --------
     Partition a 10x10x10 box into smaller 2x2x2 volumes and generate 5 points in each volume:
-    >>> big_box_dim = np.array([10.0, 10.0, 10.0])
+    >>> box_dim = np.array([10.0, 10.0, 10.0])
     >>> small_box_dim = np.array([2.0, 2.0, 2.0])
     >>> num_spheres = 10
     >>> num_monomers = 5
-    >>> centers, points = partition_cuboid_volume_oriented_rectangles(big_box_dim, num_spheres, small_box_dim, num_monomers)
+    >>> centers, points = partition_cubic_volume_oriented_rectangles(box_dim, num_spheres, small_box_dim, num_monomers)
     """
+    box_dim = _as_box(box_dim)
+    small_box_dim = _as_box(small_box_dim)
     _, _, sphere_diameter = small_box_dim
     sphere_radius = sphere_diameter * 0.5
 
     x_partitions, y_partitions, z_partitions = (
-        big_box_dim // small_box_dim).astype(int)
+        box_dim // small_box_dim).astype(int)
 
     x_len, y_len, z_len = small_box_dim
     x_coords = np.linspace(
-        0.5 * x_len, big_box_dim[0] - 0.5 * x_len, x_partitions)
+        0.5 * x_len, box_dim[0] - 0.5 * x_len, x_partitions)
     y_coords = np.linspace(
-        0.5 * y_len, big_box_dim[1] - 0.5 * y_len, y_partitions)
+        0.5 * y_len, box_dim[1] - 0.5 * y_len, y_partitions)
     z_coords = np.linspace(
-        0.5 * z_len, big_box_dim[2] - 0.5 * z_len, z_partitions)
+        0.5 * z_len, box_dim[2] - 0.5 * z_len, z_partitions)
 
     xx, yy, zz = np.meshgrid(x_coords, y_coords, z_coords, indexing='ij')
     sphere_centers = np.vstack([xx.ravel(), yy.ravel(), zz.ravel()]).T
@@ -1318,15 +592,15 @@ def partition_cubic_volume_oriented_rectangles(big_box_dim, num_spheres, small_b
     # Adjust coordinates for partitions equal to 1
     if x_partitions == 1:
         for i in range(1, len(sphere_centers), 2):
-            sphere_centers[i, 0] = big_box_dim[0] - 0.5 * x_len
+            sphere_centers[i, 0] = box_dim[0] - 0.5 * x_len
 
     if y_partitions == 1:
         for i in range(1, len(sphere_centers), 2):
-            sphere_centers[i, 1] = big_box_dim[1] - 0.5 * y_len
+            sphere_centers[i, 1] = box_dim[1] - 0.5 * y_len
 
     if z_partitions == 1:
         for i in range(1, len(sphere_centers), 2):
-            sphere_centers[i, 2] = big_box_dim[2] - 0.5 * z_len
+            sphere_centers[i, 2] = box_dim[2] - 0.5 * z_len
 
     if not (len(sphere_centers) >= num_spheres):
         raise ValueError('Must be enough possible volumes. Introduce a scaling factor.')
@@ -1356,8 +630,7 @@ def get_orientation_vec(pos):
 
     The gyration tensor is real symmetric by construction, so np.linalg.eigh is
     used: it is guaranteed to return real eigenvalues and eigenvectors, which is
-    what espresso needs. (np.linalg.eig would occasionally hand back a complex
-    type with zero imaginary part.)
+    what espresso needs.
 
     An eigenvector is only defined up to sign, so the returned axis is pinned to
     point from the first to the last position. Callers rely on this: the vector
@@ -1366,7 +639,6 @@ def get_orientation_vec(pos):
 
     :param pos: array_like, shape (N, 3) | positions, in order along the object
     :return: np.ndarray, shape (3,) | normalised principal gyration axis
-
     '''
     dip_3d = np.asarray(pos, dtype=float)
     deviations = dip_3d - dip_3d.mean(axis=0)
@@ -1397,29 +669,24 @@ def get_orientation_vec(pos):
         pr_comp = -pr_comp
     return pr_comp
 
-def get_cross_lattice_nonintersecting_volumes(current_lattice_centers, current_lattice_grouped_part_pos, current_lattice_diam,other_lattice_centers, other_lattice_grouped_part_pos,other_lattice_diam,box_lengths, mode='cross_volumes'):
+def get_cross_lattice_nonintersecting_volumes(current_lattice_centers, current_lattice_diam,
+                                              other_lattice_centers, other_lattice_diam, box_dim):
     """
-    Calculate non-intersecting volumes between particles in two different lattices. This function determines which volumes from one lattice do not intersect with volumes from another lattice,
+    Calculate non-intersecting volumes between two different lattices. This function determines which volumes from one lattice do not intersect with volumes from another lattice,
     considering periodic boundary conditions.
 
     Parameters
     ----------
     current_lattice_centers : array-like
         Centers of volumes in the first lattice.
-    current_lattice_grouped_part_pos : array-like
-        Particle positions grouped by volume for the first lattice.
     current_lattice_diam : float
-        Diameter of particles in the first lattice.
+        Diameter of the volumes in the first lattice.
     other_lattice_centers : array-like
         Centers of volumes in the second lattice.
-    other_lattice_grouped_part_pos : array-like
-        Particle positions grouped by volume for the second lattice.
     other_lattice_diam : float
-        Diameter of particles in the second lattice.
-    box_lengths : array-like of shape (3,)
+        Diameter of the volumes in the second lattice.
+    box_dim : array-like of shape (3,)
         Side lengths of the periodic box.
-    mode : str, optional
-        Mode of calculation, either 'cross_parts' or 'cross_volumes'. Default is 'cross_volumes'.
 
     Returns
     -------
@@ -1430,35 +697,22 @@ def get_cross_lattice_nonintersecting_volumes(current_lattice_centers, current_l
 
     Notes
     -----
-    The function uses a cutoff distance of (d1 + d2)/2 where d1, d2 are the
-    diameters of particles in respective lattices. Particle pairs are considered
-    non-intersecting if their separation is greater than (d1/n1 + d2/n2)/2,
-    where n1, n2 are the number of particles in respective volumes.
+    Volumes are paired within a cutoff of (d1 + d2)/2, where d1, d2 are the
+    diameters of the volumes in the respective lattices, and a pair counts as
+    non-intersecting when its centre-to-centre separation reaches that same
+    distance.
     """
 
-    box_lengths = np.asarray(box_lengths)
-    if not (box_lengths.shape == (3,)):
-        raise ValueError("box_lengths must be an array-like of shape (3,)")
+    box_dim = _as_box(box_dim)
     neigh=get_neighbours_cross_lattice(current_lattice_centers,other_lattice_centers,
-    box_lengths, cutoff=(current_lattice_diam+other_lattice_diam)*0.5)
+    box_dim, cutoff=(current_lattice_diam+other_lattice_diam)*0.5)
     aranged_cross_lattice_options={}
-    if mode=='cross_parts':
-        fact=pow(2,1/6)
-        new_crit=((current_lattice_diam/current_lattice_grouped_part_pos.shape[1])*fact+(other_lattice_diam/other_lattice_grouped_part_pos.shape[1])*fact)*0.5
-        current_lattice_dat=current_lattice_grouped_part_pos
-        other_lattice_dat=other_lattice_grouped_part_pos
-
-    elif mode=='cross_volumes':
-        new_crit=(current_lattice_diam+other_lattice_diam)*0.5
-        current_lattice_dat=current_lattice_centers
-        other_lattice_dat=other_lattice_centers
-    else:
-        raise ValueError('mode must be either cross_parts or cross_volumes')
+    new_crit=(current_lattice_diam+other_lattice_diam)*0.5
     for vol_id,associated_vol_ids in neigh.items():
         mask=[]
         if associated_vol_ids:
             for as_vol_id in associated_vol_ids:
-                res=calculate_pair_distances(current_lattice_dat[vol_id], other_lattice_dat[as_vol_id], box_lengths=box_lengths)
+                res=calculate_pair_distances(current_lattice_centers[vol_id], other_lattice_centers[as_vol_id], box_dim=box_dim)
                 mask.append(all(x >= new_crit for x in res))
         aranged_cross_lattice_options[vol_id]=mask
     return aranged_cross_lattice_options
@@ -1535,48 +789,7 @@ def get_perpendicular(vec, phi=None):
     perp /= np.linalg.norm(perp)
     return perp
 
-def api_agnostic_feature_check(feature_name):
-    """
-    Checks whether an ESPResSo build has a given compile-time feature enabled,
-    across the v4/v5 API split.
-
-    :param feature_name: str | name of the ESPResSo feature (e.g. 'DIPOLES')
-    :return: bool | True if the feature is compiled in, False if it is not or
-        if the check itself fails (e.g. the feature name is unknown to this
-        ESPResSo build, which is logged as a warning rather than raised)
-    :raises ValueError: if the installed ESPResSo major version is neither 4 nor 5
-    """
-    ret_val=None
-    espresso_major_version=espressomd.version.major()
-    try:
-        if espresso_major_version==5:
-            ret_val=espressomd.code_features.has_features(feature_name)
-        elif espresso_major_version==4:
-            ret_val=espressomd.has_features(feature_name)
-        else:
-            raise ValueError('This version of ESPResSo may not be supported!')
-    except RuntimeError:
-        logging.warning(f'feature check for {feature_name}, espresso version {espresso_major_version} failed with exception {sysos.exc_info()}')
-        return False
-    return ret_val
-
-def particle_attribute_check(part_hndl, attribute_name):
-    """
-    Checks that a particle handle exposes a given attribute.
-
-    :param part_hndl: ParticleHandle | particle to check
-    :param attribute_name: str | name of the attribute to look up
-    :return: None
-    :raises MissingFeature: if the attribute is not present, e.g. because the
-        ESPResSo build lacks the feature that would expose it
-    """
-    try:
-        getattr(part_hndl,attribute_name)
-    except AttributeError:
-        logging.warning(f'particle attribute check for {attribute_name} failed with exception {sysos.exc_info()}')
-        raise MissingFeature(f"Particle attribute {attribute_name} not found. Please ensure your ESPResSo installation supports this attribute.")
-
-def add_box_constraints_func(sys, wall_type=0, sides=['all'], inter=None, types_=None, object_types=None, bottom=None, top=None, left=None, right=None, back=None, front=None):
+def add_box_constraints_func(sys, wall_type=0, wall_epsilon=1E6, sides=['all'], inter=None, types_=None, object_types=None, bottom=None, top=None, left=None, right=None, back=None, front=None):
     """
     Adds wall constraints to the simulation box along specified sides.
 
@@ -1599,7 +812,7 @@ def add_box_constraints_func(sys, wall_type=0, sides=['all'], inter=None, types_
             - 'no-<side>': exclude specific sides, e.g., 'no-top', 'no-right', 'no-sides'.
     inter : str or list of str, optional
         Type(s) of interaction to enable between wall and specified particle types. Currently supports:
-            - 'wca': Weeks–Chandler–Andersen potential with large epsilon.
+            - 'wca': Weeks-Chandler-Andersen potential with large epsilon.
     types_ : list of int, optional
         Particle types that will interact with the walls. If None, all non-wall types in the system are used.
     object_types : list of type, optional
@@ -1715,12 +928,12 @@ def add_box_constraints_func(sys, wall_type=0, sides=['all'], inter=None, types_
 
         if 'wca' in inter:
             for type_ in types_:
-                # The extra /2**(1/6) softened sigma is what keeps particles sitting at
+                # Dividing by WCA_CONTACT_FACTOR is what keeps particles sitting at
                 # their equilibrium distance from the wall instead of a stiff overlap.
-                sigma = sys.non_bonded_inter[type_,type_].wca.sigma/2 / 2**(1/6)
+                sigma = sys.non_bonded_inter[type_,type_].wca.sigma/2 / WCA_CONTACT_FACTOR
                 if sigma < 0.001:
                     warnings.warn(f"Interaction of type {type_} with wall is 0, has these particles have no interaction defined. If you would like to have no interactions between particles, but only with wall, then hange this function or do it with normal espresso constraints.")
-                sys.non_bonded_inter[wall_type,type_].wca.set_params(epsilon=1E6, sigma=sigma)
+                sys.non_bonded_inter[wall_type,type_].wca.set_params(epsilon=wall_epsilon, sigma=sigma)
 
     return wall_constraints
 
@@ -1783,111 +996,30 @@ def check_free_cuboid(sys, cuboid_l, cuboid_l_shift=None):
     else:
         return np.all(np.any((pos < cuboid_l_shift) | (pos > cuboid_l_shift + cuboid_l), axis=1))
 
-class BondWrapper:
-    """Transparent proxy around an espresso bond.
+def require_min_global_cut(sys, cutoff):
+    """Raise unless ``sys.min_global_cut`` can hold a pair bond of length ``cutoff`` across ranks.
+
+    A bonded partner must lie within the owning rank's ghost layer, whose width
+    is ``min_global_cut``; on more than one MPI rank a longer bond cannot be
+    resolved by the bond loop. Requires ``min_global_cut >= 1.5 * cutoff`` when
+    ``n_nodes > 1``. A single rank has no rank boundary to cross and always passes.
+
+    :param sys: espressomd.System | the system about to receive the bonds
+    :param cutoff: float | the longest bond length (``r_0`` / catch radius) to be bonded
+    :raises RuntimeError: when the cut is too small for the rank layout
     """
+    n_nodes = int(sys.cell_system.get_state()['n_nodes'])
+    needed = 1.5 * float(cutoff)
+    if n_nodes > 1 and sys.min_global_cut < needed:
+        raise RuntimeError(
+            f"min_global_cut={sys.min_global_cut} is too small for bonds of length {cutoff} on "
+            f"{n_nodes} MPI ranks (needs >= 1.5 x {cutoff} = {needed}). Call "
+            f"set_sys(min_global_cut={needed}) before bonding, or run on a single rank.")
 
-    #: Attributes that belong to the wrapper, not to the wrapped espresso bond.
-    _wrapper_attrs = frozenset({"_bond_handle", "name"})
-
-    def __init__(self, bond_handle):
-        self._bond_handle = bond_handle
-        self.name = bond_handle.__class__.__name__
-
-    def __getattr__(self, name):
-        return getattr(self._bond_handle, name)
-
-    def __setattr__(self, name, value):
-        if name in BondWrapper._wrapper_attrs:
-            super().__setattr__(name, value)
-        else:
-            setattr(self._bond_handle, name, value)
-
-    def __delattr__(self, name):
-        delattr(self._bond_handle, name)
-
-    def __repr__(self):
-        return f"BondWrapper({self._bond_handle!r})"
-
-    def get_raw_handle(self):
-        """Return the wrapped espresso bond object."""
-        return self._bond_handle
-
-def get_repo_context(path):
-    """Return the enclosing git repository root and a provenance version string.
-
-    The version string stores the current branch and commit hash and appends ``-dirty`` when
-    the repository has uncommitted changes. If the path is not inside a git
-    repository, or if the git query fails, the version falls back to ``unknown``.
-    """
-    path = Path(path).resolve()
-    search_root = path if path.is_dir() else path.parent
-    repo_root = None
-    for candidate in (search_root, *search_root.parents):
-        if (candidate / ".git").exists():
-            repo_root = candidate
-            break
-    if repo_root is None:
-        return None, "unknown"
-    try:
-        branch = subprocess.run(
-            ["git", "-C", str(repo_root), "rev-parse", "--abbrev-ref", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        commit = subprocess.run(
-            ["git", "-C", str(repo_root), "rev-parse", "--short", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        dirty = subprocess.run(
-            ["git", "-C", str(repo_root), "status", "--porcelain"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    except Exception:
-        return repo_root, "unknown"
-    suffix = "-dirty" if dirty else ""
-    return repo_root, f"{branch}@{commit}{suffix}"
-
-def get_submission_creator_info():
-    """Return H5MD creator metadata for the active submission script.
-
-    The creator name is reported as ``repo_name/repo_relative_path`` when the
-    script belongs to a git repository, and as ``unknown/<script_name>``
-    otherwise. The accompanying version string follows :func:`get_repo_context`.
-    """
-    package_root = Path(__file__).resolve().parent
-    current_file = Path(__file__).resolve()
-    frame = inspect.currentframe()
-    script_path = None
-    while frame is not None:
-        filename = frame.f_code.co_filename
-        if filename:
-            candidate = Path(filename).resolve()
-            if candidate != current_file and package_root not in candidate.parents:
-                script_path = candidate
-                break
-        frame = frame.f_back
-
-    if script_path is None:
-        return "unknown/unknown", "unknown"
-    repo_root, version = get_repo_context(script_path)
-    if repo_root is None:
-        return f"unknown/{script_path.name}", "unknown"
-    relpath = script_path.relative_to(repo_root).as_posix()
-    return f"{repo_root.name}/{relpath}", version
-
-_DEFFAULT_NDIM = 3
-def _as_box(box_dim: ArrayLike, ndim=None) -> np.ndarray:
-    """Coerce a scalar or sequence into a strictly-positive (3,) float array."""
+def _as_box(box_dim: ArrayLike, ndim: int = 3) -> np.ndarray:
+    """Coerce a scalar or sequence into a strictly-positive (ndim,) float array."""
     box = np.asarray(box_dim, dtype=np.float64)
     assert box.ndim <= 1
-    if ndim is None:
-        ndim = box.shape[0] if box.ndim == 1 else _DEFFAULT_NDIM
     if box.ndim == 0:
         box = np.full(ndim, float(box))
     else:
@@ -2053,11 +1185,11 @@ def _choose_grid(box, cutoff, n_target, cells_per_cutoff=None, max_cells=10_000_
             best = (score, n, size, stencil)
     if best is None:  # all divisons had > max_cells cells
         n = np.maximum(np.floor(box / cutoff).astype(np.int64), 1)
-        while n.prod() > max_cells:
-            reducible = n > 1
-            if not reducible.any():
-                break
-            n[np.argmax(np.where(reducible, n, -1))] -= 1
+        lo, hi = 1, int(n.max())
+        while lo < hi:  # bisect the largest common cap c with prod(min(n, c)) <= max_cells
+            c = (lo + hi + 1) // 2
+            lo, hi = (c, hi) if np.minimum(n, c).prod() <= max_cells else (lo, c - 1)
+        n = np.minimum(n, lo)
         size = box / n
         return n, size, _stencil(n, size, cutoff, ndim)
     return best[1], best[2], best[3]

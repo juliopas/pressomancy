@@ -1,6 +1,6 @@
 import numpy as np
 import espressomd
-from .create_system import sim_inst , BaseTestCase
+from .create_system import sim_inst, BaseTestCase, BoxTestCase
 from pressomancy.simulation import (Filament, Quartet, Quadriplex, Crowder, Elastomer,
                                     PointDipolePermanent, PointDipoleMagnetizable)
 from pressomancy.infra import BondWrapper, api_agnostic_feature_check
@@ -23,21 +23,14 @@ from pressomancy.io.bonds import verify_bond_params, write_bonds, read_bonds, re
 SMALL_BOX = (16, 16, 16)
 
 
-class IOTestCase(BaseTestCase):
-    """A class tmpdir; every test resets into the class's `box_dim`, and 50^3 comes back once at the end."""
+class IOTestCase(BoxTestCase):
+    """A class tmpdir on top of BoxTestCase's per-class box and per-test reset."""
 
     @classmethod
     def setUpClass(cls):
-        super().setUpClass()
         cls.tmpdir = tempfile.TemporaryDirectory()
-        cls.addClassCleanup(cls.tmpdir.cleanup)
-        cls.addClassCleanup(BaseTestCase.cleanup)     # runs first (LIFO), even if setUpClass fails
-        BaseTestCase.cleanup(cls.box_dim)             # every test resets after itself; this covers the first
-
-    def setUp(self):
-        super().setUp()
-        # addCleanup, not tearDown: it also runs when a subclass setUp fails half-way.
-        self.addCleanup(BaseTestCase.cleanup, self.box_dim)
+        cls.addClassCleanup(cls.tmpdir.cleanup)       # registered first, so it runs after the reset (LIFO)
+        super().setUpClass()
 
 
 class CommonH5DataSelectorTests:

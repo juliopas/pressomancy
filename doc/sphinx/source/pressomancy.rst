@@ -8,16 +8,23 @@ Subpackages
    :maxdepth: 4
 
    pressomancy.object_classes
-   pressomancy.analysis
    pressomancy.io
 
 Submodules
 ----------
 
-pressomancy.helper\_functions module
-------------------------------------
+pressomancy.infra module
+------------------------
 
-.. automodule:: pressomancy.helper_functions
+.. automodule:: pressomancy.infra
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+pressomancy.geometry module
+---------------------------
+
+.. automodule:: pressomancy.geometry
    :members:
    :undoc-members:
    :show-inheritance:

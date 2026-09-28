@@ -88,8 +88,9 @@ library, analysis helpers, and examples:
     pressomancy/
     ├─ pressomancy/
     │  ├─ simulation.py
-    │  ├─ helper_functions.py
-    │  ├─ analysis/
+    │  ├─ infra.py
+    │  ├─ geometry.py
+    │  ├─ io/
     │  ├─ object_classes/
     │  └─ resources/
     ├─ doc/sphinx/
@@ -99,7 +100,7 @@ library, analysis helpers, and examples:
 In normal use, three areas matter most. :mod:`pressomancy.simulation`
 contains the top-level orchestration logic. :mod:`pressomancy.object_classes`
 contains the reusable object families that plug into that orchestration.
-:mod:`pressomancy.analysis.data_analysis` contains the HDF5-backed analysis
+:mod:`pressomancy.io` contains the HDF5-backed write and read/analysis
 helpers that make the saved output convenient to inspect. The scripts in
 ``samples/`` are therefore more than demonstrations. They are the clearest
 record of how the intended build patterns are supposed to be used in practice.

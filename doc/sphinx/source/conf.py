@@ -116,7 +116,7 @@ import sys
 import types
 
 def setup(app):
-    import pressomancy.helper_functions as hf
+    import pressomancy.infra as hf
     original_managed = hf.ManagedSimulation
 
     # Mock ManagedSimulation for autosummary step

@@ -38,7 +38,7 @@ leaves.
 
 The placement pipeline follows that logic directly.
 :meth:`~pressomancy.simulation.Simulation.set_objects` calls
-:func:`~pressomancy.helper_functions.partition_cuboid_volume` to generate
+:func:`~pressomancy.geometry.partition_cuboid_volume` to generate
 candidate regions in the box. The helper starts from an FCC lattice because it
 provides a dense and regular set of trial centers. For each accepted center,
 the simulation calls the object's ``build_function`` to ask what local point
@@ -59,8 +59,12 @@ write their ownership structure to disk in a uniform way.
 
 At class definition time, the metaclass expects the object family to declare
 the metadata the simulation needs in order to reason about it:
-``required_features``, ``numInstances``, ``part_types``, ``simulation_type``,
-and ``config``. At instance level, the object is expected to expose
+``required_features``, ``part_types``, ``simulation_type``, and ``config``. ``part_types``
+is a :class:`~pressomancy.infra.TypeDictSafe`, a strict ``str`` -> ``int`` bijection of type name
+to numeric espresso type, and ``simulation_type`` is a
+:class:`~pressomancy.infra.SimulationType` pair whose name *and* number the metaclass keeps
+unique across object classes (a clash raises ``ValueError`` at class definition time; a subclass
+may instead inherit its base's pair). At instance level, the object is expected to expose
 ``who_am_i``, ``type_part_dict``, ``associated_objects``, and ``sys``. Those
 requirements are not there for style. They are what lets a
 :class:`~pressomancy.object_classes.part_class.GenericPart`, a
@@ -68,13 +72,12 @@ requirements are not there for style. They are what lets a
 :class:`~pressomancy.object_classes.quadriplex_class.Quadriplex` all be
 handled by the same :class:`~pressomancy.simulation.Simulation` machinery.
 
-Two of those are managed for you and should not be written by a subclass.
-``numInstances`` is an identifier allocator: it is incremented by
-after ``__init__``, and decremented by ``__del__``. The metaclass keeps ``who_am_i``
-unique and stable for the whole run, which matters because it is also the value
-written into the HDF5 ownership tables. A separate, metaclass-created
-``live_instances`` counter tracks how many instances are currently alive. The
-metaclass also hands every construction a private copy of the ``config`` it was
+Three class attributes are created and managed by the metaclass and must not be
+written by a subclass. ``instance_id_counter`` allocates ``who_am_i`` (the value written
+into the HDF5 ownership tables, so it is kept unique and stable for the whole run);
+``numInstances`` counts every construction and never decreases; ``live_instances`` is a
+``weakref.WeakSet`` of the instances currently alive. ``Simulation.reinitialize_instance()``
+rewinds all three for every registered class. The metaclass also hands every construction a private copy of the ``config`` it was
 given, so an ``__init__`` that fills in inferred parameters or builds its
 ``associated_objects`` implicitly cannot contaminate a config that the caller
 intends to reuse for further instances.
@@ -111,7 +114,7 @@ still allowing object-local methods to update simulation-level bookkeeping.
 One detail matters more than it may first appear to. Every simulation object
 participates in the same build pipeline through ``build_function``. If a class
 does not define one explicitly, the metaclass supplies a default
-:class:`~pressomancy.helper_functions.RoutineWithArgs` instance. For simple
+:class:`~pressomancy.infra.RoutineWithArgs` instance. For simple
 single-particle objects, that may be enough. For chain-like or composite
 objects such as
 :class:`~pressomancy.object_classes.filament_class.Filament` and
@@ -202,21 +205,19 @@ object class must satisfy.
 .. code-block:: python
 
    from pressomancy.object_classes.object_class import Simulation_Object, ObjectConfigParams
-   from pressomancy.helper_functions import PartDictSafe, SinglePairDict
+   from pressomancy.infra import TypeDictSafe, SimulationType
 
    class MyObject(metaclass=Simulation_Object):
        required_features = []
-       numInstances = 0
-       simulation_type = SinglePairDict("my_object", 123)
-       part_types = PartDictSafe({"real": 1})
+       simulation_type = SimulationType("my_object", 123)
+       part_types = TypeDictSafe({"real": 1})
        config = ObjectConfigParams(my_param=1.0)
 
        def __init__(self, config: ObjectConfigParams):
            self.sys = config["espresso_handle"]
            self.params = config
            self.associated_objects = config["associated_objects"]
-           self.type_part_dict = PartDictSafe({"real": []})
-           MyObject.numInstances += 1
+           self.type_part_dict = {key: [] for key in MyObject.part_types}
 
        def set_object(self, pos, ori):
            part = self.add_particle(type_name="real", pos=pos, rotation=(True, True, True))
