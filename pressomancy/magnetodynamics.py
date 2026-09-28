@@ -65,19 +65,17 @@ Two models are currently exposed, both parameterised by the saturation moment
 import numpy as np
 
 import espressomd
-import espressomd.version
+import espressomd.propagation
 
-from pressomancy.helper_functions import MissingFeature, api_agnostic_feature_check
+from pressomancy.infra import MissingFeature, api_agnostic_feature_check
 
-if espressomd.version.major() == 5:
-    import espressomd.propagation
-    Propagation = espressomd.propagation.Propagation
+Propagation = espressomd.propagation.Propagation
 
-    MOMENT_CARRIER_PROPAGATION = int(Propagation.TRANS_VS_RELATIVE |
-                                     Propagation.ROT_VS_INDEPENDENT)
+MOMENT_CARRIER_PROPAGATION = int(Propagation.TRANS_VS_RELATIVE |
+                                 Propagation.ROT_VS_INDEPENDENT)
 
-    _REPLACEABLE_PROPAGATION = int(Propagation.SYSTEM_DEFAULT |
-                                   Propagation.ROT_VS_RELATIVE)
+_REPLACEABLE_PROPAGATION = int(Propagation.SYSTEM_DEFAULT |
+                               Propagation.ROT_VS_RELATIVE)
 
 #: Features every magnetodynamics model needs, whichever model is picked.
 COMMON_FEATURES = ['DIPOLES', 'DIPOLE_FIELD_TRACKING', 'VIRTUAL_SITES_RELATIVE']
@@ -188,11 +186,8 @@ def _assert_bound_virtual_site(part_hndl):
     :raises ValueError: if the particle is not a virtual site relative, or is
         one but was never related to a real particle
     '''
-    if espressomd.version.major() == 5:
-        is_vs_relative = bool(int(part_hndl.propagation) &
-                              int(Propagation.TRANS_VS_RELATIVE))
-    else:
-        is_vs_relative = bool(part_hndl.virtual)
+    is_vs_relative = bool(int(part_hndl.propagation) &
+                          int(Propagation.TRANS_VS_RELATIVE))
     related_to = int(part_hndl.vs_relative[0])
     if not is_vs_relative or related_to < 0:
         raise ValueError(
@@ -284,8 +279,7 @@ def configure_magnetization(part_hndl, model, dipm_sat, mag_susc_0, anchor=None)
         part_hndl.vs_auto_relate_to(anchor)
     else:
         _assert_bound_virtual_site(part_hndl)
-    if espressomd.version.major() == 5:
-        _set_moment_carrier_propagation(part_hndl)
+    _set_moment_carrier_propagation(part_hndl)
 
     for other_model, (other_feature, other_flag) in MAGNETIZATION_MODELS.items():
         if other_model != model and api_agnostic_feature_check(other_feature):

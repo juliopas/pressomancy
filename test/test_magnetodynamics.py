@@ -1,17 +1,20 @@
+import functools
 import unittest
+from unittest import mock
+
 import numpy as np
 
-import espressomd
-import espressomd.magnetostatics
+import espressomd.interactions
+from espressomd.magnetostatics import DipolarDirectSum
 
-from pressomancy.helper_functions import (BondWrapper, MissingFeature,
-                                          api_agnostic_feature_check)
-from pressomancy.magnetodynamics import (MAGNETIZATION_MODELS, configure_magnetization,
+from pressomancy.infra import BondWrapper, MissingFeature, api_agnostic_feature_check
+from pressomancy.magnetodynamics import (MAGNETIZATION_MODELS, MOMENT_CARRIER_PROPAGATION,
+                                         Propagation, configure_magnetization,
                                          contraction_ratio, required_features_for,
                                          susceptibility_from_kT, validate_model)
 from pressomancy.simulation import (Filament, PointDipoleMagnetizable,
                                     PointDipoleSuperparamagnetic)
-from .create_system import sim_inst, BaseTestCase
+from .create_system import sim_inst, BaseTestCase, BoxTestCase
 
 AVAILABLE_MODELS = [name for name in MAGNETIZATION_MODELS
                     if all(api_agnostic_feature_check(f)
@@ -33,412 +36,223 @@ CLOSED_FORM = {'langevin': langevin_moment,
                'froelich_kennelly': froelich_kennelly_moment}
 
 
-class ModelRegistryTest(unittest.TestCase):
-    '''Validation that does not need a live espresso system.'''
+def _make_pair(m_sat, pos=(5., 5., 5.)):
+    '''A fixed real anchor plus an unbound particle at its position, moment seeded along z.'''
+    anchor = sim_inst.sys.part.add(pos=list(pos), fix=[True] * 3)
+    virt = sim_inst.sys.part.add(pos=anchor.pos, rotation=[True] * 3, dip=[0., 0., m_sat])
+    return anchor, virt
 
-    def test_unknown_model_rejected(self):
-        with self.assertRaises(ValueError):
-            validate_model('not_a_model')
-        with self.assertRaises(ValueError):
-            required_features_for('ideal')
 
-    def test_required_features_are_model_specific(self):
-        for name, (feature, _) in MAGNETIZATION_MODELS.items():
-            self.assertIn(feature, required_features_for(name))
-            for other, (other_feature, _) in MAGNETIZATION_MODELS.items():
-                if other != name:
-                    self.assertNotIn(other_feature, required_features_for(name))
+class ValidationTest(unittest.TestCase):
+    '''Refusals that need no live espresso particle.'''
 
-    def test_object_config_rejects_unknown_model(self):
-        with self.assertRaises(ValueError):
-            PointDipoleMagnetizable(
+    def test_unknown_model_is_refused_everywhere(self):
+        '''The helpers and both object configs refuse an unknown model name.'''
+        cases = {
+            'validate_model': lambda: validate_model('ideal'),
+            'required_features_for': lambda: required_features_for('ideal'),
+            'PointDipoleMagnetizable': lambda: PointDipoleMagnetizable(
                 config=PointDipoleMagnetizable.config.specify(
-                    magnetization_model='ideal', espresso_handle=sim_inst.sys))
+                    magnetization_model='ideal', espresso_handle=sim_inst.sys)),
+            'PointDipoleSuperparamagnetic': lambda: PointDipoleSuperparamagnetic(
+                config=PointDipoleSuperparamagnetic.config.specify(
+                    magnetization_model='ideal', espresso_handle=sim_inst.sys)),
+        }
+        for label, call in cases.items():
+            with self.subTest(label), self.assertRaisesRegex(ValueError, 'Unknown magnetization model'):
+                call()
+
+    def test_unphysical_dipm_or_kT_is_refused(self):
+        '''`PointDipoleSuperparamagnetic.__init__` fails early, not at `set_object`.'''
+        for dipm, kT, fragment in [(0., 1., 'dipm must'), (-1., 1., 'dipm must'),
+                                   (1., 0., 'kT must'), (1., -2., 'kT must')]:
+            with self.subTest(f'susceptibility_from_kT({dipm}, {kT})'), \
+                    self.assertRaisesRegex(ValueError, fragment):
+                susceptibility_from_kT(dipm, kT)
+        for dipm, kT, fragment in [(0., 1., 'dipm must'), (1., 0., 'kT must')]:
+            with self.subTest(f'PointDipoleSuperparamagnetic(dipm={dipm}, kT={kT})'), \
+                    self.assertRaisesRegex(ValueError, fragment):
+                PointDipoleSuperparamagnetic(config=PointDipoleSuperparamagnetic.config.specify(
+                    dipm=dipm, kT=kT, espresso_handle=sim_inst.sys))
 
 
-@unittest.skipIf(not AVAILABLE_MODELS,
-                 'no magnetization model compiled in this espresso build')
-class ConfigureMagnetizationTest(BaseTestCase):
-    '''Exercises the helper directly on a bare anchor plus virtual site pair.'''
+@unittest.skipIf(not AVAILABLE_MODELS, 'no magnetization model compiled in this espresso build')
+class ConfigureMagnetizationTest(BoxTestCase):
+    '''`configure_magnetization` on bare anchor + virtual pairs, and through objects and `Simulation`.'''
 
+    box_dim = (20, 20, 20)
     m_sat = 1.5
-    chi_0 = 0.4
-
-    def tearDown(self) -> None:
-        self.cleanup()
-        self.assertEqual(len(sim_inst.sys.part), 0)
-
-    def _make_pair(self):
-        anchor = sim_inst.sys.part.add(pos=[5., 5., 5.], fix=[True] * 3)
-        virt = sim_inst.sys.part.add(pos=anchor.pos, rotation=[True] * 3,
-                                     dip=[0., 0., self.m_sat])
-        return anchor, virt
-
-    def test_parameters_land_on_the_particle(self):
-        for model in AVAILABLE_MODELS:
-            with self.subTest(model=model):
-                anchor, virt = self._make_pair()
-                configure_magnetization(virt, model, self.m_sat, self.chi_0,
-                                        anchor=anchor)
-                self.assertEqual(virt.dipm_sat, self.m_sat)
-                self.assertEqual(virt.mag_susc_0, self.chi_0)
-                self.assertTrue(getattr(virt, MAGNETIZATION_MODELS[model][1]))
-                self.assertTrue(virt.is_virtual())
-                sim_inst.sys.part.all().remove()
-
-    def test_models_are_mutually_exclusive(self):
-        if len(AVAILABLE_MODELS) < 2:
-            self.skipTest('needs both models compiled')
-        anchor, virt = self._make_pair()
-        first, second = AVAILABLE_MODELS[0], AVAILABLE_MODELS[1]
-        configure_magnetization(virt, first, self.m_sat, self.chi_0, anchor=anchor)
-        configure_magnetization(virt, second, self.m_sat, self.chi_0)
-        self.assertTrue(getattr(virt, MAGNETIZATION_MODELS[second][1]))
-        self.assertFalse(getattr(virt, MAGNETIZATION_MODELS[first][1]),
-                         'switching models must clear the previous one')
-
-    def test_anchor_none_reuses_existing_binding(self):
-        anchor, virt = self._make_pair()
-        model = AVAILABLE_MODELS[0]
-        virt.vs_auto_relate_to(anchor)
-        configure_magnetization(virt, model, self.m_sat, self.chi_0, anchor=None)
-        self.assertEqual(virt.dipm_sat, self.m_sat)
-        self.assertTrue(getattr(virt, MAGNETIZATION_MODELS[model][1]))
-
-    def test_anchor_none_rejects_unbound_virtual_site(self):
-        _, virt = self._make_pair()
-        model = AVAILABLE_MODELS[0]
-        with self.assertRaises(ValueError):
-            configure_magnetization(virt, model, self.m_sat, self.chi_0, anchor=None)
-
-    def test_parameter_validation_precedes_espresso(self):
-        anchor, virt = self._make_pair()
-        model = AVAILABLE_MODELS[0]
-        with self.assertRaises(ValueError):
-            configure_magnetization(virt, model, 0., self.chi_0, anchor=anchor)
-        with self.assertRaises(ValueError):
-            configure_magnetization(virt, model, -1., self.chi_0, anchor=anchor)
-        with self.assertRaises(ValueError):
-            configure_magnetization(virt, model, self.m_sat, -0.1, anchor=anchor)
-
-    def test_unknown_model_raises_before_touching_the_particle(self):
-        anchor, virt = self._make_pair()
-        with self.assertRaises(ValueError):
-            configure_magnetization(virt, 'ideal', self.m_sat, self.chi_0,
-                                    anchor=anchor)
-        self.assertFalse(virt.is_virtual(),
-                         'a rejected model must not bind the virtual site')
-
-
-@unittest.skipIf(not AVAILABLE_MODELS,
-                 'no magnetization model compiled in this espresso build')
-class MagnetizationCurveTest(BaseTestCase):
-    '''A single isolated particle must follow the closed form of its model.
-
-    With one particle there is no dipolar field, so H_tot is the external field
-    alone and the fixed point is reached in a single step.
-    '''
-
-    m_sat = 2.0
     chi_0 = 0.3
 
-    def tearDown(self) -> None:
-        self.cleanup()
-        self.assertEqual(len(sim_inst.sys.part), 0)
+    def test_configure_binds_and_switches_models(self):
+        '''Every available model in turn, then back to the first; only the first step passes the anchor.'''
+        anchor, virt = _make_pair(self.m_sat)
+        models = AVAILABLE_MODELS + AVAILABLE_MODELS[:1]
+        for step, model in enumerate(models):
+            dipm_sat = 1. + 0.5 * step
+            chi_0 = 0.1 * (len(models) - 1 - step)  # distinct at every step, the last is the boundary 0
+            with self.subTest(f'step {step}: {model}'):
+                configure_magnetization(virt, model, dipm_sat, chi_0,
+                                        anchor=anchor if step == 0 else None)
+                self.assertEqual(virt.dipm_sat, dipm_sat)
+                self.assertEqual(virt.mag_susc_0, chi_0)
+                self.assertEqual({m: getattr(virt, MAGNETIZATION_MODELS[m][1]) for m in AVAILABLE_MODELS},
+                                 {m: m == model for m in AVAILABLE_MODELS})
+                self.assertTrue(virt.is_virtual())
+                self.assertEqual(virt.vs_relative[0], anchor.id)
+                self.assertEqual(int(virt.propagation), MOMENT_CARRIER_PROPAGATION)
+
+    def test_refusals_leave_the_particle_untouched(self):
+        '''Each refusal raises before the particle is bound, propagated or flagged.'''
+        def with_anchor(anchor, virt):
+            return anchor
+
+        def plain(anchor, virt):
+            return None
+
+        def never_related(anchor, virt):
+            virt.propagation = Propagation.TRANS_VS_RELATIVE | Propagation.ROT_VS_RELATIVE
+            return None
+
+        def langevin_coupled(anchor, virt):
+            virt.vs_auto_relate_to(anchor, couple_to_langevin=True)
+            return None
+
+        model, m_sat, chi_0 = AVAILABLE_MODELS[0], self.m_sat, self.chi_0
+        # (label, model, dipm_sat, mag_susc_0, bind, feature reported missing, exception, fragment)
+        rows = [
+            ('unknown model', 'ideal', m_sat, chi_0, with_anchor, None,
+             ValueError, 'Unknown magnetization model'),
+            ('dipm_sat 0', model, 0., chi_0, with_anchor, None, ValueError, 'dipm_sat'),
+            ('dipm_sat -1', model, -1., chi_0, with_anchor, None, ValueError, 'dipm_sat'),
+            ('mag_susc_0 -0.1', model, m_sat, -0.1, with_anchor, None, ValueError, 'mag_susc_0'),
+            ('anchor=None, plain particle', model, m_sat, chi_0, plain, None,
+             ValueError, 'virtual sites relative: False'),
+            ('anchor=None, never related', model, m_sat, chi_0, never_related, None,
+             ValueError, 'related to particle id: -1'),
+            ('anchor=None, coupled to langevin', model, m_sat, chi_0, langevin_coupled, None,
+             ValueError, 'cannot be kept'),
+        ] + [
+            (f'{name}: {MAGNETIZATION_MODELS[name][0]} missing', name, m_sat, chi_0, with_anchor,
+             MAGNETIZATION_MODELS[name][0], MissingFeature,
+             f'Missing required features: {MAGNETIZATION_MODELS[name][0]}')
+            for name in AVAILABLE_MODELS
+        ]
+        for label, row_model, dipm_sat, mag_susc_0, bind, missing, exception, fragment in rows:
+            with self.subTest(label):
+                sim_inst.sys.part.all().remove()
+                anchor, virt = _make_pair(m_sat)
+                anchor_arg = bind(anchor, virt)
+                before = (int(virt.propagation), virt.is_virtual())
+                # the real check, except that `missing` (None: nothing) is reported absent
+                with mock.patch('pressomancy.magnetodynamics.api_agnostic_feature_check',
+                                lambda f: f != missing and api_agnostic_feature_check(f)):
+                    with self.assertRaisesRegex(exception, fragment):
+                        configure_magnetization(virt, row_model, dipm_sat, mag_susc_0, anchor=anchor_arg)
+                    self.assertEqual((int(virt.propagation), virt.is_virtual()), before)
+                    for m in AVAILABLE_MODELS:
+                        self.assertFalse(getattr(virt, MAGNETIZATION_MODELS[m][1]))
+                    if missing is not None:
+                        for other in AVAILABLE_MODELS:
+                            if other != row_model:
+                                configure_magnetization(virt, other, m_sat, chi_0, anchor=anchor)
+                                self.assertTrue(getattr(virt, MAGNETIZATION_MODELS[other][1]))
 
     def test_moment_follows_closed_form(self):
+        '''One isolated carrier sees only H_ext, so a single step lands on its model's curve.'''
+        h_hat = np.array([1., 2., 2.]) / 3.
+        carriers = []  # (label, virtual site, m_sat, m(H))
         for model in AVAILABLE_MODELS:
-            for H in (0.25, 1.0, 5.0, 50.0):
-                with self.subTest(model=model, H=H):
-                    anchor = sim_inst.sys.part.add(pos=[5., 5., 5.], fix=[True] * 3)
-                    virt = sim_inst.sys.part.add(pos=anchor.pos, rotation=[True] * 3,
-                                                 dip=[0., 0., self.m_sat])
-                    configure_magnetization(virt, model, self.m_sat, self.chi_0,
-                                            anchor=anchor)
-                    sim_inst.set_H_ext(H=[0., 0., H])
-                    sim_inst.sys.integrator.run(1)
-                    expected = CLOSED_FORM[model](H, self.m_sat, self.chi_0)
-                    self.assertAlmostEqual(virt.dipm, expected, places=9)
-                    # the moment aligns with the field
-                    np.testing.assert_allclose(np.asarray(virt.dip)[:2], 0.,
-                                               atol=1e-12)
-                    sim_inst.sys.part.all().remove()
+            anchor, virt = _make_pair(self.m_sat)
+            configure_magnetization(virt, model, self.m_sat, self.chi_0, anchor=anchor)
+            carriers.append((model, virt, self.m_sat,
+                             functools.partial(CLOSED_FORM[model], m_sat=self.m_sat, chi_0=self.chi_0)))
+        if 'langevin' in AVAILABLE_MODELS:
+            dipm, kT = 2.0, 0.5
 
-    def test_saturates_below_m_sat(self):
-        model = AVAILABLE_MODELS[0]
-        anchor = sim_inst.sys.part.add(pos=[5., 5., 5.], fix=[True] * 3)
-        virt = sim_inst.sys.part.add(pos=anchor.pos, rotation=[True] * 3,
-                                     dip=[0., 0., self.m_sat])
-        configure_magnetization(virt, model, self.m_sat, self.chi_0, anchor=anchor)
-        sim_inst.set_H_ext(H=[0., 0., 1e4])
-        sim_inst.sys.integrator.run(1)
-        self.assertLess(virt.dipm, self.m_sat)
-        self.assertGreater(virt.dipm, 0.95 * self.m_sat)
+            def classical_langevin(H):
+                alpha = dipm * H / kT
+                return dipm * (1. / np.tanh(alpha) - 1. / alpha)
 
+            obj = PointDipoleSuperparamagnetic(config=PointDipoleSuperparamagnetic.config.specify(
+                dipm=dipm, kT=kT, espresso_handle=sim_inst.sys))
+            sim_inst.store_objects([obj])
+            sim_inst.place_objects([obj], [np.array([15., 15., 15.])], [np.array([0., 0., 1.])])
+            carriers.append(('PointDipoleSuperparamagnetic', obj.type_part_dict['pds_virt'][0], dipm,
+                             classical_langevin))
 
-@unittest.skipIf(not AVAILABLE_MODELS,
-                 'no magnetization model compiled in this espresso build')
-class SimulationConfiguratorTest(BaseTestCase):
-    '''Simulation.set_magnetization_model on virtuals an object created for us.'''
+        for H in (0.25, 1., 5., 50., 1e4):
+            for _, virt, m_sat, _ in carriers:
+                virt.dip = [0., 0., m_sat]
+                self.assertLess(np.dot(virt.dip, h_hat) / m_sat, 0.9)
+            sim_inst.set_H_ext(H=H * h_hat)
+            sim_inst.sys.integrator.run(1)
+            for label, virt, m_sat, moment in carriers:
+                with self.subTest(carrier=label, H=H):
+                    np.testing.assert_allclose(np.copy(virt.dip), moment(H) * h_hat, rtol=1e-9)
+                    self.assertLess(virt.dipm, m_sat)
 
-    sigma = 1.
-    m_sat = 1.732
-
-    def tearDown(self) -> None:
-        self.filaments = None
-        self.cleanup()
-        self.assertEqual(len(sim_inst.sys.part), 0)
-
-    def setUp(self) -> None:
-        bond_hndl = BondWrapper(espressomd.interactions.FeneBond(
-            k=10, d_r_max=3 * self.sigma, r_0=0))
-        config = Filament.config.specify(sigma=self.sigma, size=2.26, n_parts=2,
-                                         espresso_handle=sim_inst.sys,
-                                         bond_handle=bond_hndl)
-        self.filaments = [Filament(config=config) for _ in range(2)]
-        sim_inst.store_objects(self.filaments)
-        sim_inst.set_objects(self.filaments)
-        for filament in self.filaments:
+    def test_simulation_configures_object_virtuals(self):
+        '''`set_magnetization_model` on the virtuals `add_dipole_to_embedded_virt` made; a bad dipm_sat is refused.'''
+        bond_hndl = BondWrapper(espressomd.interactions.FeneBond(k=10, d_r_max=3., r_0=0))
+        config = Filament.config.specify(sigma=1., size=2.26, n_parts=2,
+                                         espresso_handle=sim_inst.sys, bond_handle=bond_hndl)
+        filaments = [Filament(config=config) for _ in range(2)]
+        sim_inst.store_objects(filaments)
+        sim_inst.set_objects(filaments)
+        for filament in filaments:
             filament.add_dipole_to_embedded_virt(type_name='real', dip_magnitude=1.)
-
-    def test_configures_filament_virtuals(self):
-        model = AVAILABLE_MODELS[0]
-        targets = list(sim_inst.sys.part.select(
-            type=sim_inst.part_types['to_be_magnetized']))
+        targets = list(sim_inst.sys.part.select(type=sim_inst.part_types['to_be_magnetized']))
         self.assertGreater(len(targets), 0)
-        sim_inst.set_magnetization_model(targets, model,
-                                         dipm_sat=self.m_sat,
-                                         mag_susc_0=self.m_sat ** 2 / 3.)
+
+        model, dipm_sat = AVAILABLE_MODELS[0], 1.732
+        sim_inst.set_magnetization_model(targets, model, dipm_sat=dipm_sat, mag_susc_0=dipm_sat ** 2 / 3.)
         for part in targets:
-            self.assertEqual(part.dipm_sat, self.m_sat)
-            self.assertTrue(getattr(part, MAGNETIZATION_MODELS[model][1]))
+            with self.subTest(part=part.id):
+                self.assertEqual(part.dipm_sat, dipm_sat)
+                self.assertEqual(part.mag_susc_0, dipm_sat ** 2 / 3.)
+                self.assertTrue(getattr(part, MAGNETIZATION_MODELS[model][1]))
+                self.assertEqual(int(part.propagation), MOMENT_CARRIER_PROPAGATION)
+        with self.assertRaisesRegex(ValueError, 'dipm_sat'):
+            sim_inst.set_magnetization_model(targets, model, dipm_sat=-1., mag_susc_0=1.)
 
-    def test_rejects_bad_parameters(self):
-        targets = list(sim_inst.sys.part.select(
-            type=sim_inst.part_types['to_be_magnetized']))
-        with self.assertRaises(ValueError):
-            sim_inst.set_magnetization_model(targets, AVAILABLE_MODELS[0],
-                                             dipm_sat=-1., mag_susc_0=1.)
-
-
-class SusceptibilityFromKTTest(unittest.TestCase):
-    '''The dipm/kT parameterisation of a superparamagnetic point dipole.'''
-
-    def test_matches_the_langevin_initial_slope(self):
-        for dipm, kT in [(1., 1.), (1.732, 2.5), (0.25, 0.1)]:
-            with self.subTest(dipm=dipm, kT=kT):
-                self.assertAlmostEqual(susceptibility_from_kT(dipm, kT),
-                                       dipm ** 2 / (3. * kT))
-
-    def test_is_the_slope_of_the_classical_curve_at_zero_field(self):
-        # chi_0 must equal dm/dH of m*L(m*H/kT) as H -> 0. The field cannot be
-        # taken arbitrarily small here: 1/tanh(a) - 1/a subtracts two numbers of
-        # order 1/a, so the cancellation swamps the result long before the
-        # O(a**2) truncation of the slope does.
-        dipm, kT = 1.4, 0.8
-        h = 1e-3
-        alpha = dipm * h / kT
-        moment = dipm * (1. / np.tanh(alpha) - 1. / alpha)
-        self.assertAlmostEqual(moment / h, susceptibility_from_kT(dipm, kT),
-                               places=6)
-
-    def test_rejects_unphysical_arguments(self):
-        for dipm, kT in [(0., 1.), (-1., 1.), (1., 0.), (1., -2.)]:
-            with self.subTest(dipm=dipm, kT=kT):
-                with self.assertRaises(ValueError):
-                    susceptibility_from_kT(dipm, kT)
-
-    def test_object_config_rejects_unphysical_arguments(self):
-        for dipm, kT in [(0., 1.), (1., 0.), (-1., 1.)]:
-            with self.subTest(dipm=dipm, kT=kT):
-                with self.assertRaises(ValueError):
-                    PointDipoleSuperparamagnetic(
-                        config=PointDipoleSuperparamagnetic.config.specify(
-                            dipm=dipm, kT=kT, espresso_handle=sim_inst.sys))
-
-    def test_object_config_rejects_unknown_model(self):
-        with self.assertRaises(ValueError):
-            PointDipoleSuperparamagnetic(
-                config=PointDipoleSuperparamagnetic.config.specify(
-                    magnetization_model='ideal', espresso_handle=sim_inst.sys))
-
-
-@unittest.skipIf(not AVAILABLE_MODELS,
-                 'no magnetization model compiled in this espresso build')
-class ContractionRatioTest(BaseTestCase):
-    '''The convergence probe must measure the iteration without advancing time.'''
-
-    m_sat = 1.732
-
-    def tearDown(self) -> None:
-        self.cleanup()
-        self.assertEqual(len(sim_inst.sys.part), 0)
-
-    def _chain(self, chi_0, n=5, spacing=1.):
-        '''n touching magnetizable spheres head to tail along z.'''
-        parts = []
-        for i in range(n):
-            anchor = sim_inst.sys.part.add(pos=[10., 10., 5. + i * spacing],
-                                           fix=[True] * 3)
-            virt = sim_inst.sys.part.add(pos=anchor.pos, rotation=[True] * 3,
-                                         dip=[0., 0., self.m_sat])
-            configure_magnetization(virt, AVAILABLE_MODELS[0], self.m_sat, chi_0,
-                                    anchor=anchor)
-            parts.append(virt)
-        sim_inst.init_magnetic_inter(
-            espressomd.magnetostatics.DipolarDirectSum(prefactor=1.))
-        sim_inst.set_H_ext(H=[0., 0., 1.])
-        return parts
-
-    @staticmethod
-    def _reset_cluster():
-        sim_inst.sys.magnetostatics.clear()
-        sim_inst.sys.part.all().remove()
-
-    @staticmethod
-    def _increment_series(parts, n_iter, scalar):
-        increments = []
-        previous = None
-        for _ in range(n_iter):
-            sim_inst.sys.integrator.run(0, recalc_forces=True)
-            current = (np.array([p.dipm for p in parts]) if scalar
-                       else np.array([p.dip for p in parts]).ravel())
-            if previous is not None:
-                increments.append(np.linalg.norm(current - previous))
-            previous = current
-        return np.asarray(increments)
-
-    @staticmethod
-    def _ratios(increments, tol=1e-12):
-        converged = np.flatnonzero(increments <= tol)
-        cut = int(converged[0]) if converged.size else len(increments)
-        increments = increments[:cut]
-        if len(increments) < 2:
-            return np.empty(0)
-        return increments[1:] / increments[:-1]
-
-    def _tilted_ring(self, chi_0, n=6, radius=1.0, tilt=0.3*np.pi, H=(0., 0., 0.1)):
-        parts = []
-        for i in range(n):
-            phi = 2. * np.pi * i / n
-            anchor = sim_inst.sys.part.add(
-                pos=[10. + radius * np.cos(phi), 10. + radius * np.sin(phi), 10.],
-                fix=[True] * 3)
-            moment = self.m_sat * np.array([np.sin(tilt) * np.cos(phi),
-                                            np.sin(tilt) * np.sin(phi),
-                                            np.cos(tilt)])
-            virt = sim_inst.sys.part.add(pos=anchor.pos, rotation=[True] * 3,
-                                         dip=moment)
-            configure_magnetization(virt, AVAILABLE_MODELS[0], self.m_sat, chi_0,
-                                    anchor=anchor)
-            parts.append(virt)
-        sim_inst.init_magnetic_inter(
-            espressomd.magnetostatics.DipolarDirectSum(prefactor=1.))
-        sim_inst.set_H_ext(H=list(H))
-        return parts
-
-    def test_rotation_dominated_series_tracks_moment_vectors(self):
-        n_iter = 10
-
-        vec_inc = self._increment_series(
-            self._tilted_ring(chi_0=0.8), n_iter, scalar=False)
-        self._reset_cluster()
-        sca_inc = self._increment_series(
-            self._tilted_ring(chi_0=0.8), n_iter, scalar=True)
-        self._reset_cluster()
-        # the fixture must actually be rotation-dominated, otherwise the rest is vacuous
-        live = vec_inc > 1e-12
-        self.assertTrue(live.any(), "no resolvable increments")
-        self.assertLess((sca_inc[live] / vec_inc[live]).mean(), 0.25,
-                        "fixture is not roation-dominated, otherwise this ration would be small")
-
-        expected_vector = self._ratios(vec_inc)
-        expected_scalar = self._ratios(sca_inc)
-        actual = sim_inst.probe_magnetization_convergence(
-            self._tilted_ring(chi_0=0.8), n_iter=n_iter)
-        np.testing.assert_allclose(
-            actual, expected_vector, rtol=1e-9,
-            err_msg='probe does not track the stacked moment vectors')
-        self.assertFalse(
-            np.allclose(actual, expected_scalar),
-            "probe output matches a magnitude-only metric."
-            "contraction_ratio has regressed to reading p.dipm instead of p.dip")
-
-    def test_weak_coupling_contracts(self):
-        parts = self._chain(chi_0=0.1)
-        ratios = sim_inst.probe_magnetization_convergence(parts, n_iter=10)
-        self.assertGreater(len(ratios), 0)
-        self.assertLess(ratios[-1], 1.)
-
-    def test_stronger_coupling_contracts_more_slowly(self):
-        weak = self._chain(chi_0=0.05)
-        weak_ratio = sim_inst.probe_magnetization_convergence(weak, n_iter=10)[-1]
-        sim_inst.sys.magnetostatics.clear()
-        sim_inst.sys.part.all().remove()
-        strong = self._chain(chi_0=0.4)
-        strong_ratio = sim_inst.probe_magnetization_convergence(strong, n_iter=10)[-1]
-        self.assertLess(weak_ratio, strong_ratio)
-
-    def test_probe_does_not_advance_the_simulation(self):
-        parts = self._chain(chi_0=0.1)
-        time_before = sim_inst.sys.time
-        pos_before = np.copy(sim_inst.sys.part.all().pos)
-        sim_inst.probe_magnetization_convergence(parts, n_iter=10)
-        self.assertEqual(sim_inst.sys.time, time_before)
-        np.testing.assert_allclose(sim_inst.sys.part.all().pos, pos_before)
-
-    def test_converged_series_is_truncated_not_reported_as_noise(self):
-        parts = self._chain(chi_0=0.02)
-        ratios = sim_inst.probe_magnetization_convergence(parts, n_iter=10)
-        self.assertGreater(len(ratios), 0)
-        self.assertLess(ratios[-1], 1.)
-
-    def test_exact_fixed_point_reports_no_ratio(self):
-        anchor = sim_inst.sys.part.add(pos=[10., 10., 10.], fix=[True] * 3)
-        virt = sim_inst.sys.part.add(pos=anchor.pos, rotation=[True] * 3,
-                                     dip=[0., 0., self.m_sat])
-        configure_magnetization(virt, AVAILABLE_MODELS[0], self.m_sat, 0.1,
-                                anchor=anchor)
-        sim_inst.set_H_ext(H=[0., 0., 1.])
-        ratios = contraction_ratio(sim_inst.sys, [virt], n_iter=10)
-        self.assertEqual(len(ratios), 0)
-
-
-class MissingFeatureTest(unittest.TestCase):
-    '''Models the build does not provide must fail loudly, not silently.'''
-
-    def test_uncompiled_model_raises_missing_feature(self):
-        unavailable = [name for name in MAGNETIZATION_MODELS
-                       if name not in AVAILABLE_MODELS]
-        if not unavailable:
-            self.skipTest("every model is compiled in this espresso build")
-        anchor = sim_inst.sys.part.add(pos=[5., 5., 5.])
-        virt = sim_inst.sys.part.add(pos=anchor.pos)
-        try:
-            with self.assertRaises(MissingFeature):
-                configure_magnetization(virt, unavailable[0], 1., 1., anchor=anchor)
-        finally:
-            sim_inst.sys.part.all().remove()
-
-
-if __name__ == '__main__':
-    unittest.main()
 
 @unittest.skipIf('langevin' not in AVAILABLE_MODELS,
                  'the langevin magnetization model is not compiled in this espresso build')
-class MagnetizationRegimeTest(BaseTestCase):
-    """Pins the measured usable window documented in magnetodynamics.py.
+class ConvergenceTest(BoxTestCase):
+    '''`contraction_ratio` measures the fixed-point iteration on moment vectors without advancing time.'''
 
-    The window exists because the models take one fixed-point iterate per timestep,
-    so the moments only reach their self-consistent value where the map contracts.
-    These two points anchor opposite sides of it; if either moves, the documented
-    table and tools/magnetization_regime_sweep.py need re-measuring.
-    """
+    box_dim = (20, 20, 20)
+    m_sat = 1.732
 
-    PROBE_FIELD = 0.01
+    def _chain(self, chi_0):
+        '''Five touching magnetizable spheres head to tail along z, H=1 along z.'''
+        parts = []
+        for i in range(5):
+            anchor, virt = _make_pair(self.m_sat, pos=(10., 10., 5. + i))
+            configure_magnetization(virt, 'langevin', self.m_sat, chi_0, anchor=anchor)
+            parts.append(virt)
+        sim_inst.init_magnetic_inter(DipolarDirectSum(prefactor=1.))
+        sim_inst.set_H_ext(H=[0., 0., 1.])
+        return parts
+
+    def _tilted_ring(self):
+        '''A flat ring of six (χ₀=0.8) whose moments start tilted out of plane: the iteration mostly rotates them.'''
+        parts, tilt = [], 0.3 * np.pi
+        for i in range(6):
+            phi = 2. * np.pi * i / 6
+            anchor, virt = _make_pair(self.m_sat, pos=(10. + np.cos(phi), 10. + np.sin(phi), 10.))
+            virt.dip = self.m_sat * np.array([np.sin(tilt) * np.cos(phi),
+                                              np.sin(tilt) * np.sin(phi),
+                                              np.cos(tilt)])
+            configure_magnetization(virt, 'langevin', self.m_sat, 0.8, anchor=anchor)
+            parts.append(virt)
+        sim_inst.init_magnetic_inter(DipolarDirectSum(prefactor=1.))
+        sim_inst.set_H_ext(H=[0., 0., 0.1])
+        return parts
 
     def _settled_chain(self, chi0, n_particles=6):
-        from espressomd.magnetostatics import DipolarDirectSum
+        '''The regime-sweep geometry: PointDipoleMagnetizable at contact, H=0.01; returns (last ratio, mean |m|).'''
         spacing = 2.0 ** (1.0 / 6.0)
         cfg = PointDipoleMagnetizable.config.specify(
             magnetization_model='langevin', dipm_sat=1., mag_susc_0=chi0,
@@ -452,26 +266,78 @@ class MagnetizationRegimeTest(BaseTestCase):
             [np.array([mid, mid, centre + i * spacing]) for i in range(n_particles)],
             [np.array([0., 0., 1.]) for _ in range(n_particles)])
         sim_inst.init_magnetic_inter(DipolarDirectSum(prefactor=1.0))
-        sim_inst.set_H_ext(H=(0, 0, self.PROBE_FIELD))
+        sim_inst.set_H_ext(H=(0, 0, 0.01))
         virt = [p for o in objs for p in o.get_owned_part()[0]
                 if int(p.type) == PointDipoleMagnetizable.part_types['pdm_virt']]
         ratios = sim_inst.probe_magnetization_convergence(virt, n_iter=40)
         moment = float(np.mean([float(np.linalg.norm(p.dip)) for p in virt]))
-        return (float(ratios[-1]) if len(ratios) else 0.0), moment
+        return float(ratios[-1]), moment
 
-    def tearDown(self):
-        self.cleanup()
-        super().tearDown()
+    def test_probe_tracks_moment_vectors(self):
+        '''On a rotation-dominated ring the probe equals the stacked-vector ratios, not the magnitude ones.'''
+        n_iter, tol = 10, 1e-12
+        parts = self._tilted_ring()
+        snapshots = []
+        for _ in range(n_iter):
+            sim_inst.sys.integrator.run(0, recalc_forces=True)
+            snapshots.append(np.array([p.dip for p in parts]))
+        snapshots = np.array(snapshots)
+        vector_inc = np.linalg.norm(np.diff(snapshots, axis=0).reshape(n_iter - 1, -1), axis=1)
+        magnitude_inc = np.linalg.norm(np.diff(np.linalg.norm(snapshots, axis=2), axis=0), axis=1)
+        # no increment reaches tol, so the probe keeps the full series and no truncation is needed here
+        self.assertGreater(vector_inc.min(), tol)
+        self.assertLess((magnitude_inc / vector_inc).mean(), 0.25)
 
-    def test_in_window_chi0_converges_without_saturating(self):
-        """chi0=0.1 is inside the window: contracts, and barely magnetised."""
-        ratio, moment = self._settled_chain(0.1)
-        self.assertLess(ratio, 1.0, msg="in-window point must contract")
-        self.assertLess(moment, 0.5, msg="in-window point must not be saturated")
+        sim_inst.sys.part.all().remove()
+        actual = sim_inst.probe_magnetization_convergence(self._tilted_ring(), n_iter=n_iter, tol=tol)
+        np.testing.assert_allclose(actual, vector_inc[1:] / vector_inc[:-1], rtol=1e-9)
+        self.assertFalse(np.allclose(actual, magnitude_inc[1:] / magnitude_inc[:-1]))
 
-    def test_out_of_window_chi0_is_saturated_despite_a_small_ratio(self):
-        """chi0=1.0 is outside it, and shows exactly the documented false positive.
-        """
-        _, moment = self._settled_chain(1.0)
-        self.assertGreater(moment, 0.5,
-                           msg="but the moments are saturated, so that ratio is meaningless")
+    def test_ratio_scales_linearly_with_chi0(self):
+        '''Unsaturated chains contract with ratio ∝ χ₀ (3.8·χ₀ here), as the module docstring states.'''
+        n_iter, slopes = 10, []
+        for chi_0 in (0.02, 0.05, 0.1):
+            with self.subTest(chi_0=chi_0):
+                sim_inst.sys.part.all().remove()
+                parts = self._chain(chi_0)
+                time_before = sim_inst.sys.time
+                ratios = sim_inst.probe_magnetization_convergence(parts, n_iter=n_iter)
+                self.assertEqual(sim_inst.sys.time, time_before)
+                self.assertEqual(len(ratios), n_iter - 2)
+                self.assertTrue(np.all(ratios < 1.))
+                slopes.append(ratios[-1] / chi_0)
+        np.testing.assert_allclose(slopes, slopes[0], rtol=0.05)
+
+    def test_truncation_and_argument_contract(self):
+        '''A loose tol cuts the series short; a lone particle leaves no ratio; bad arguments are refused.'''
+        n_iter = 10
+        ratios = sim_inst.probe_magnetization_convergence(self._chain(chi_0=0.02), n_iter=n_iter, tol=1e-6)
+        self.assertTrue(0 < len(ratios) < n_iter - 2)
+        self.assertTrue(np.all(ratios < 1.))
+        sim_inst.sys.part.all().remove()
+
+        anchor, virt = _make_pair(self.m_sat, pos=(10., 10., 10.))
+        configure_magnetization(virt, 'langevin', self.m_sat, 0.1, anchor=anchor)
+        self.assertEqual(len(contraction_ratio(sim_inst.sys, [virt], n_iter=n_iter)), 0)
+        for label, part_list, kwargs, fragment in [('n_iter=1', [virt], {'n_iter': 1}, 'n_iter'),
+                                                   ('tol=0', [virt], {'tol': 0.}, 'tol'),
+                                                   ('empty part_list', [], {}, 'empty')]:
+            with self.subTest(label), self.assertRaisesRegex(ValueError, fragment):
+                contraction_ratio(sim_inst.sys, part_list, **kwargs)
+
+    def test_documented_regime_points(self):
+        '''Pins two points of the regime table in magnetodynamics.py; if either moves, re-measure the table.'''
+        # χ₀=1.0 is the documented false positive: it contracts, but around a saturated fixed point
+        for chi_0, saturated in ((0.1, False), (1.0, True)):
+            with self.subTest(chi_0=chi_0):
+                BaseTestCase.cleanup(self.box_dim)
+                ratio, moment = self._settled_chain(chi_0)
+                self.assertLess(ratio, 1.)
+                if saturated:
+                    self.assertGreater(moment, 0.5)
+                else:
+                    self.assertLess(moment, 0.5)
+
+
+if __name__ == '__main__':
+    unittest.main()
