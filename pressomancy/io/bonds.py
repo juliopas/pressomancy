@@ -1,39 +1,61 @@
-"""Normalized, static HDF5 persistence for espresso bonds.
+"""Static HDF5 persistence for espresso bonds, in the H5MD connectivity form.
 
-Layout, under ``/connectivity/<Group>/bonds``::
+Layout, for one particle group ``<Group>``::
 
-    params/<BondTypeName>  compound, one row per *registered* bond
-                           (``bond_id`` + exactly that type's parameters)
-    particle_ids           int32  (N,)    particle id of each CSR row
-    offsets                int64  (N+1,)  CSR row pointers into ``links``
-    links                  int32  (M, 2 + max_partners)
-                           columns: bond_id, n_partners, p0 .. pk  (-1 padded)
+    /connectivity/<Group>/bonds        int32 (N1, 2)  (owner, partner)             -- always written
+    /connectivity/<Group>/angles       int32 (N2, 3)  (owner, p0, p1)              -- only if such links exist
+    /connectivity/<Group>/dihedrals    int32 (N3, 4)  (owner, p0, p1, p2)          -- only if such links exist
+        every entry is a COLUMN INDEX (0..N-1) into the group's ``<element>/value``
+        arrays, as the H5MD connectivity spec requires -- not a particle id
+        every table: attr particles_group = "/particles/<Group>"
+        ``bonds`` only: attrs n_links (links of ALL tables), captured_at_time
+    /pressomancy/<Group>/bond_params/bond_id      int32 (N1,)  row-aligned with ``bonds``
+    /pressomancy/<Group>/bond_params/angle_id     int32 (N2,)  row-aligned with ``angles``
+    /pressomancy/<Group>/bond_params/dihedral_id  int32 (N3,)  row-aligned with ``dihedrals``
+    /pressomancy/<Group>/bond_params/<BondClass>  compound, one row per *registered* bond
+                                                  (``bond_id`` + exactly that class's parameters)
 
-Parameters live once in ``params`` and are referenced by ``bond_id``: nothing is
-repeated per occurrence, and nothing is repeated per frame because the topology
-has no time axis at all. CSR rather than a vlen-of-compound: it chunks and
-compresses properly, reads contiguously, and slices per particle trivially.
+A link is stored once, on its owner (the particle whose ``part.bonds`` lists it).
+Inside pressomancy a particle is an id; the file's column indices exist only in
+this module: ``write_bonds`` maps ids to indices (``np.searchsorted`` over the
+group's ascending id column) and ``read_link_tables`` maps them back through
+``particles/<Group>/id/value[0]`` (the id column is constant across frames), so
+``read_bonds``, ``H5DataSelector.bonds`` and ``set_bonds_from_src`` all see ids.
+A partner that is not a particle of the group has no column and is a
+``NotImplementedError`` at write time, naming the link, rather than a foreign number in
+the table. The table a link lands in is decided by its partner count
+(``LINK_TABLES`` in ``io/read.py``: 1 -> bonds, 2 -> angles, 3 -> dihedrals,
+which covers every espresso bond). Parameters live once in the
+class tables and are referenced by ``bond_id``: nothing is repeated per
+occurrence, and nothing is repeated per frame because the topology has no time
+axis at all. Cannot track changes to bond topology in time.
 """
 
-from collections import defaultdict
-
 import logging
+from collections import defaultdict
 
 import h5py
 import numpy as np
 
 import espressomd.interactions
 
+from pressomancy.io.read import LINK_TABLES, element_name
+
 _SKIP_PARAMS = frozenset({"bond_id", "_bond_id"})
+
+#: How many offending links a single aggregated warning lists by name.
+_MAX_EXAMPLES = 3
+
+_GZ = dict(compression="gzip", compression_opts=4)
 
 
 def _bond_id_of(handle):
-    """Registration id of ``handle``.
+    """Registration id of ``handle`` keyed on ``handle._bond_id``.
 
-    Keyed on ``_bond_id``, never on ``id(handle)``: espresso re-creates the
-    Python wrapper on every ``part.bonds`` access, and once a temporary is
-    collected CPython reuses its ``id()`` for an unrelated object, which would
-    silently resolve to the wrong bond.
+    Never on ``id(handle)``: espresso re-creates the Python wrapper on every
+    ``part.bonds`` access, and once a temporary is collected CPython reuses
+    its ``id()`` for an unrelated object, which would silently resolve to
+    the wrong bond.
     """
     bond_id = getattr(handle, "_bond_id", None)
     if bond_id is None or int(bond_id) < 0:
@@ -46,51 +68,36 @@ def _bond_id_of(handle):
 
 def _registered_bonds(sys):
     """``[(bond_id, handle), ...]`` for every bond in ``sys.bonded_inter``."""
-    out = []
-    for entry in sys.bonded_inter:
-        if isinstance(entry, tuple):
-            bond_id, handle = int(entry[0]), entry[1]
-        else:
-            bond_id, handle = _bond_id_of(entry), entry
-        out.append((bond_id, handle))
-    return out
+    return [(_bond_id_of(handle), handle) for handle in sys.bonded_inter]
 
 
 # --------------------------------------------------------------------------- #
 # Safeguard for new bonds
 # --------------------------------------------------------------------------- #
 
-def count_bond_links(particles):
-    """Total bond occurrences owned by ``particles``. One pass, no allocation."""
-    return sum(len(part.bonds) for part in particles)
 
-
-def check_bond_count(stored, particles, group_name, policy='raise'):
+def check_bond_count(stored, particles, group_name):
     """Guard against topology changes after inscription.
 
-    Compares occurrence counts only, so a rewire that
-    leaves the count unchanged will go unnoticed.
-    """
-    if policy == 'ignore' or stored is None:
-        return None
-    live = count_bond_links(particles)
-    if live == stored:
-        return True
-    msg = (
-        f"Bond topology of group '{group_name}' changed after inscription "
-        f"({stored} -> {live} bond occurrences). Topology is written once and "
-        "has no time axis, so this change is NOT in the file. Create all bonds "
-        "before calling inscribe_part_group_to_h5()."
-        "\nThis warning/error can be supressed by chainging the 'policy' in"
-        "pressomancy.io.bonds.check_bond_count."
-    )
-    if policy == 'warn':
-        logging.warning(msg)
-    else:
-        raise RuntimeError(msg)
-    return False
+    Compares occurrence counts only, so a rewire that leaves the count
+    unchanged will go unnoticed. ``stored`` is the ``n_links`` captured at
+    inscription (``None`` when the group was inscribed without bonds).
 
-    
+    Raises:
+        RuntimeError: If the live count differs from ``stored``.
+    """
+    if stored is None:
+        return
+    live = sum(len(part.bonds) for part in particles)
+    if live != stored:
+        raise RuntimeError(
+            f"Bond topology of group '{group_name}' changed after inscription "
+            f"({stored} -> {live} bond occurrences). Topology is written once and "
+            "has no time axis, so this change is NOT in the file. Create all bonds "
+            "before calling inscribe_part_group_to_h5()."
+        )
+
+
 # --------------------------------------------------------------------------- #
 # parameter schema (derived, not hardcoded)
 # --------------------------------------------------------------------------- #
@@ -98,7 +105,7 @@ def check_bond_count(stored, particles, group_name, policy='raise'):
 def _param_items(handle):
     """``[(name, value)]`` of the parameters needed to rebuild ``handle``."""
     params = handle.get_params()
-    names = sorted(params)
+    names = sorted(params.keys())
     return [(n, params[n]) for n in names if n not in _SKIP_PARAMS]
 
 
@@ -127,13 +134,63 @@ def h5_dtype_for(handle):
     return np.dtype(fields)
 
 
-def write_bond_params(bonds_grp, sys):
-    """Write ``bonds/params/<BondTypeName>``, one compound table per bond type."""
+def _param_signature(bond_cls, params):
+    """Hashable identity of ``(bond_cls, params)``, comparable across the file.
+
+    Floats are rounded to ``float32`` because that is what ``h5_dtype_for``
+    stores, so a live ``float64`` parameter and its own stored copy produce the
+    *same* signature and a lossless round trip compares equal. The class is
+    keyed by name rather than by the class object, so a file read in another
+    process compares against the live registry all the same.
+    """
+    items = []
+    for name, value in sorted(params.items()):
+        if name in _SKIP_PARAMS:
+            continue
+        arr = np.asarray(value)
+        if arr.ndim:
+            flat = arr.ravel()
+            if flat.dtype.kind == "f":
+                items.append((name, tuple(float(x) for x in np.float32(flat))))
+            else:
+                items.append((name, tuple(flat.tolist())))
+        elif arr.dtype.kind == "f":
+            items.append((name, float(np.float32(arr.item()))))
+        elif arr.dtype.kind == "b":
+            items.append((name, bool(arr.item())))
+        elif arr.dtype.kind in "iu":
+            items.append((name, int(arr.item())))
+        else:
+            items.append((name, arr.item()))
+    return (bond_cls.__name__ if isinstance(bond_cls, type) else str(bond_cls),
+            tuple(items))
+
+
+def _live_links_of(part):
+    """``{partners_tuple: [signature, ...]}`` for one live particle, in bond order."""
+    by_partners = defaultdict(list)
+    for entry in part.bonds:
+        handle, partners = entry[0], tuple(int(x) for x in entry[1:])
+        by_partners[partners].append(_param_signature(type(handle), handle.get_params()))
+    return by_partners
+
+
+def _stored_links_by_particle(h5_file, group_name):
+    """``(params_table, {particle_id: [(partners, bond_id, cls, kw), ...]})``."""
+    stored = read_bond_params(h5_file, group_name)
+    by_particle = defaultdict(list)
+    for pid, partners, bond_id in read_bonds(h5_file, group_name):
+        cls, kw = stored[int(bond_id)]
+        by_particle[int(pid)].append((partners, int(bond_id), cls, kw))
+    return stored, by_particle
+
+
+def write_bond_params(params_grp, sys):
+    """Write ``<params_grp>/<BondClass>``, one compound table per registered bond class."""
     by_type = defaultdict(list)
     for bond_id, handle in _registered_bonds(sys):
         by_type[type(handle)].append((bond_id, handle))
 
-    params_grp = bonds_grp.require_group("params")
     for bond_cls, entries in by_type.items():
         dtype = h5_dtype_for(entries[0][1])
         names = [n for n in dtype.names if n != "bond_id"]
@@ -145,124 +202,220 @@ def write_bond_params(bonds_grp, sys):
             for name in names:
                 table[row][name] = params[name]
 
-        params_grp.create_dataset(
-            bond_cls.__name__, data=table,
-            compression="gzip", compression_opts=4,
-        )
+        params_grp.create_dataset(bond_cls.__name__, data=table, **_GZ)
 
 
 # --------------------------------------------------------------------------- #
 # connectivity
 # --------------------------------------------------------------------------- #
 
-def collect_bond_links(particles):
-    """Build the CSR connectivity for ``particles``.
+def _columns_of(ids, id_rows, group_name, bond_ids):
+    """Column index of every id in ``id_rows`` (L, 1 + k) within the ascending ``ids``.
+
+    The id -> column translation of the write side. A partner id without a column
+    (a particle of another group, or of no object) raises ``NotImplementedError``
+    naming owner, partner and bond id: H5MD connectivity rows are indices into one
+    particles group, and bonds across groups are not supported by this writer.
+    """
+    columns = np.searchsorted(ids, id_rows)
+    in_range = columns < ids.size
+    found = np.zeros_like(in_range)
+    found[in_range] = ids[columns[in_range]] == id_rows[in_range]
+    if not found.all():
+        row, col = np.argwhere(~found)[0]
+        raise NotImplementedError(
+            f"Group '{group_name}': particle {int(id_rows[row, 0])} owns a bond (bond_id "
+            f"{int(bond_ids[row])}) to partner {int(id_rows[row, col])}, which is not a particle "
+            f"of the group. Bonds between different particle groups are not supported: H5MD "
+            f"connectivity rows are column indices into particles/{group_name}.")
+    return columns
+
+
+def write_bonds(h5_file, group_name, particles, sys):
+    """Write the link tables and parameter tables of ``group_name``. Call once, at inscription.
 
     ``particles`` is the flat view for one registered group, in the *same order*
-    as the columns of that group's ``pos/value``. Partners may live outside the
-    group; they are stored as raw particle ids and left for the reader to
-    resolve, so a dangling partner is visible rather than silently dropped.
+    as the columns of that group's ``<element>/value`` (ascending id); link rows
+    are stored as column indices into it. Returns ``n_links``, the number of
+    links over all tables (what ``check_bond_count`` compares).
 
-    Returns:
-        tuple: ``(particle_ids, offsets, links, max_partners)``.
+    Raises:
+        ValueError: If ``particles`` is not in strictly ascending id order.
+        NotImplementedError: If a link has a partner outside the group (bonds
+            between particle groups are not supported, see ``_columns_of``).
     """
-    particle_ids = np.fromiter((int(p.id) for p in particles),
-                               dtype=np.int32, count=len(particles))
+    conn_grp = h5_file.require_group(f"connectivity/{group_name}")
+    params_grp = h5_file.require_group(f"pressomancy/{group_name}/bond_params")
+    write_bond_params(params_grp, sys)
 
-    rows, max_partners = [], 1
+    ids = np.array([int(part.id) for part in particles], dtype=np.int64)
+    if not np.all(np.diff(ids) > 0):
+        raise ValueError(f"Group '{group_name}': particles must be in strictly ascending id order "
+                         f"(file column order) to store links as column indices; got {ids.tolist()}.")
+    # One row per link: (bond_id, owner id, partner ids...), bucketed by partner count.
+    rows_by_arity = defaultdict(list)
     for part in particles:
-        row = []
         for entry in part.bonds:
-            handle, partners = entry[0], entry[1:]
-            max_partners = max(max_partners, len(partners))
-            row.append((_bond_id_of(handle), [int(x) for x in partners]))
-        rows.append(row)
+            handle, partners = entry[0], [int(x) for x in entry[1:]]
+            rows_by_arity[len(partners)].append((_bond_id_of(handle), int(part.id), *partners))
+    n_links = sum(len(rows) for rows in rows_by_arity.values())
+    rows_by_arity.setdefault(1, [])   # the H5MD 'bonds' table is always present
+    unsupported = sorted(set(rows_by_arity) - set(LINK_TABLES))
+    if unsupported:
+        raise NotImplementedError(
+            f"Group '{group_name}' has links with {unsupported} partner(s); only "
+            f"{sorted(LINK_TABLES)} partner(s) have a table ({LINK_TABLES}).")
+    for arity, rows in sorted(rows_by_arity.items()):
+        table_name, id_name = LINK_TABLES[arity]
+        arr = np.array(rows, dtype=np.int64).reshape(len(rows), 2 + arity)
+        columns = _columns_of(ids, arr[:, 1:], group_name, arr[:, 0])
+        # A zero-row dataset cannot be chunked, and gzip requires chunking.
+        gz = _GZ if rows else {}
+        table = conn_grp.create_dataset(table_name, data=columns.astype(np.int32), **gz)
+        table.attrs["particles_group"] = f"/particles/{group_name}"
+        params_grp.create_dataset(id_name, data=arr[:, 0].astype(np.int32), **gz)
 
-    counts = np.fromiter((len(r) for r in rows), dtype=np.int64, count=len(rows))
-    offsets = np.zeros(len(rows) + 1, dtype=np.int64)
-    np.cumsum(counts, out=offsets[1:])
-
-    links = np.full((int(offsets[-1]), 2 + max_partners), -1, dtype=np.int32)
-    k = 0
-    for row in rows:
-        for bond_id, partners in row:
-            links[k, 0] = bond_id
-            links[k, 1] = len(partners)
-            links[k, 2:2 + len(partners)] = partners
-            k += 1
-    return particle_ids, offsets, links, max_partners
-
-
-def write_bonds(connect_grp, particles, sys, step=0):
-    """Write ``<connect_grp>/bonds``. Call once, at inscription.
-
-    Idempotent: an existing group is deleted first, so re-inscribing a group
-    does not collide.
-    """
-    if "bonds" in connect_grp:
-        del connect_grp["bonds"]
-    bonds_grp = connect_grp.require_group("bonds")
-    write_bond_params(bonds_grp, sys)
-
-    particle_ids, offsets, links, max_partners = collect_bond_links(particles)
-    gz = dict(compression="gzip", compression_opts=4)
-    bonds_grp.create_dataset("particle_ids", data=particle_ids, **gz)
-    bonds_grp.create_dataset("offsets", data=offsets, **gz)
-    # A zero-row dataset cannot be chunked, and gzip requires chunking.
-    bonds_grp.create_dataset("links", data=links, **(gz if links.shape[0] else {}))
-
-    n_links = int(offsets[-1])
-    bonds_grp.attrs["static_topology"] = True
-    bonds_grp.attrs["max_partners"] = int(max_partners)
-    bonds_grp.attrs["n_links"] = n_links
-    bonds_grp.attrs["link_columns"] = np.array(
-        ["bond_id", "n_partners"] + [f"partner_{i}" for i in range(max_partners)],
-        dtype=h5py.string_dtype(encoding="ascii"),
-    )
-    bonds_grp.attrs["captured_at_step"] = int(step)
-    bonds_grp.attrs["captured_at_time"] = float(sys.time)
+    conn_grp["bonds"].attrs["n_links"] = n_links
+    conn_grp["bonds"].attrs["captured_at_time"] = float(sys.time)
     return n_links
 
 
-def verify_bond_params(connect_grp, sys):
-    """Warn if the live ``sys.bonded_inter`` has drifted from the stored tables.
+# For a nice error message in verify_bond_params
+def _drift_description(stored_sig, live_sig):
+    """Human-readable difference between two ``_param_signature`` values."""
+    stored_cls, stored_params = stored_sig
+    live_cls, live_params = live_sig
+    if stored_cls != live_cls:
+        return f"file says {stored_cls}, live bond is {live_cls}"
+    live_map = dict(live_params)
+    diffs = [f"'{name}' file {value!r} live {live_map.get(name, '<absent>')!r}"
+             for name, value in stored_params if live_map.get(name, object()) != value]
+    extra = [name for name, _ in live_params if name not in dict(stored_params)]
+    if extra:
+        diffs.append(f"live-only parameter(s) {extra}")
+    return f"{stored_cls}: " + ", ".join(diffs or ["parameters differ"])
+
+
+def verify_bond_params(h5_file, group_name, sys):
+    """Warn if the live bonds have drifted from the stored tables, by *content*.
+
+    Two independent, id-agnostic checks:
+
+    1. **Per stored link**: the parameters of the bond actually attached to that
+       particle (matched on the link's partner ids) are compared with the
+       parameters the file stores for it.
+    2. **Registry**: every distinct ``(class, parameters)`` set in the file's
+       class tables must still exist somewhere in ``sys.bonded_inter``.
+
+    Neither keys on the espresso registration id: a restart registers bonds in
+    whatever order it rebuilds them, so file id *N* and live id *N* are
+    unrelated bonds. Deduplicated registration (one handle shared by several
+    stored ids) is likewise silent, because the content is what is compared.
 
     Advisory only: on resume the file is authoritative and is not rewritten.
+    Reports are aggregated -- at most one line per kind of drift, with a count
+    and up to ``_MAX_EXAMPLES``=3 examples -- so a systematic mismatch cannot bury
+    the log.
+
+    Raises:
+        KeyError: If the file holds no ``connectivity/<group_name>/bonds`` table
+            (the group was inscribed with ``io_dict['bonds']`` disabled).
     """
-    bonds_grp = connect_grp.get("bonds")
-    if bonds_grp is None:
-        logging.warning("Bonds requested but no bonds group found in %s.",
-                        connect_grp.name)
-        return
-    stored = read_bond_params(bonds_grp)
-    for bond_id, handle in _registered_bonds(sys):
-        entry = stored.get(bond_id)
-        if entry is None:
-            logging.warning("Bond id %d (%s) is live but absent from the file.",
-                            bond_id, type(handle).__name__)
+    where = f"connectivity/{group_name}"
+    if f"{where}/bonds" not in h5_file:
+        raise KeyError(f"{h5_file.filename} has no bond topology at '{where}/bonds' (the group "
+                       "was inscribed with io_dict['bonds'] disabled); cannot resume with bonds.")
+    # 1. Read the stored links (by particle) and the stored parameter tables.
+    stored_params, stored_by_particle = _stored_links_by_particle(h5_file, group_name)
+
+    live_ids = set()
+    if len(sys.part):
+        live_ids = {int(x) for x in np.asarray(sys.part.all().id).reshape(-1)}
+
+    # 2. Per-link content comparison: match each stored link against the live
+    # bonds on the same partners, by parameter signature rather than by id.
+    missing_particles, drifted, unmatched = [], [], []
+    n_links = 0
+    for pid, links in stored_by_particle.items():
+        n_links += len(links)
+        if pid not in live_ids:
+            missing_particles.append(pid)
             continue
-        cls, kw = entry
-        if cls is not type(handle):
-            logging.warning("Bond id %d: file says %s, live handle is %s.",
-                            bond_id, cls.__name__, type(handle).__name__)
-            continue
-        live = handle.get_params()
-        for name, value in kw.items():
-            if not np.allclose(np.asarray(live[name], dtype=float),
-                               np.asarray(value, dtype=float)):
-                logging.warning("Bond id %d (%s): parameter '%s' differs "
-                                "(file %r, live %r).",
-                                bond_id, cls.__name__, name, value, live[name])
+        live_by_partners = _live_links_of(sys.part.by_id(pid))
+        for partners, bond_id, cls, kw in links:
+            stored_sig = _param_signature(cls, kw)
+            pool = live_by_partners.get(partners)
+            if pool and stored_sig in pool:
+                pool.remove(stored_sig)
+            elif pool:
+                drifted.append((pid, partners, bond_id, stored_sig, pool.pop(0)))
+            else:
+                unmatched.append((pid, partners, bond_id))
+
+    if missing_particles:
+        logging.warning(
+            "Bond verification: %d of %d particles that own stored bonds in %s do not "
+            "exist in the live system (e.g. ids %s); their links were not checked.",
+            len(missing_particles), len(stored_by_particle), where,
+            missing_particles[:_MAX_EXAMPLES])
+    if unmatched:
+        logging.warning(
+            "Bond verification: %d of %d stored links in %s have no live bond on the "
+            "same partners, so the live topology differs from the file (e.g. %s).",
+            len(unmatched), n_links, where,
+            [f"particle {pid} -> {partners} (file bond_id {bid})"
+             for pid, partners, bid in unmatched[:_MAX_EXAMPLES]])
+    if drifted:
+        logging.warning(
+            "Bond verification: %d of %d stored links in %s are attached to a live bond "
+            "with different parameters (e.g. %s). The file is authoritative and is not "
+            "rewritten.",
+            len(drifted), n_links, where,
+            [f"particle {pid} -> {partners} (file bond_id {bid}): "
+             f"{_drift_description(stored_sig, live_sig)}"
+             for pid, partners, bid, stored_sig, live_sig in drifted[:_MAX_EXAMPLES]])
+
+    # 3. Registry check: every distinct stored parameter set must still exist
+    # somewhere in sys.bonded_inter, regardless of which particle owns it.
+    file_sigs = {}
+    for bond_id, (cls, kw) in stored_params.items():
+        file_sigs.setdefault(_param_signature(cls, kw), []).append(bond_id)
+    live_sigs = {_param_signature(type(handle), handle.get_params())
+                 for _, handle in _registered_bonds(sys)}
+    absent = [sig for sig in file_sigs if sig not in live_sigs]
+    if absent:
+        logging.warning(
+            "Bond verification: %d of %d distinct parameter sets stored in %s are not "
+            "registered in sys.bonded_inter (e.g. %s).",
+            len(absent), len(file_sigs), where,
+            [f"{sig[0]}{dict(sig[1])} (file bond_id(s) {file_sigs[sig][:_MAX_EXAMPLES]})"
+             for sig in absent[:_MAX_EXAMPLES]])
+    live_only = live_sigs - set(file_sigs)
+    if live_only:
+        logging.info(
+            "Bond verification: %d live parameter set(s) are not in %s; they were "
+            "registered after the topology was captured.",
+            len(live_only), where)
+    if not (missing_particles or unmatched or drifted or absent):
+        logging.debug("Bond verification: %d stored links and %d distinct parameter "
+                      "sets in %s all match the live system.",
+                      n_links, len(file_sigs), where)
 
 
 # --------------------------------------------------------------------------- #
 # reading
 # --------------------------------------------------------------------------- #
 
-def read_bond_params(bonds_grp):
-    """Return ``{bond_id: (bond_class, {param: value})}`` from ``bonds/params``."""
+def read_bond_params(h5_file, group_name):
+    """``{bond_id: (bond_class, {param: value})}`` from the class tables of ``pressomancy/<group>/bond_params``.
+
+    The class tables are the compound datasets there; the ``*_id`` arrays
+    (plain int32) are skipped.
+    """
     table = {}
-    for type_name, dset in bonds_grp["params"].items():
+    for type_name, dset in h5_file[f"pressomancy/{group_name}/bond_params"].items():
+        if dset.dtype.names is None:
+            continue
         bond_cls = getattr(espressomd.interactions, type_name, None)
         if bond_cls is None:
             raise NotImplementedError(
@@ -280,22 +433,34 @@ def read_bond_params(bonds_grp):
     return table
 
 
-def read_bonds(bonds_grp, instantiate=False):
-    """Yield ``(particle_id, partners, bond)`` for every stored bond.
+def read_link_tables(h5_file, group_name):
+    """``[(owner_ids, partner_ids, bond_ids), ...]``, one entry per stored link table, as particle ids.
 
-    ``partners`` is a tuple of particle ids, so angle and dihedral bonds come
-    back intact. ``bond`` is the integer ``bond_id`` by default; pass
-    ``instantiate=True`` to get live espresso bond objects instead, which
-    requires an initialised espresso System in the process.
+    Tables come in arity order (bonds, angles, dihedrals; absent ones skipped),
+    rows in stored order: ``owner_ids`` (L,), ``partner_ids`` (L, k), ``bond_ids``
+    (L,). The column -> id translation of the read side: the file's indices are
+    resolved through ``particles/<group>/id/value[0]`` (the id column is constant
+    across frames) before anything downstream sees them.
     """
-    params = read_bond_params(bonds_grp)
-    bonds = ({bid: cls(**kw) for bid, (cls, kw) in params.items()}
-             if instantiate else {bid: bid for bid in params})
+    conn_grp = h5_file[f"connectivity/{group_name}"]
+    params_grp = h5_file[f"pressomancy/{group_name}/bond_params"]
+    ids = np.asarray(h5_file[f"particles/{group_name}/{element_name('id')}/value"][0]).reshape(-1)
+    tables = []
+    for _arity, (table_name, id_name) in sorted(LINK_TABLES.items()):
+        if table_name not in conn_grp:
+            continue
+        links = ids[np.asarray(conn_grp[table_name][...], dtype=np.intp)]
+        tables.append((links[:, 0], links[:, 1:], np.asarray(params_grp[id_name][...])))
+    return tables
 
-    particle_ids = bonds_grp["particle_ids"][...]
-    offsets = bonds_grp["offsets"][...]
-    links = bonds_grp["links"][...]
-    for i, pid in enumerate(particle_ids):
-        for link in links[offsets[i]:offsets[i + 1]]:
-            n = int(link[1])
-            yield int(pid), tuple(int(x) for x in link[2:2 + n]), bonds[int(link[0])]
+
+def read_bonds(h5_file, group_name):
+    """Yield ``(owner_id, partners, bond_id)`` for every stored link of ``group_name``.
+
+    Tables are visited in arity order (bonds, angles, dihedrals), rows in stored
+    order. ``partners`` is a tuple of particle ids, so angle and dihedral bonds
+    come back intact; ``bond_id`` indexes ``read_bond_params(h5_file, group_name)``.
+    """
+    for owners, partners, bond_ids in read_link_tables(h5_file, group_name):
+        for owner, row, bond_id in zip(owners, partners, bond_ids):
+            yield int(owner), tuple(int(x) for x in row), int(bond_id)

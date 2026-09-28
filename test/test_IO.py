@@ -1,63 +1,44 @@
 import numpy as np
 import espressomd
 from .create_system import sim_inst , BaseTestCase
-from pressomancy.simulation import Filament, Quartet, Quadriplex, Crowder, Elastomer, PointDipolePermanent
-from pressomancy.helper_functions import BondWrapper
-from pressomancy.analysis import H5DataSelector, H5ObservableSelector
+from pressomancy.simulation import (Filament, Quartet, Quadriplex, Crowder, Elastomer,
+                                    PointDipolePermanent, PointDipoleMagnetizable)
+from pressomancy.infra import BondWrapper, api_agnostic_feature_check
+from pressomancy.magnetodynamics import required_features_for
+from pressomancy.io import (H5DataSelector, H5ObservableSelector, stored_steps,
+                            CHECKPOINT_PROPERTIES, checkpoint_properties)
+from pressomancy.io.read import LAYOUT, element_name
 import h5py
+import importlib.util
 import tempfile
 import os
-import logging
 import shutil
+import unittest
 from unittest.mock import patch
-import pressomancy.simulation as simulation_module
-import pressomancy.io.h5_writer as h5_writer_module
-import warnings
+import pressomancy.io.write as write_module
+from pressomancy.io.bonds import verify_bond_params, write_bonds, read_bonds, read_bond_params
 
-class cestica():
-    pass
+#: Box of the SourceFixture classes and the bond-heavy ones: a cell-grid rebuild costs ~125 ms in 50^3,
+#: ~4 ms here. 16 is the smallest side a SourceFixture filament (size 8) fits: set_objects needs L/2 >= size.
+SMALL_BOX = (16, 16, 16)
 
-def capture_particle_snapshot(parts, custom_prop=None):
-    snap=[]
-    for part in parts:
-        new=cestica()
-        for prop, _, _ in sim_inst.io_dict["properties"]:
-            setattr(new, prop, getattr(part, prop))
-        if custom_prop is not None:
-            setattr(new, custom_prop, getattr(part, custom_prop))
-        snap.append(new)
-    return snap
 
-def check_prop_dim_dtype(dataview, ref_parts, prop_shape_dtype, time_slice=-1, expected_types=None):
-    prop, shape, _dtype = prop_shape_dtype
-    property_data_h5df=getattr(dataview,prop)
-    # dtype / shape checks on the stored data, before any squeeze
-    assert property_data_h5df.dtype == np.dtype(_dtype), \
-        f"'{prop}': stored dtype {property_data_h5df.dtype}, expected {np.dtype(_dtype)}"
-    assert property_data_h5df.shape[-1] == shape, \
-        f"'{prop}': stored last dim {property_data_h5df.shape[-1]}, expected {shape}"
-    property_data=[]
-    time_part_slice=np.atleast_2d(ref_parts if time_slice is None else ref_parts[time_slice])
-    for snap in time_part_slice:
-        if expected_types is not None:
-            property_data.append([getattr(part,prop) for part in snap if part.type in expected_types])
-        else:
-            property_data.append([getattr(part,prop) for part in snap])
-    if shape == 1:
-        property_data_h5df=np.squeeze(property_data_h5df, axis=-1)
-    assert np.allclose(property_data, property_data_h5df, rtol=1e-05, atol=1e-08), \
-        f'The vectors differ!, {property_data}, {property_data_h5df}'
+class IOTestCase(BaseTestCase):
+    """A class tmpdir; every test resets into the class's `box_dim`, and 50^3 comes back once at the end."""
 
-def get_and_check_complete_object(dataview, object_grp_name, identity, ref_parts, expected_types, time_slice):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.tmpdir = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmpdir.cleanup)
+        cls.addClassCleanup(BaseTestCase.cleanup)     # runs first (LIFO), even if setUpClass fails
+        BaseTestCase.cleanup(cls.box_dim)             # every test resets after itself; this covers the first
 
-    selection_source = dataview if time_slice is None else dataview.timestep[time_slice]
-    selection=selection_source.select_particles_by_object(object_name=object_grp_name, connectivity_value=identity)
-    for prop,shape,_dtpye in sim_inst.io_dict['properties']:
-        check_prop_dim_dtype(selection, ref_parts, (prop, shape, _dtpye), time_slice=time_slice, expected_types=expected_types)
-    for predicate_type in expected_types:
-        selection=selection_source.select_particles_by_object(object_name=object_grp_name, connectivity_value=identity,predicate=lambda p:p.type==predicate_type)
-        for prop,shape,_dtype in sim_inst.io_dict['properties']:
-            check_prop_dim_dtype(selection, ref_parts, (prop, shape, _dtype), time_slice=time_slice, expected_types=[predicate_type])
+    def setUp(self):
+        super().setUp()
+        # addCleanup, not tearDown: it also runs when a subclass setUp fails half-way.
+        self.addCleanup(BaseTestCase.cleanup, self.box_dim)
+
 
 class CommonH5DataSelectorTests:
 
@@ -67,22 +48,27 @@ class CommonH5DataSelectorTests:
     lib_path="/some/path/"
     author="dungeonwitch"
     email='dungeonwitch@dungeon.com'
+    kT = 0.75           # not the Simulation default (1.), so the stored kT attr means something
 
     @classmethod
     def setUpClass(cls):
         sim_inst.set_author(cls.author, cls.email)
         super().setUpClass()
         sim_inst.sys.box_l = cls.box_dim
+        sim_inst.kT = cls.kT            # cleanup() in tearDownClass builds a new Simulation (kT 1.)
         cls.tmpdir = tempfile.TemporaryDirectory()
         cls.h5_filename = os.path.join(cls.tmpdir.name, "testfile.h5")
         cls.written_steps = [10, 20, 30, 40]
         cls.written_times = []
         cls.build_fixture()
-        cls.part_snapshots = {group_type.__name__: [] for group_type in cls.group_types}
+        properties = sim_inst.io_dict["properties"]
+        #: {group: {prop: array [F, N(, dim)] in the stored dtype}}, columns in ascending id like the file's
+        cls.snapshots = {group_type.__name__: {prop: [] for prop, _dim, _dtype in properties}
+                         for group_type in cls.group_types}
         if hasattr(cls, "observable_name"):
             cls.observable_value = np.zeros(3, dtype=np.float64)
             cls.observable_values = []
-        with patch.object(h5_writer_module, "get_submission_creator_info", return_value=(cls.runner_script, cls.runner_script_repo)), patch.object(h5_writer_module, "get_repo_context", return_value=(cls.lib_path, cls.library_vers)):
+        with patch.object(write_module, "get_submission_creator_info", return_value=(cls.runner_script, cls.runner_script_repo)), patch.object(write_module, "get_repo_context", return_value=(cls.lib_path, cls.library_vers)):
             sim_inst.inscribe_part_group_to_h5(group_type=cls.group_types, h5_data_path=cls.h5_filename)
             if hasattr(cls, "observable_name"):
                 sim_inst.inscribe_observable_group_to_h5(
@@ -95,15 +81,16 @@ class CommonH5DataSelectorTests:
             if hasattr(cls, "observable_name"):
                 cls.observable_value[:] = np.array([GLOBAL_COUNTER, frame_index + 1, -GLOBAL_COUNTER], dtype=np.float64)
                 cls.observable_values.append(cls.observable_value.copy())
-            sim_inst.write_registered_to_h5(time_step=GLOBAL_COUNTER)
+            sim_inst.write_registered_to_h5(step=GLOBAL_COUNTER)
             cls.written_times.append(sim_inst.sys.time)
             for group_type in cls.group_types:
-                parts = []
-                for obj in sim_inst.objects:
-                    if isinstance(obj, group_type):
-                        owned_parts, _ = obj.get_owned_part()
-                        parts.extend(owned_parts)
-                cls.part_snapshots[group_type.__name__].append(capture_particle_snapshot(parts))
+                parts = sorted((part for obj in sim_inst.objects if isinstance(obj, group_type)
+                                for part in obj.get_owned_part()[0]), key=lambda part: part.id)
+                for prop, _dim, dtype in properties:
+                    cls.snapshots[group_type.__name__][prop].append(
+                        np.array([getattr(part, prop) for part in parts], dtype=dtype))
+        cls.snapshots = {group: {prop: np.asarray(frames) for prop, frames in snapshot.items()}
+                         for group, snapshot in cls.snapshots.items()}
         cls.reset_io_state()
 
     @classmethod
@@ -111,7 +98,6 @@ class CommonH5DataSelectorTests:
         if hasattr(cls, "tmpdir"):
             cls.tmpdir.cleanup()
             cls.tmpdir = None
-        cls.reset_io_state()
         BaseTestCase.cleanup()
         assert len(sim_inst.sys.part) == 0
         super().tearDownClass()
@@ -120,221 +106,110 @@ class CommonH5DataSelectorTests:
         self.reset_io_state()
         super().tearDown()
 
-    @staticmethod
-    def reset_io_state():
-        h5_file = sim_inst.io_dict.get("h5_file")
-        if h5_file is not None:
-            h5_file.flush()
-            h5_file.close()
-        sim_inst.io_dict["h5_file"] = None
-        sim_inst.io_dict["flat_part_view"].clear()
-        sim_inst.io_dict["registered_observables"] = {}
-        sim_inst.io_dict["registered_group_type"] = None
-        sim_inst.io_dict["bonds"] = False
-        sim_inst.io_dict["bond_links"] = {}
+    def check_selection(self, view, snapshot, time_slice=None, types=None):
+        """dtype, shape and values of every stored property of ``view`` against the snapshot's frames
+        ``time_slice`` (None: all) and its columns of ``types`` (None: all), selected frame by frame."""
+        keep = np.ones(snapshot['type'].shape, bool) if types is None else np.isin(snapshot['type'], types)
+        for prop, _dim, dtype in sim_inst.io_dict['properties']:
+            want = np.stack([frame[mask] for frame, mask in zip(snapshot[prop], keep)])
+            if time_slice is not None:
+                want = want[time_slice]         # an integer frame index drops the frame axis
+            got = getattr(view, prop)
+            with self.subTest(prop=prop, time_slice=time_slice, types=types):
+                self.assertEqual(got.dtype, np.dtype(dtype))
+                self.assertEqual(got.shape, want.shape)
+                np.testing.assert_allclose(got, want, rtol=1e-05, atol=1e-08)
 
-    @staticmethod
-    def check_box_data(dataview, expected_edges, expected_boundary=("periodic", "periodic", "periodic")):
-        box = dataview.get_box()
-        expected_edges = np.array(expected_edges, dtype=float, copy=True)
-        np.testing.assert_equal(box["dimension"], len(expected_edges), err_msg="Box dimension from selector does not match!")
-        np.testing.assert_equal(box["boundary"], expected_boundary, err_msg="Box boundary from selector does not match!")
-        np.testing.assert_allclose(box["edges"], expected_edges, err_msg="Box edges from selector do not match!")
-
-    def check_version_signing(self, dataview):
-        np.testing.assert_array_equal(dataview.metadata["h5md"]["_meta"]["attributes"]["version"], np.array([1, 0], dtype=np.int32))
-        self.assertEqual(dataview.metadata["h5md"]["creator"]["_meta"]["attributes"]["name"], self.runner_script)
-        self.assertEqual(dataview.metadata["h5md"]["creator"]["_meta"]["attributes"]["version"], self.runner_script_repo)
-        self.assertEqual(dataview.metadata["parameters"]["pressomancy"]["_meta"]["attributes"]["version"], self.library_vers)
-        expected_part_types = {
-            key: int(value)
-            for key, value in sim_inst.part_types.items()
-            if isinstance(value, (int, np.integer))
-        }
-        observed_part_types = {
-            key: int(value)
-            for key, value in dataview.metadata["parameters"]["pressomancy"]["part_types"]["_meta"]["attributes"].items()
-        }
+    def check_version_signing(self, h5_file):
+        """Provenance attrs, read from the file itself (the selector keeps no metadata tree)."""
+        np.testing.assert_array_equal(h5_file["h5md"].attrs["version"], np.array([1, 1], dtype=np.int32))
+        self.assertEqual(h5_file["h5md/creator"].attrs["name"], self.runner_script)
+        self.assertEqual(h5_file["h5md/creator"].attrs["version"], self.runner_script_repo)
+        self.assertEqual(h5_file["parameters/pressomancy"].attrs["version"], self.library_vers)
+        self.assertEqual(h5_file["parameters/pressomancy"].attrs["layout"], LAYOUT)
+        expected_part_types = {key: int(value) for key, value in sim_inst.part_types.items()
+                               if isinstance(value, (int, np.integer))}
+        observed_part_types = {key: int(value)
+                               for key, value in h5_file["parameters/pressomancy/part_types"].attrs.items()}
         self.assertEqual(observed_part_types, expected_part_types)
-        self.assertEqual(dataview.metadata["h5md"]["author"]["_meta"]["attributes"]["name"], self.author)
-        self.assertEqual(dataview.metadata["h5md"]["author"]["_meta"]["attributes"]["email"], self.email)
+        self.assertEqual(h5_file["h5md/author"].attrs["name"], self.author)
+        self.assertEqual(h5_file["h5md/author"].attrs["email"], self.email)
 
-    @staticmethod
-    def get_and_check_connectivity_predicate(dataview, object_grp_name, particle_type, control_ids):
-        selected_ids = np.array(
-            dataview.get_connectivity_values(
-                object_grp_name,
-                predicate=lambda subset: np.all(subset.timestep[-1].type == particle_type),
-            ),
-            dtype=int,
-        )
-        np.testing.assert_array_equal(control_ids, selected_ids, err_msg=f"{object_grp_name} predicate-filtered IDs do not match!")
-
-    def check_expected_metadata(self, dataview, h5_file, particle_group=None):
-
-        def metadata_node(metadata, path):
-            node = metadata
-            for key in path.split("/"):
-                node = node[key]
-            return node
-
-        metadata = dataview.metadata
-        particle_group = next(iter(h5_file["particles"])) if particle_group is None else particle_group
-        self.assertEqual(metadata["_meta"]["type"], "Group")
-        self.assertEqual(set(metadata["_meta"]["members"]), set(h5_file.keys()))
-        for group_name in ("h5md", "parameters", "particles", "connectivity"):
-            self.assertIn(group_name, h5_file)
-            self.assertIn(group_name, metadata)
-        if hasattr(self, "observable_name"):
-            self.assertIn("observables", h5_file)
-            self.assertIn("observables", metadata)
-
-        group_paths = [
-            "h5md",
-            "parameters/pressomancy",
-            f"particles/{particle_group}",
-            f"connectivity/{particle_group}",
-        ]
-        if hasattr(self, "observable_name"):
-            group_paths.append(f"observables/{self.observable_name}")
-        dataset_paths = [f"particles/{particle_group}/id/value",
-                         f"particles/{particle_group}/pos/value",
-                         f"particles/{particle_group}/box/edges",
-                         *(f"connectivity/{particle_group}/{dataset_name}" for dataset_name in h5_file[f"connectivity/{particle_group}"]),]
-        if hasattr(self, "observable_name"):
-                dataset_paths.extend([f"observables/{self.observable_name}/step", f"observables/{self.observable_name}/time", f"observables/{self.observable_name}/value"])
-
-        for group_path in group_paths:
-            h5_group = h5_file[group_path]
-            meta_node = metadata_node(metadata, group_path)
-            self.assertEqual(meta_node["_meta"]["type"], "Group")
-            self.assertEqual(set(meta_node["_meta"]["members"]), set(h5_group.keys()))
-            actual_attrs = {key: h5_group.attrs[key] for key in h5_group.attrs}
-            observed_attrs = meta_node["_meta"]["attributes"]
-            self.assertEqual(set(observed_attrs), set(actual_attrs))
-            for key, value in actual_attrs.items():
-                np.testing.assert_equal(observed_attrs[key], value)
-
-        for dataset_path in dataset_paths:
-            h5_dataset = h5_file[dataset_path]
-            meta_node = metadata_node(metadata, dataset_path)
-            self.assertEqual(meta_node["type"], "Dataset")
-            self.assertEqual(meta_node["shape"], h5_dataset.shape)
-            self.assertEqual(meta_node["dtype"], str(h5_dataset.dtype))
-            actual_attrs = {key: h5_dataset.attrs[key] for key in h5_dataset.attrs}
-            observed_attrs = meta_node["attributes"]
-            self.assertEqual(set(observed_attrs), set(actual_attrs))
-            for key, value in actual_attrs.items():
-                np.testing.assert_equal(observed_attrs[key], value)
-
-    def test_observables(self):
-        if not hasattr(self, "observable_name"):
-            return
+    def test_file_layout(self):
+        """Provenance, `/pressomancy/system` attrs, and per group the box, dims, H5MD elements and one shared step/time."""
+        n_frames = len(self.written_steps)
         with h5py.File(self.h5_filename, "r") as h5_file:
-            selector = H5ObservableSelector(h5_file, observable_name=self.observable_name)
-            np.testing.assert_equal(len(selector.timestep), len(self.written_steps), err_msg="Observable selector length is incorrect!")
-            np.testing.assert_array_equal(selector.step, self.written_steps, err_msg="Observable frame counters are incorrect!")
-            np.testing.assert_allclose(selector.time, self.written_times, err_msg="Observable times do not match fixture write times.")
-            np.testing.assert_allclose(selector.value, np.array(self.observable_values), err_msg="Observable values do not match fixture payloads.")
-            sliced = selector.timestep[0:2]
-            np.testing.assert_equal(len(sliced.timestep), 2, err_msg="Observable timestep slicing did not preserve frame count.")
-            np.testing.assert_array_equal(sliced.step, self.written_steps[0:2], err_msg="Observable timestep slicing did not preserve steps.")
-            np.testing.assert_allclose(sliced.time, self.written_times[0:2], err_msg="Observable timestep slicing did not preserve times.")
-            np.testing.assert_allclose(sliced.value, np.array(self.observable_values[0:2]), err_msg="Observable timestep slicing did not preserve values.")
-            frames = [frame for frame in selector.timestep]
-            np.testing.assert_equal(len(frames), len(self.written_steps), err_msg="Observable timestep iteration did not yield every frame.")
-            np.testing.assert_array_equal([frame.step for frame in frames], self.written_steps, err_msg="Observable timestep iteration did not preserve steps.")
+            self.check_version_signing(h5_file)
+            system = h5_file["pressomancy/system"]
+            self.assertEqual(int(system.attrs["seed"]), sim_inst.seed)
+            self.assertEqual(float(system.attrs["kT"]), self.kT)
+            self.assertEqual(float(system.attrs["time_step"]), sim_inst.sys.time_step)
+            np.testing.assert_allclose(system.attrs["box_l"], np.array(self.box_dim, dtype=float))
+            np.testing.assert_array_equal(system.attrs["periodicity"], np.array(sim_inst.sys.periodicity))
 
-    def test_metadata(self):
-        with h5py.File(self.h5_filename, "r") as h5_file:
             for group_type in self.group_types:
-                particle_group = group_type.__name__
-                expected_particles = 0
-                for obj in sim_inst.objects:
-                    if isinstance(obj, group_type):
-                        parts, _ = obj.get_owned_part()
-                        expected_particles += len(parts)
-                dataview = H5DataSelector(h5_file, particle_group=particle_group)
-                self.check_box_data(dataview, self.box_dim)
-                self.check_version_signing(dataview)
-                self.check_expected_metadata(dataview, h5_file, particle_group=particle_group)
-                expected_timesteps = len(self.written_steps)
-                np.testing.assert_equal(
-                    dataview.common_dims,
-                    (expected_timesteps, expected_particles),
-                    err_msg=f"{particle_group} selector common dimensions do not match!",
-                )
-                np.testing.assert_equal(len(dataview.timestep), expected_timesteps, err_msg=f"{particle_group} timestep length does not match!")
-                np.testing.assert_equal(len(dataview.particles), expected_particles, err_msg=f"{particle_group} particle count does not match!")
+                group_name = group_type.__name__
+                n_particles = sum(len(obj.get_owned_part()[0])
+                                  for obj in sim_inst.objects if isinstance(obj, group_type))
+                dataview = H5DataSelector(h5_file, particle_group=group_name)
+                box = dataview.get_box()
+                self.assertEqual(box["dimension"], len(self.box_dim))
+                np.testing.assert_equal(box["boundary"], ("periodic", "periodic", "periodic"))
+                # the box is a time-dependent element: edges is [F, D], one row per frame
+                np.testing.assert_allclose(box["edges"], np.tile(np.array(self.box_dim, dtype=float), (n_frames, 1)))
+                np.testing.assert_equal(dataview.common_dims, (n_frames, n_particles))
+                self.assertEqual(len(dataview.timestep), n_frames)
+                self.assertEqual(len(dataview.particles), n_particles)
 
-    def test_trigger_exceptions_smoke(self):
-        with h5py.File(self.h5_filename, "r") as h5_file:
-            dataview = H5DataSelector(
-                h5_file, particle_group=self.group_types[0].__name__
-                )
-            tests = [
-                (lambda: H5DataSelector(h5_file, particle_group="DangerNoodle"), ValueError),
-                (lambda: dataview[-1], TypeError),
-                (lambda: iter(dataview), TypeError),
-                (lambda: len(dataview), TypeError),
-            ]
+                group = h5_file[f"particles/{group_name}"]
+                # The H5MD names spelled out: element_name() below agrees with any table, a wrong one too.
+                for h5md_name in ("id", "species", "position", "image", "box/edges"):
+                    self.assertIn(h5md_name, group)
+                for espresso_name in ("pos", "type", "image_box"):
+                    self.assertNotIn(espresso_name, group)
+                # a scalar (dim None) is [F, N], a vector [F, N, dim]; step/time are the *same* HDF5 objects
+                step, time = (group[f"{element_name('pos')}/step"],
+                              group[f"{element_name('pos')}/time"])
+                for attr, dim, dtype in sim_inst.io_dict['properties']:
+                    expected = (n_frames, n_particles) if dim is None else (n_frames, n_particles, dim)
+                    with self.subTest(group=group_name, attr=attr):
+                        element = group[element_name(attr)]
+                        self.assertEqual(element["value"].shape, expected)
+                        self.assertEqual(element["value"].dtype, np.dtype(dtype))
+                        self.assertEqual(element["step"], step)
+                        self.assertEqual(element["time"], time)
+                self.assertEqual(group["box/edges/value"].shape,
+                                 (n_frames, int(group["box"].attrs["dimension"])))
+                self.assertEqual(group["box/edges/value"].dtype, np.dtype(np.float64))
+                self.assertEqual(group["box/edges/step"], step)
+                self.assertEqual(group["box/edges/time"], time)
+                self.assertEqual(time.dtype, np.float32)
+                np.testing.assert_array_equal(stored_steps(h5_file, group_name), self.written_steps)
+
             if hasattr(self, "observable_name"):
-                observable_selector = H5ObservableSelector(h5_file, observable_name=self.observable_name)
-                tests.extend([
-                    (lambda: H5ObservableSelector(h5_file, observable_name="missing_observable"), ValueError),
-                    (lambda: observable_selector[0], TypeError),
-                    (lambda: iter(observable_selector), TypeError),
-                    (lambda: len(observable_selector), TypeError),
-                ])
-            for fn, exc in tests:
-                with self.assertRaises(exc):
-                    fn()
-
-    def test_mk_src_file(self):
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            dst_filename = os.path.join(tmpdirname, "dst.h5")
-            sim_inst.mk_src_file(self.h5_filename, dst_filename)
-
-            with h5py.File(dst_filename, "r") as h5_file:
-                for group_type in self.group_types:
-                    particle_group = group_type.__name__
-                    dataview = H5DataSelector(h5_file, particle_group=particle_group)
-                    self.check_box_data(dataview, self.box_dim)
-                    self.check_version_signing(dataview)
-                    self.check_expected_metadata(dataview, h5_file, particle_group=particle_group)
-                    np.testing.assert_array_equal(dataview.step, np.array([self.written_steps[-1]], dtype=np.int32))
-                    check_prop_dim_dtype(dataview, [self.part_snapshots[particle_group][-1]], ("pos", 3, np.float64), time_slice=0)
+                selector = H5ObservableSelector(h5_file, observable_name=self.observable_name)
+                self.assertEqual(len(selector.timestep), n_frames)
+                np.testing.assert_array_equal(selector.step, self.written_steps)
+                np.testing.assert_allclose(selector.time, self.written_times)
+                np.testing.assert_allclose(selector.value, np.array(self.observable_values))
+            else:
+                self.assertNotIn("observables", h5_file)
 
     def test_load_modes(self):
         with tempfile.TemporaryDirectory() as tmpdirname:
             for mode in ("LOAD_NEW", "LOAD"):
                 h5_filename = os.path.join(tmpdirname, f"{mode}.h5")
                 shutil.copy2(self.h5_filename, h5_filename)
-                saved_part_types = dict(sim_inst.part_types)
                 try:
-                    if mode == "LOAD_NEW":
-                        sim_inst.part_types.clear()
                     GLOBAL_COUNTER = sim_inst.inscribe_part_group_to_h5(
-                        group_type=self.group_types,
-                        h5_data_path=h5_filename,
-                        mode=mode,
-                    )
+                        group_type=self.group_types, h5_data_path=h5_filename, mode=mode)
                     self.assertEqual(GLOBAL_COUNTER, len(self.written_steps))
-                    if mode == "LOAD_NEW":
-                        self.assertEqual(dict(sim_inst.part_types), saved_part_types)
                     for group_type in self.group_types:
                         group_name = group_type.__name__
-                        expected_ids = []
-                        for obj in sim_inst.objects:
-                            if isinstance(obj, group_type):
-                                parts, _ = obj.get_owned_part()
-                                expected_ids.extend(part.id for part in parts)
+                        expected_ids = sorted(part.id for obj in sim_inst.objects if isinstance(obj, group_type)
+                                              for part in obj.get_owned_part()[0])
                         reconstructed_ids = [part.id for part in sim_inst.io_dict['flat_part_view'][group_name]]
-                        np.testing.assert_array_equal(
-                            reconstructed_ids,
-                            expected_ids,
-                            err_msg=f"{mode} flat_part_view for {group_name} does not match live object order.",
-                        )
+                        np.testing.assert_array_equal(reconstructed_ids, expected_ids, err_msg=f"{mode} {group_name}")
                     if hasattr(self, "observable_name"):
                         observable_counter = sim_inst.inscribe_observable_group_to_h5(
                             observable_defs=[(self.observable_name, self.observable_value.shape, self.observable_value.dtype, self.observable_value)],
@@ -352,113 +227,74 @@ class CommonH5DataSelectorTests:
                         np.testing.assert_allclose(selector.time, self.written_times)
                         np.testing.assert_allclose(selector.value, np.array(self.observable_values))
                 finally:
-                    sim_inst.part_types.clear()
-                    sim_inst.part_types.update(saved_part_types)
                     self.reset_io_state()
-
-    def test_load_modes_force_resize(self):
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            for mode in ("LOAD_NEW", "LOAD"):
-                h5_filename = os.path.join(tmpdirname, f"{mode}_resized.h5")
-                shutil.copy2(self.h5_filename, h5_filename)
-                GLOBAL_COUNTER = sim_inst.inscribe_part_group_to_h5(
-                    group_type=self.group_types,
-                    h5_data_path=h5_filename,
-                    mode=mode,
-                    force_resize_to_size=2,
-                )
-                self.assertEqual(GLOBAL_COUNTER, 2)
-                for group_type in self.group_types:
-                    particle_group = group_type.__name__
-                    dataview = H5DataSelector(sim_inst.io_dict['h5_file'], particle_group=particle_group)
-                    np.testing.assert_array_equal(dataview.step,
-                                                  self.written_steps[:2])
-                    np.testing.assert_allclose(dataview.time,
-                                               self.written_times[:2])
-                    np.testing.assert_equal(dataview.common_dims, (2, len(self.part_snapshots[particle_group][0])))
-
-                if hasattr(self, "observable_name"):
-                    observable_counter = sim_inst.inscribe_observable_group_to_h5(
-                        observable_defs=[(self.observable_name, self.observable_value.shape, self.observable_value.dtype, self.observable_value)],
-                        h5_data_path=h5_filename,
-                        mode=mode,
-                        force_resize_to_size=2,
-                    )
-                    selector = H5ObservableSelector(sim_inst.io_dict['h5_file'], observable_name=self.observable_name)
-                    self.assertEqual(observable_counter, 2)
-                    np.testing.assert_array_equal(selector.step, self.written_steps[:2])
-                    np.testing.assert_allclose(selector.time, self.written_times[:2])
-                    np.testing.assert_allclose(selector.value,
-                    np.array(self.observable_values[:2]))
-                self.reset_io_state()
 
     def test_select_particles_by_object(self):
         with h5py.File(self.h5_filename, "r") as h5_file:
             for group_type in self.group_types:
                 object_name = group_type.__name__
+                snapshot = self.snapshots[object_name]
                 dataview = H5DataSelector(h5_file, particle_group=object_name)
-                np.testing.assert_equal(len(dataview.timestep), len(self.written_steps), err_msg=f"{object_name} stored frame count does not match fixture writes.")
+                self.assertEqual(len(dataview.timestep), len(self.written_steps))
                 self.assertEqual(dataview.timestep[-1].step, self.written_steps[-1])
-                self.assertEqual(dataview.timestep[-1].time, self.written_times[-1])
+                # particle times are stored as float32, like the observables'
+                self.assertEqual(dataview.timestep[-1].time, np.float32(self.written_times[-1]))
                 objects = [obj for obj in sim_inst.objects if isinstance(obj, group_type)]
                 connectivity_value = np.array([obj.who_am_i for obj in objects], dtype=int)
-                expected_types = sorted({
-                    int(part.type)
-                    for obj in objects
-                    for part in obj.get_owned_part()[0]
-                })
-                ids = dataview.get_connectivity_values(object_name)
-                np.testing.assert_array_equal(ids, connectivity_value, err_msg=f"{object_name} connectivity IDs do not match fixture object ids!")
+                types = np.unique(snapshot['type']).tolist()
+                np.testing.assert_array_equal(dataview.get_connectivity_values(object_name), connectivity_value)
+
                 connected_objects = sim_inst._collect_instances_recursively(objects)
-                connected_object_names = sorted({obj.__class__.__name__ for obj in connected_objects})
-                for connected_object_name in connected_object_names:
-                    connected_class_objects = [obj for obj in connected_objects if obj.__class__.__name__ == connected_object_name]
-                    for predicate_type in expected_types:
-                        control_ids = [obj.who_am_i for obj in connected_class_objects if all(part.type == predicate_type for part in obj.get_owned_part()[0])]
-                        self.get_and_check_connectivity_predicate(dataview, connected_object_name, predicate_type, control_ids)
-                for time_slice in [None, -1, 0, slice(0, 2, 1)]:
-                    get_and_check_complete_object(dataview, object_name, connectivity_value, self.part_snapshots[object_name], expected_types, time_slice=time_slice)
-                for predicate_type in expected_types:
-                    selection = dataview.select_particles_by_object(
-                        object_name=object_name,
-                        connectivity_value=connectivity_value,
-                        predicate=lambda subset, predicate_type=predicate_type: subset.timestep[-1].type == predicate_type,
-                    )
-                    np.testing.assert_equal(len(selection.timestep), len(dataview.timestep), err_msg="Predicate selection changed timestep context!")
-                    expected_ids = [[part.id for part in snap if part.type == predicate_type] for snap in self.part_snapshots[object_name]]
-                    np.testing.assert_allclose(selection.id.squeeze(axis=-1), expected_ids)
+                for class_name in sorted({type(obj).__name__ for obj in connected_objects}):
+                    members = [obj for obj in connected_objects if type(obj).__name__ == class_name]
+                    for predicate_type in types:
+                        control_ids = [obj.who_am_i for obj in members
+                                       if all(part.type == predicate_type for part in obj.get_owned_part()[0])]
+                        selected_ids = dataview.get_connectivity_values(
+                            class_name,
+                            predicate=lambda subset, t=predicate_type: np.all(subset.timestep[-1].type == t))
+                        np.testing.assert_array_equal(control_ids, np.array(selected_ids, dtype=int),
+                                                      err_msg=f"{class_name} type {predicate_type}")
+
+                for time_slice in (None, -1, 0, slice(0, 2)):
+                    source = dataview if time_slice is None else dataview.timestep[time_slice]
+                    with self.subTest(group=object_name, form="per particle"):
+                        self.check_selection(source.select_particles_by_object(
+                            object_name=object_name, connectivity_value=connectivity_value), snapshot, time_slice)
+                        for predicate_type in types:
+                            self.check_selection(source.select_particles_by_object(
+                                object_name=object_name, connectivity_value=connectivity_value,
+                                predicate=lambda p, t=predicate_type: p.type == t),
+                                snapshot, time_slice, [predicate_type])
+                for predicate_type in types:
+                    with self.subTest(group=object_name, form="timestep[-1]"):
+                        selection = dataview.select_particles_by_object(
+                            object_name=object_name, connectivity_value=connectivity_value,
+                            predicate=lambda subset, t=predicate_type: subset.timestep[-1].type == t)
+                        self.assertEqual(len(selection.timestep), len(dataview.timestep))
+                        self.check_selection(selection, snapshot, None, [predicate_type])
 
     def test_object_relations(self):
         with h5py.File(self.h5_filename, "r") as h5_file:
             for group_type in self.group_types:
-                particle_group = group_type.__name__
-                dataview = H5DataSelector(h5_file, particle_group=particle_group)
+                dataview = H5DataSelector(h5_file, particle_group=group_type.__name__)
                 parents = sim_inst._collect_instances_recursively(
-                    [obj for obj in sim_inst.objects if isinstance(obj, group_type)]
-                    )
-
+                    [obj for obj in sim_inst.objects if isinstance(obj, group_type)])
                 for parent in parents:
                     if not getattr(parent, "associated_objects", None):
                         continue
                     parent_key = parent.__class__.__name__
                     child_key = parent.associated_objects[0].__class__.__name__
-                    child_ids = [child.who_am_i for child in parent.associated_objects]
                     np.testing.assert_array_equal(
                         dataview.get_child_ids(parent_key, child_key, parent.who_am_i),
-                        child_ids,
-                        err_msg=f"{parent_key}_to_{child_key} child IDs do not match for parent {parent.who_am_i}!",
-                    )
+                        [child.who_am_i for child in parent.associated_objects],
+                        err_msg=f"{parent_key} {parent.who_am_i}")
                     for child in parent.associated_objects:
-                        expected_parent_ids = [
-                            obj.who_am_i
-                            for obj in sim_inst.objects
-                            if child in (getattr(obj, "associated_objects", None) or [])
-                        ]
+                        expected_parent_ids = [obj.who_am_i for obj in sim_inst.objects
+                                               if child in (getattr(obj, "associated_objects", None) or [])]
                         np.testing.assert_array_equal(
                             dataview.get_parent_ids(parent_key, child_key, child.who_am_i),
-                            expected_parent_ids,
-                            err_msg=f"{parent_key}_to_{child_key} parent IDs do not match for child {child.who_am_i}!",
-                        )
+                            expected_parent_ids, err_msg=f"{child_key} {child.who_am_i}")
 
 class ElastomerFixture(CommonH5DataSelectorTests, BaseTestCase):
     box_dim = [5,5,20]
@@ -478,23 +314,35 @@ class ElastomerFixture(CommonH5DataSelectorTests, BaseTestCase):
         sim_inst.set_objects([elastomer])
         cls.group_types = [Elastomer, PointDipolePermanent]
 
+    @unittest.skipUnless(importlib.util.find_spec("MDAnalysis"), "needs MDAnalysis")
+    def test_mdanalysis_reads_positions_and_box(self):
+        """An external H5MD reader sees what was written. MDAnalysis reads only the
+        first group of `/particles` in h5py's (alphabetical) order, so the Universe
+        holds the Elastomer group; the file carries no units, hence convert_units=False."""
+        import MDAnalysis
+        with h5py.File(self.h5_filename, "r") as h5_file:
+            self.assertEqual(list(h5_file["particles"])[0], "Elastomer",
+                             msg="MDAnalysis would read another group than the one compared here")
+        # the default preset stores pos as float32, which is what MDAnalysis holds
+        positions = self.snapshots["Elastomer"]["pos"].astype(np.float32)
+        universe = MDAnalysis.Universe.empty(positions.shape[1], trajectory=True)
+        universe.load_new(self.h5_filename, format='H5MD', convert_units=False)
+        try:
+            self.assertEqual(len(universe.trajectory), len(self.written_steps))
+            for frame, want in zip(universe.trajectory, positions):
+                with self.subTest(frame=frame.frame):
+                    np.testing.assert_array_equal(frame.positions, want)
+                    np.testing.assert_allclose(frame.dimensions, [*self.box_dim, 90., 90., 90.])
+        finally:
+            universe.trajectory.close()
+
 class FilamentFixture(CommonH5DataSelectorTests, BaseTestCase):
 
-    N_avog = 6.02214076e23
-    sigma = 1.
-    rho_si = 0.6*N_avog
+    box_dim = (75.6, 75.6, 75.6)
     no_obj=30
-    N = no_obj/3
-    vol = N/rho_si
-    box_l = pow(vol, 1/3)
-    _box_l = box_l/0.4e-09
-    box_dim = _box_l*np.ones(3)
-    _rho = N/pow(_box_l, 3)
-
     sheets_per_quad = 3
     part_per_filament = 2
     no_crowders=10
-    part_per_ligand=2
 
     @classmethod
     def build_fixture(cls):
@@ -530,543 +378,1354 @@ class FilamentFixture(CommonH5DataSelectorTests, BaseTestCase):
 
         cls.group_types = [Filament, Crowder]
 
-    def test_crowder_missing_relation_smoke(self):
-        with h5py.File(self.h5_filename, "r") as h5_file:
-            crowder = next(obj for obj in sim_inst.objects if isinstance(obj, Crowder))
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                missing_children = H5DataSelector(
-                    h5_file,
-                    particle_group="Crowder",
-                ).get_child_ids(
-                    "Crowder",
-                    "Quadriplex",
-                    crowder.who_am_i,
-                )
-            self.assertIsNone(missing_children)
-            self.assertGreaterEqual(len(caught), 1)
 
+class BondTopologyIOTest(IOTestCase):
+    """Every mode records `bond_links`; a stray bond is refused before any element of the frame is appended."""
 
-class BondTopologyIOTest(BaseTestCase):
-
+    box_dim = (20, 20, 20)      # set_objects needs L/2 >= the filament size (10)
     n_parts = 5
     n_filaments = 3
 
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.tmpdir = tempfile.TemporaryDirectory()
-        cls.h5_filename = os.path.join(cls.tmpdir.name, "bond_topology.h5")
-
+    def test_every_mode_records_the_links_and_refuses_a_stray_bond(self):
         bond = BondWrapper(espressomd.interactions.FeneBond(k=10., r_0=2., d_r_max=3.))
-        configs = [Filament.config.specify(sigma=2., size=2. * cls.n_parts,
-                                           n_parts=cls.n_parts,
-                                           espresso_handle=sim_inst.sys,
-                                           bond_handle=bond)
-                   for _ in range(cls.n_filaments)]
-        cls.filaments = [Filament(config=cfg) for cfg in configs]
-        sim_inst.store_objects(cls.filaments)
-        sim_inst.set_objects(cls.filaments)
-        for filament in cls.filaments:
+        filaments = [Filament(config=Filament.config.specify(
+            sigma=2., size=2. * self.n_parts, n_parts=self.n_parts, espresso_handle=sim_inst.sys,
+            bond_handle=bond)) for _ in range(self.n_filaments)]
+        sim_inst.store_objects(filaments)
+        sim_inst.set_objects(filaments)
+        for filament in filaments:
             filament.bond_center_to_center(type_name='real')
-        cls.live_links = sum(len(part.bonds) for part in sim_inst.sys.part.all())
+        live_links = sum(len(part.bonds) for part in sim_inst.sys.part.all())
+        self.assertGreater(live_links, 0, msg="fixture built no bonds")
+        path = os.path.join(self.tmpdir.name, "bond_topology.h5")
+        handles = filaments[0].type_part_dict['real']
+        stray = (filaments[0].params['bond_handle'].get_raw_handle(), handles[-1].id)
+        # Each mode resumes the file the previous one left: one frame per mode.
+        for n_frames, mode in enumerate(("NEW", "LOAD", "LOAD_NEW")):
+            with self.subTest(mode=mode):
+                sim_inst.io_dict["bonds"] = True
+                try:
+                    counter = sim_inst.inscribe_part_group_to_h5(
+                        group_type=[Filament], mode=mode, h5_data_path=path)
+                    self.assertEqual(counter, n_frames)
+                    self.assertEqual(sim_inst.io_dict["bond_links"]["Filament"], live_links)
+                    h5_file = sim_inst.io_dict["h5_file"]
+                    # angles/dihedrals tables are written only when such links exist
+                    self.assertNotIn("angles", h5_file["connectivity/Filament"])
+                    sim_inst.write_part_group_to_h5(step=n_frames)
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.close_h5()
-        if getattr(cls, "tmpdir", None) is not None:
-            cls.tmpdir.cleanup()
-            cls.tmpdir = None
-        sim_inst.io_dict["bonds"] = False
-        sim_inst.io_dict["bond_links"] = {}
-        sim_inst.io_dict["flat_part_view"].clear()
-        sim_inst.io_dict["registered_group_type"] = None
-        BaseTestCase.cleanup()
-        super().tearDownClass()
-
-    @staticmethod
-    def close_h5():
-        handle = sim_inst.io_dict.get("h5_file")
-        if handle is not None:
-            handle.flush()
-            handle.close()
-        sim_inst.io_dict["h5_file"] = None
-
-    @staticmethod
-    def reopen(mode):
-        """Drop the in-memory view the way a fresh process would, then inscribe."""
-        sim_inst.io_dict["flat_part_view"].clear()
-        sim_inst.io_dict["bond_links"] = {}
-        return sim_inst.inscribe_part_group_to_h5(
-            group_type=[Filament], h5_data_path=BondTopologyIOTest.h5_filename, mode=mode)
-
-    def test_bond_topology_round_trip(self):
-        self.assertGreater(self.live_links, 0, msg="fixture built no bonds to write")
-        sim_inst.io_dict["bonds"] = True
-
-        # --- NEW -----------------------------------------------------------
-        counter = self.reopen('NEW')
-        self.assertEqual(counter, 0)
-        self.assertEqual(sim_inst.io_dict["bond_links"]["Filament"], self.live_links)
-        for step in range(3):
-            sim_inst.write_part_group_to_h5(step=step)
-        self.close_h5()
-
-        with h5py.File(self.h5_filename, "r") as h5_file:
-            bonds_grp = h5_file["connectivity/Filament/bonds"]
-            self.assertIn("links", bonds_grp)
-            self.assertIn("offsets", bonds_grp)
-            self.assertIn("particle_ids", bonds_grp)
-            self.assertEqual(int(bonds_grp.attrs["n_links"]), self.live_links)
-            self.assertTrue(bool(bonds_grp.attrs["static_topology"]))
-            self.assertEqual(h5_file["particles/Filament/pos/value"].shape[0], 3)
-
-        # --- LOAD ----------------------------------------------------------
-        self.assertEqual(self.reopen('LOAD'), 3)
-        self.assertEqual(sim_inst.io_dict["bond_links"]["Filament"], self.live_links)
-        sim_inst.write_part_group_to_h5(step=3)
-        self.close_h5()
-
-        # --- LOAD_NEW ------------------------------------------------------
-        self.assertEqual(self.reopen('LOAD_NEW'), 4)
-        self.assertEqual(sim_inst.io_dict["bond_links"]["Filament"], self.live_links)
-        self.close_h5()
-
-    def test_topology_change_after_inscription_is_caught(self):
-        """The guard only works because bond_links is populated at inscription."""
-        sim_inst.io_dict["bonds"] = True
-        self.reopen('NEW')
-        sim_inst.write_part_group_to_h5(step=0)
-
-        # Add a bond the file knows nothing about; topology has no time axis.
-        handles = self.filaments[0].type_part_dict['real']
-        handles[0].add_bond((self.filaments[0].params['bond_handle'].get_raw_handle(),
-                             handles[-1].id))
-        try:
-            with self.assertRaises(RuntimeError) as ctx:
-                sim_inst.write_part_group_to_h5(step=1)
-            self.assertIn("changed after inscription", str(ctx.exception))
-        finally:
-            handles[0].delete_bond((self.filaments[0].params['bond_handle'].get_raw_handle(),
-                                    handles[-1].id))
-            self.close_h5()
+                    handles[0].add_bond(stray)
+                    try:
+                        with self.assertRaises(RuntimeError) as ctx:
+                            sim_inst.write_part_group_to_h5(step=n_frames + 1)
+                        self.assertIn("changed after inscription", str(ctx.exception))
+                    finally:
+                        handles[0].delete_bond(stray)
+                    group = h5_file["particles/Filament"]
+                    for element in [element_name(attr) for attr, _dim, _dtype in sim_inst.io_dict['properties']] + ["box/edges"]:
+                        for dataset in ("value", "step"):
+                            self.assertEqual(group[f"{element}/{dataset}"].shape[0], n_frames + 1,
+                                             msg=f"{element}/{dataset}")
+                finally:
+                    self.reset_io_state()     # what a fresh process starts from
 
 
-class BulkFrameReadTest(BaseTestCase):
-    """A ParticleSlice built from a non-monotonic id list is not self-consistent
-    about row order -- espresso routes `type`/`q`/`pos`/`pos_folded` through an
-    optimised path and everything else through a per-id loop, and those two
-    disagreed before espresso commit 45376706e. H5Writer sidesteps it by always
-    slicing on sorted ids and inverting the permutation. This pins that.
-    """
+class BulkFrameReadTest(IOTestCase):
+    """`_capture_frame` equals a per-particle loop on gapped and custom ids, and refuses a disordered view.
 
-    @classmethod
-    def tearDownClass(cls):
-        BaseTestCase.cleanup()
-        super().tearDownClass()
+    A ParticleSlice built from non-monotonic ids disagrees with itself about row order: the writer slices ascending ids only."""
 
-    def test_bulk_read_matches_per_particle_loop_for_shuffled_ids(self):
+    box_dim = (20, 20, 20)      # holds the particles placed in [0, 20)^3
+
+    def test_bulk_read_matches_per_particle_loop_for_gapped_ids(self):
         rng = np.random.default_rng(4242)
-        for _ in range(120):
+        for _ in range(60):
             part = sim_inst.sys.part.add(pos=rng.random(3) * 20.0, type=int(rng.integers(0, 4)))
             part.dip = rng.random(3) + 0.5
+        sim_inst.sys.part.add(id=5000, pos=[1.0, 2.0, 3.0], type=1)          # a custom id
+        for stray in list(sim_inst.sys.part.all())[3:60:7]:                   # punch holes in the id range
+            stray.remove()
         sim_inst.sys.integrator.run(5)
 
-        ids = [int(x) for x in rng.permutation([p.id for p in sim_inst.sys.part.all()])]
-        handles = [sim_inst.sys.part.by_id(i) for i in ids]
-        group = "ShuffledProbe"
+        handles = sorted(sim_inst.sys.part.all(), key=lambda p: p.id)
+        group = "GappedProbe"
         sim_inst.io_dict['flat_part_view'][group] = handles
-        try:
-            writer = sim_inst._h5_writer
-            for prop, dim, dtype in sim_inst.io_dict['properties']:
-                expected = np.array(
-                    [np.atleast_1d(getattr(h, prop)) for h in handles], dtype=dtype)
-                got = writer._read_frame(group, prop, dim, dtype)
-                with self.subTest(prop=prop):
-                    self.assertEqual(got.shape, expected.shape)
-                    np.testing.assert_array_equal(got, expected)
-        finally:
-            sim_inst.io_dict['flat_part_view'].pop(group, None)
-            sim_inst._h5_writer._slice_cache.pop(group, None)
-
-    def test_duplicate_ids_are_rejected(self):
-        """The espresso-side reorder is keyed on id, so duplicates must not pass."""
-        part = sim_inst.sys.part.add(pos=[1.0, 1.0, 1.0], type=0)
-        group = "DupProbe"
-        sim_inst.io_dict['flat_part_view'][group] = [part, part]
-        try:
-            with self.assertRaises(ValueError) as ctx:
-                sim_inst._h5_writer._read_frame(group, 'pos', 3, np.float64)
-            self.assertIn("duplicate particle ids", str(ctx.exception))
-        finally:
-            sim_inst.io_dict['flat_part_view'].pop(group, None)
-            sim_inst._h5_writer._slice_cache.pop(group, None)
+        writer = sim_inst._h5_writer
+        for prop, dim, dtype in sim_inst.io_dict['properties']:
+            # dim None is a scalar column [N]; a vector one is [N, dim]
+            expected = np.array([getattr(h, prop) for h in handles], dtype=dtype)
+            got = writer._capture_frame(group, prop, dim, dtype)
+            with self.subTest(prop=prop):
+                self.assertEqual(got.shape, expected.shape)
+                np.testing.assert_array_equal(got, expected)
+        for bad, label in ((handles[::-1], "unsorted"), (handles[:1] * 2, "duplicate")):
+            sim_inst.io_dict['flat_part_view'][group] = bad
+            writer._slice_cache.pop(group, None)
+            with self.subTest(label), self.assertRaises(ValueError) as ctx:
+                writer._capture_frame(group, 'pos', 3, np.float64)
+            self.assertIn("strictly ascending particle ids", str(ctx.exception))
 
 
-class SourceSeedingTest(BaseTestCase):
-    """Only `set_prop_from_src` with an identity type map and pos->pos was covered
-    before, by a bare assert inside samples/poly_BRACO.py. `get_pos_ori_from_src`
-    (the `set_objects(mode='INIT_SRC')` path) had no exercise at all.
+class SourceFixture(IOTestCase):
+    """Build a tree, write it to a source file, rebuild the tree, read the file back onto the new one.
 
-    Note these tests read back onto the *same* objects that wrote the file.
-    Selection is keyed on `who_am_i`, which the metaclass allocates monotonically
-    and never resets, so a freshly constructed object can never carry a source
-    id within one process -- INIT_SRC across a real restart works because
-    numInstances starts from zero in a new interpreter.
-    """
+    Seeding needs the file's who_am_i set (a per-class construction counter) to equal the seeded objects';
+    `rebuild()` rewinds the counters as a restart would. Seeded objects are stored, not set: placement adds
+    their particles (hence `place=`). Source files use `SOURCE_PROPERTIES` (floats float64, dip stored)."""
 
     n_parts = 4
     n_filaments = 2
+    box_dim = SMALL_BOX
+    SOURCE_PROPERTIES = ([('id', None, np.int32), ('type', None, np.int16), ('pos', 3, np.float64)]
+                         + ([('director', 3, np.float64)] if api_agnostic_feature_check('ROTATION') else [])
+                         + ([('dip', 3, np.float64)] if api_agnostic_feature_check('DIPOLES') else []))
 
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.tmpdir = tempfile.TemporaryDirectory()
+    def setUp(self):
+        super().setUp()
+        self.pin()
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.close_open_file()
-        if getattr(cls, "tmpdir", None) is not None:
-            cls.tmpdir.cleanup()
-            cls.tmpdir = None
-        BaseTestCase.cleanup()
-        super().tearDownClass()
+    # -- building ----------------------------------------------------------
+    def rebuild(self):
+        """Empty the system and rewind the who_am_i counters: what a restart hands a script."""
+        BaseTestCase.cleanup(self.box_dim)
+        self.pin()
 
-    @staticmethod
-    def close_open_file():
-        handle = sim_inst.io_dict.get("h5_file")
-        if handle is not None:
-            handle.flush()
-            handle.close()
-        sim_inst.io_dict["h5_file"] = None
-        sim_inst.io_dict["flat_part_view"].clear()
-        sim_inst.io_dict["registered_group_type"] = None
+    def pin(self):
+        """Re-apply the properties list `cleanup()` resets to the writer's default."""
+        sim_inst.io_dict['properties'] = list(self.SOURCE_PROPERTIES)
 
-    def tearDown(self):
-        self.close_open_file()
-        BaseTestCase.cleanup()
-        super().tearDown()
-
-    def build_filaments(self, with_dipoles=False, with_anchors=False):
-        bond = BondWrapper(espressomd.interactions.FeneBond(k=10., r_0=2., d_r_max=3.))
-        configs = [Filament.config.specify(
+    def build_filaments(self, n_filaments=None, place=True, one_bond_handle=True,
+                        with_dipoles=False, with_anchors=False, bonded=False):
+        """Store (and by default place) filaments; ``one_bond_handle=False`` gives each its own, equal FeneBond."""
+        shared = BondWrapper(espressomd.interactions.FeneBond(k=10., r_0=2., d_r_max=3.))
+        filaments = [Filament(config=Filament.config.specify(
             sigma=2., size=2. * self.n_parts, n_parts=self.n_parts,
-            espresso_handle=sim_inst.sys, bond_handle=bond)
-            for _ in range(self.n_filaments)]
-        filaments = [Filament(config=cfg) for cfg in configs]
+            espresso_handle=sim_inst.sys,
+            bond_handle=shared if one_bond_handle else BondWrapper(
+                espressomd.interactions.FeneBond(k=10., r_0=2., d_r_max=3.))))
+            for _ in range(self.n_filaments if n_filaments is None else n_filaments)]
         sim_inst.store_objects(filaments)
-        sim_inst.set_objects(filaments)
-        if with_anchors:
-            for filament in filaments:
-                filament.add_anchors(type_name='real')
-        if with_dipoles:
-            for index, part in enumerate(sim_inst.sys.part.all()):
-                part.dip = np.array([1.0, 0.5, 0.25]) * (index + 1)
+        if place:
+            sim_inst.set_objects(filaments)
+            if with_anchors:
+                for filament in filaments:
+                    filament.add_anchors(type_name='real')
+            if with_dipoles:
+                for index, part in enumerate(sim_inst.sys.part.all()):
+                    part.dip = np.array([1.0, 0.5, 0.25]) * (index + 1)
+            if bonded:
+                for filament in filaments:
+                    filament.bond_center_to_center(type_name='real')
         return filaments
 
-    def write_source(self, filaments, name, properties=None):
-        """Write one frame and return its path, optionally with a custom schema."""
+    def build_elastomer(self, place=True):
+        elastomer = Elastomer(config=Elastomer.config.specify(
+            box_E=[3, 3, 9], n_parts=10, size=1., espresso_handle=sim_inst.sys,
+            seed=sim_inst.seed))
+        sim_inst.store_objects([elastomer])
+        if place:
+            sim_inst.set_objects([elastomer])
+        return elastomer
+
+    # -- writing -----------------------------------------------------------
+    def write_source(self, name, group_type=Filament, bonds=False, steps=(0,), advance=None):
+        """Write one frame per entry of ``steps`` (``advance()`` before each) and return the path."""
         path = os.path.join(self.tmpdir.name, name)
-        original = sim_inst.io_dict["properties"]
-        if properties is not None:
-            sim_inst.io_dict["properties"] = properties
-        try:
-            sim_inst.inscribe_part_group_to_h5(
-                group_type=[Filament], h5_data_path=path, mode="NEW")
-            sim_inst.write_part_group_to_h5(step=0)
-            sim_inst.io_dict["h5_file"].flush()
-        finally:
-            if properties is not None:
-                sim_inst.io_dict["properties"] = original
+        sim_inst.io_dict["bonds"] = bonds
+        sim_inst.inscribe_part_group_to_h5(group_type=[group_type], h5_data_path=path,
+                                           mode="NEW")
+        for step in steps:
+            if advance is not None:
+                advance()
+            sim_inst.write_part_group_to_h5(step=step)
+        self.reset_io_state()
         return path
 
-    # -- get_pos_ori_from_src ---------------------------------------------
-    def test_get_pos_ori_returns_source_positions_and_directors(self):
-        filaments = self.build_filaments()
-        path = self.write_source(filaments, "geometry.h5")
-        expected = {f.who_am_i: ([p.pos.copy() for p in f.type_part_dict['real']],
-                                 [p.director.copy() for p in f.type_part_dict['real']])
-                    for f in filaments}
-        self.close_open_file()
+    def edited_copy(self, path, name, edit):
+        """A copy of ``path`` named ``name``, with ``edit(h5_file)`` applied to it."""
+        copy = os.path.join(self.tmpdir.name, name)
+        shutil.copy2(path, copy)
+        with h5py.File(copy, "r+") as h5_file:
+            edit(h5_file)
+        return copy
 
-        sim_inst.set_init_src(path=path, pos_ori_src_type=['real'])
-        positions, orientations = sim_inst._get_pos_ori_from_src(filaments)
-
-        self.assertEqual(len(positions), len(filaments))
-        for filament, pos, ori in zip(filaments, positions, orientations):
-            want_pos, want_ori = expected[filament.who_am_i]
-            np.testing.assert_allclose(pos, np.array(want_pos), rtol=0, atol=1e-12)
-            np.testing.assert_allclose(ori, np.array(want_ori), rtol=0, atol=1e-12)
-
-    def test_set_objects_init_src_uses_the_source_reader(self):
-        filaments = self.build_filaments()
-        path = self.write_source(filaments, "routing.h5")
-        self.close_open_file()
-        sim_inst.set_init_src(path=path, pos_ori_src_type=['real'])
-
-        with patch.object(sim_inst._h5_init, "get_pos_ori_from_src",
-                          wraps=sim_inst._h5_init.get_pos_ori_from_src) as reader:
-            with patch.object(type(sim_inst.instance), "place_objects") as place:
-                sim_inst.set_objects(filaments, mode='INIT_SRC')
-            reader.assert_called_once()
-            place.assert_called_once()
-
-    def test_orientation_falls_back_to_normalised_dip(self):
-        """With no `director` column stored, orientation comes from `dip`."""
-        filaments = self.build_filaments(with_dipoles=True)
-        no_director = [entry for entry in sim_inst.io_dict["properties"]
-                       if entry[0] != "director"]
-        path = self.write_source(filaments, "dip_only.h5", properties=no_director)
-        expected = {f.who_am_i: [p.dip.copy() for p in f.type_part_dict['real']]
-                    for f in filaments}
-        self.close_open_file()
-
-        sim_inst.set_init_src(path=path, pos_ori_src_type=['real'])
-        _, orientations = sim_inst._get_pos_ori_from_src(filaments)
-        for filament, ori in zip(filaments, orientations):
-            dips = np.array(expected[filament.who_am_i])
-            want = dips / np.linalg.norm(dips, axis=1, keepdims=True)
-            np.testing.assert_allclose(ori, want, rtol=0, atol=1e-12)
-            np.testing.assert_allclose(np.linalg.norm(ori, axis=1), 1.0, atol=1e-12)
-
-    def test_zero_dip_raises_rather_than_producing_nan(self):
-        filaments = self.build_filaments()          # dip left at zero
-        no_director = [entry for entry in sim_inst.io_dict["properties"]
-                       if entry[0] != "director"]
-        path = self.write_source(filaments, "zero_dip.h5", properties=no_director)
-        self.close_open_file()
-
-        sim_inst.set_init_src(path=path, pos_ori_src_type=['real'])
-        with self.assertRaises(ValueError) as ctx:
-            sim_inst._get_pos_ori_from_src(filaments)
-        self.assertIn("dip moment magnitude is 0", str(ctx.exception))
-
-    # -- set_prop_from_src -------------------------------------------------
-    def test_set_prop_from_src_restores_positions(self):
-        filaments = self.build_filaments()
-        path = self.write_source(filaments, "props.h5")
-        written = sim_inst.sys.part.all().pos.copy()
-        self.close_open_file()
-
-        # Move everything, then put it back from the file.
-        for part in sim_inst.sys.part.all():
-            part.pos = part.pos + np.array([3.0, -2.0, 1.5])
-        self.assertFalse(np.allclose(sim_inst.sys.part.all().pos, written))
-
-        sim_inst.set_init_src(path=path,
-                              type_to_type_map=[('real', 'real')],
-                              prop_to_prop_map=[('pos', 'pos')])
-        sim_inst.set_prop_from_src(filaments)
-        np.testing.assert_allclose(sim_inst.sys.part.all().pos, written,
-                                   rtol=1e-10, atol=1e-10)
-
-    def test_non_identity_type_map_touches_only_the_target_type(self):
-        """poly_BRACO only ever maps a type onto itself, so this path was untested."""
-        filaments = self.build_filaments(with_anchors=True)
-        path = self.write_source(filaments, "remap.h5")
-        source_real = {f.who_am_i: [p.pos.copy() for p in f.type_part_dict['real']]
-                       for f in filaments}
-        self.close_open_file()
-
-        virt_before = {p.id: p.pos.copy()
-                       for f in filaments for p in f.type_part_dict['virt']}
-        # Copy the *real* particles' stored positions onto the *virt* particles.
-        sim_inst.set_init_src(path=path,
-                              type_to_type_map=[('real', 'virt')],
-                              prop_to_prop_map=[('pos', 'pos')])
-        sim_inst.set_prop_from_src(filaments)
-
-        for filament in filaments:
-            want = source_real[filament.who_am_i]
-            got = [p.pos for p in filament.type_part_dict['virt'][:len(want)]]
-            np.testing.assert_allclose(np.array(got), np.array(want),
-                                       rtol=1e-10, atol=1e-10)
-        moved = sum(1 for f in filaments for p in f.type_part_dict['virt']
-                    if not np.allclose(p.pos, virt_before[p.id]))
-        self.assertGreater(moved, 0, msg="the remap did not touch the target type")
-
-    # -- guards ------------------------------------------------------------
-    def test_mismatched_map_lengths_raise(self):
-        filaments = self.build_filaments()
-        path = self.write_source(filaments, "mismatch.h5")
-        self.close_open_file()
-        sim_inst.set_init_src(path=path,
-                              type_to_type_map=[('real', 'real'), ('real', 'real')],
-                              prop_to_prop_map=[('pos', 'pos')])
-        # ValueError, not AssertionError: the length guard is caller-facing, and a
-        # typed exception distinguishes it from the source-type validation that runs
-        # first and also used to raise AssertionError here.
-        with self.assertRaises(ValueError) as ctx:
-            sim_inst.set_prop_from_src(filaments)
-        self.assertIn("same length", str(ctx.exception))
-
-    def test_reading_before_declaring_a_source_raises(self):
-        filaments = self.build_filaments()
-        self.assertFalse(sim_inst.src_params_set)
-        # RuntimeError: using the reader before declaring a source is a state error.
-        with self.assertRaises(RuntimeError):
-            sim_inst.set_prop_from_src(filaments)
-        with self.assertRaises(RuntimeError):
-            sim_inst._get_pos_ori_from_src(filaments)
-
-
-class BondSerializationTest(BaseTestCase):
-    """Everything here was previously reached only through H5Writer, so the CSR
-    construction and the derived parameter schema were only ever exercised on
-    one shape of input: two-body FeneBonds, every partner inside the group.
-    """
+    # -- reading the live system -------------------------------------------
+    @staticmethod
+    def typed_values(objects, type_name, attr='pos'):
+        """``{who_am_i: (N, dim) array}`` of ``attr`` over the objects' ``type_name`` particles, in ascending id."""
+        return {obj.who_am_i: np.array([np.copy(getattr(part, attr))
+                                        for part in sorted(obj.type_part_dict[type_name], key=lambda p: p.id)])
+                for obj in objects}
 
     @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.tmpdir = tempfile.TemporaryDirectory()
-
-    @classmethod
-    def tearDownClass(cls):
-        if getattr(cls, "tmpdir", None) is not None:
-            cls.tmpdir.cleanup()
-            cls.tmpdir = None
-        BaseTestCase.cleanup()
-        super().tearDownClass()
-
-    def tearDown(self):
-        BaseTestCase.cleanup()
-        super().tearDown()
+    def real_positions(cls, objects):
+        return cls.typed_values(objects, 'real')
 
     @staticmethod
-    def add_particles(n):
-        return [sim_inst.sys.part.add(pos=[1.0 + i, 1.0, 1.0], type=0) for i in range(n)]
+    def live_links(particles):
+        """``(owner, partner ids, bond class, bond params)`` of every bond on ``particles``, sorted by the first three."""
+        return sorted(((int(part.id), tuple(int(x) for x in entry[1:]), type(entry[0]).__name__,
+                        entry[0].get_params())
+                       for part in particles for entry in part.bonds), key=lambda link: link[:3])
 
-    # -- CSR construction --------------------------------------------------
-    def test_csr_invariants_for_two_body_bonds(self):
-        from pressomancy.io.bonds import collect_bond_links
-        parts = self.add_particles(4)
+    @staticmethod
+    def n_live_links():
+        return sum(len(part.bonds) for part in sim_inst.sys.part.all())
+
+    @staticmethod
+    def n_registered_bonds():
+        return sum(1 for _ in sim_inst.sys.bonded_inter)
+
+
+class SourceSeedingTest(SourceFixture):
+    """What the source supplies (`get_pos_ori_from_src`), what it copies (`set_prop_from_src`), and the pairing."""
+
+    def test_non_contiguous_ids_round_trip_in_ascending_id_order(self):
+        """Gaps and custom ids in the source do not disturb the zip onto a tree with contiguous ids."""
+        first = self.build_filaments(n_filaments=1)
+        sim_inst.sys.part.add(id=700, pos=[1.0, 1.0, 1.0], type=0)       # custom id -> the next ids start at 701
+        second = self.build_filaments(n_filaments=1)
+        sim_inst.sys.part.by_id(700).remove()                            # leaves a hole below the 2nd filament
+        filaments = first + second
+        written = self.real_positions(filaments)
+        path = self.write_source("gapped.h5")
+        with h5py.File(path, 'r') as f:
+            ids = np.asarray(f['particles/Filament/id/value'][-1])
+        self.assertTrue(np.all(np.diff(ids) > 0), ids)
+        self.assertGreater(int(ids[self.n_parts]) - int(ids[self.n_parts - 1]), 1, "fixture left no id gap")
+
+        self.rebuild()
+        filaments = self.build_filaments(n_filaments=2)                  # contiguous ids this time
+        sim_inst.load_from_src(filaments, path, src_to_loc={('real', 'real'): [('pos', 'pos')]})
+        for who, positions in self.real_positions(filaments).items():
+            np.testing.assert_allclose(positions, written[who], err_msg=f"filament {who}")
+
+    def test_a_dip_becomes_a_director_unless_it_is_zero(self):
+        """The source dip is normalised onto the local director; a zero dip has no direction to give."""
+        filaments = self.build_filaments(with_dipoles=True)
+        dips = self.typed_values(filaments, 'real', 'dip')
+        path = self.write_source("dip_to_director.h5")
+        for part in sim_inst.sys.part.all():
+            part.dipm = 0.
+        zero_path = self.write_source("zero_dip.h5")          # the same tree, dip zero
+
+        self.rebuild()
+        filaments = self.build_filaments()
+        for part in sim_inst.sys.part.all():
+            part.director = [0., 0., 1.]
+        dip_to_director = {('real', 'real'): [('dip', 'director')]}
+        sim_inst.h5_init.set_init_src(path, place_from=['real'], src_to_loc=dip_to_director)
+        sim_inst.h5_init.set_prop_from_src(filaments)
+        for who, directors in self.typed_values(filaments, 'real', 'director').items():
+            want = dips[who] / np.linalg.norm(dips[who], axis=1, keepdims=True)
+            np.testing.assert_allclose(directors, want, rtol=0, atol=1e-12)
+
+        sim_inst.h5_init.set_init_src(zero_path, place_from=['real'], src_to_loc=dip_to_director)
+        with self.assertRaises(ValueError) as ctx:
+            sim_inst.h5_init.set_prop_from_src(filaments)
+        self.assertIn("dip moment magnitude is 0", str(ctx.exception))
+
+    def test_each_type_pair_copies_its_own_property_list(self):
+        """A grouped key shares pos between 'real' and 'virt'; dip is copied for 'real' only, 'virt' keeps zeros."""
+        filaments = self.build_filaments(with_anchors=True, with_dipoles=True)   # anchors: a second type
+        written = {(name, attr): self.typed_values(filaments, name, attr)
+                   for name in ('real', 'virt') for attr in ('pos', 'dip')}
+        self.assertTrue(any(np.any(dips) for dips in written[('virt', 'dip')].values()),
+                        msg="source virt dips are zero")
+        path = self.write_source("per_pair_props.h5")
+
+        self.rebuild()
+        filaments = self.build_filaments(with_anchors=True)
+        for part in sim_inst.sys.part.all():
+            part.pos = part.pos + np.array([4.0, 1.0, -3.0])
+        for name in ('real', 'virt'):
+            for who, positions in self.typed_values(filaments, name).items():
+                self.assertFalse(np.allclose(positions, written[(name, 'pos')][who]),
+                                 msg=f"the fixture did not move {name}")
+
+        sim_inst.h5_init.set_init_src(path, place_from=['real'], src_to_loc={
+            (('real', 'real'), ('virt', 'virt')): [('pos', 'pos')], ('real', 'real'): [('dip', 'dip')]})
+        sim_inst.h5_init.set_prop_from_src(filaments)
+        for name in ('real', 'virt'):
+            for who, positions in self.typed_values(filaments, name).items():
+                np.testing.assert_allclose(positions, written[(name, 'pos')][who], rtol=1e-10, atol=1e-10)
+        for who, dips in self.typed_values(filaments, 'real', 'dip').items():
+            np.testing.assert_allclose(dips, written[('real', 'dip')][who], rtol=0, atol=1e-12)
+        for who, dips in self.typed_values(filaments, 'virt', 'dip').items():
+            np.testing.assert_array_equal(dips, np.zeros((2 * self.n_parts, 3)))
+
+    def test_the_pairing_is_strictly_one_to_one(self):
+        """Every type pair is zipped one-to-one (no `min()`, no skip), and a mismatch assigns or places nothing."""
+        filaments = self.build_filaments()
+        path = self.write_source("pairing.h5")
+
+        with self.subTest(case="4 source reals vs 8 local virts"):
+            self.rebuild()
+            filaments = self.build_filaments(with_anchors=True)
+            before = self.typed_values(filaments, 'virt')
+            sim_inst.h5_init.set_init_src(path, place_from=['real'],
+                                          src_to_loc={('real', 'virt'): [('pos', 'pos')]})
+            with self.assertRaises(ValueError) as ctx:
+                sim_inst.h5_init.set_prop_from_src(filaments)
+            self.assertIn(f"{self.n_parts} source particles vs {2 * self.n_parts} local particles",
+                          str(ctx.exception))
+            for who, positions in self.typed_values(filaments, 'virt').items():
+                np.testing.assert_array_equal(positions, before[who])
+
+        # One unplaced tree for the rest: its first n_filaments carry the source's who_am_i.
+        self.rebuild()
+        larger = self.build_filaments(n_filaments=self.n_filaments + 1, place=False)
+        filaments = larger[:self.n_filaments]
+        with self.subTest(case="an unplaced tree without place_from"):
+            with self.assertRaises(ValueError) as ctx:
+                sim_inst.load_from_src(filaments, path,
+                                       src_to_loc={('real', 'real'): [('pos', 'pos')]})
+            self.assertIn(f"{self.n_parts} source particles vs 0 local particles", str(ctx.exception))
+            self.assertEqual(len(sim_inst.sys.part), 0)
+        with self.subTest(case="an empty property list still pairs"):
+            sim_inst.h5_init.set_init_src(path, place_from=['real'], src_to_loc={('real', 'virt'): []})
+            with self.assertRaises(ValueError) as ctx:
+                sim_inst.h5_init.set_prop_from_src(filaments)
+            self.assertIn(f"{self.n_parts} source particles vs 0 local particles", str(ctx.exception))
+        sim_inst.h5_init.set_init_src(path, place_from=['real'])
+        for label, subset in (("a who_am_i subset", larger[:1]), ("a who_am_i superset", larger)):
+            with self.subTest(case=label):
+                with self.assertRaises(ValueError) as ctx:
+                    sim_inst.h5_init.get_pos_ori_from_src(subset)
+                self.assertIn("who_am_i", str(ctx.exception))
+        self.assertEqual(len(sim_inst.sys.part), 0)
+
+    def test_a_malformed_declaration_raises_naming_the_offender(self):
+        """Every shape the `src_to_loc` grammar or `place_from` rejects: a ValueError, and nothing declared."""
+        self.build_filaments()
+        path = self.write_source("malformed_declaration.h5")
+        pos = {('real', 'real'): [('pos', 'pos')]}
+        cases = {   # label: (src_to_loc, place_from, fragment of the raise)
+            "a pair twice in one list": (
+                {('real', 'real'): [('pos', 'pos'), ('pos', 'pos')]}, ['real'], "listed twice"),
+            "a pair once under each of two keys": (
+                {('real', 'real'): [('pos', 'pos')], (('real', 'real'), ('virt', 'virt')): [('pos', 'pos')]},
+                ['real'], "listed twice"),
+            "a pair twice through one grouped key": (
+                {(('real', 'real'), ('real', 'real')): [('pos', 'pos')]}, ['real'], "listed twice"),
+            "a key that is not a tuple": ({'real': [('pos', 'pos')]}, ['real'], "'real'"),
+            "an empty key": ({(): [('pos', 'pos')]}, ['real'], "()"),
+            "a type triple": ({('real', 'real', 'virt'): []}, ['real'], "('real', 'real', 'virt')"),
+            "a non-string type name": ({('real', 1): []}, ['real'], "('real', 1)"),
+            "a value that is not a list": ({('real', 'real'): 'pos'}, ['real'], "'pos'"),
+            "a property triple": ({('real', 'real'): [('pos', 'pos', 'pos')]}, ['real'], "('pos', 'pos', 'pos')"),
+            "a mapping that is not a dict": ([('real', 'real')], ['real'], "[('real', 'real')]"),
+            # bool is an int subclass: True must not pass as type 1
+            "a bool source type": ({(True, 'real'): []}, ['real'], "(True, 'real')"),
+            "a float place_from entry": (pos, [1.5], "[1.5]"),
+            "a bool place_from entry": (pos, [True], "[True]"),
+        }
+        for label, (src_to_loc, place_from, fragment) in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(ValueError) as ctx:
+                    sim_inst.h5_init.set_init_src(path, src_to_loc=src_to_loc, place_from=place_from)
+                self.assertIn(fragment, str(ctx.exception))
+                self.assertEqual(sim_inst.h5_init.src_to_loc, {})
+                self.assertIsNone(sim_inst.h5_init.place_from)
+
+    def test_get_prop_from_src_returns_the_written_values_per_object(self):
+        """Read a stored column back per object on an unplaced tree, naming a missing dataset."""
+        filaments = self.build_filaments(with_dipoles=True)
+        written = self.real_positions(filaments)
+        path = self.write_source("get_prop.h5")
+
+        self.rebuild()
+        filaments = self.build_filaments(place=False)
+        got = sim_inst.get_prop_from_src(filaments, path, src_type='real', prop='pos')
+        self.assertEqual(len(got), len(filaments))
+        for filament, positions in zip(filaments, got):
+            self.assertEqual(positions.shape, (self.n_parts, 3))
+            np.testing.assert_array_equal(positions, written[filament.who_am_i])
+        self.assertEqual(len(sim_inst.sys.part), 0)
+
+        with self.assertRaises(KeyError) as ctx:
+            sim_inst.get_prop_from_src(filaments, path, src_type='real', prop='no_such_prop')
+        self.assertIn("particles/Filament/no_such_prop/value", str(ctx.exception))
+        with self.assertRaises(KeyError):
+            sim_inst.get_prop_from_src(filaments, path, src_type='no_such_type', prop='pos')
+
+    def test_a_reader_out_of_order_is_a_state_error(self):
+        """No source declared, a missing file, or no `place_from` for a placing reader: refused, nothing placed."""
+        self.build_filaments()
+        path = self.write_source("state_errors.h5")
+
+        self.rebuild()
+        filaments = self.build_filaments(place=False)
+        self.assertIsNone(sim_inst.h5_init.src_path_h5)
+        for label, call in (("set_prop_from_src", lambda: sim_inst.h5_init.set_prop_from_src(filaments)),
+                            ("get_pos_ori_from_src", lambda: sim_inst.h5_init.get_pos_ori_from_src(filaments))):
+            with self.subTest(case="no source declared", method=label):
+                with self.assertRaises(RuntimeError):
+                    call()
+
+        missing = os.path.join(self.tmpdir.name, "no_such_source.h5")
+        with self.subTest(case="a missing source file"):
+            with self.assertRaises(FileNotFoundError) as ctx:
+                sim_inst.h5_init.set_init_src(missing, src_to_loc={('real', 'real'): [('pos', 'pos')]},
+                                              place_from=['real'])
+            self.assertIn(missing, str(ctx.exception))
+            self.assertIsNone(sim_inst.h5_init.src_path_h5)
+
+        sim_inst.h5_init.set_init_src(path, src_to_loc={('real', 'real'): [('pos', 'pos')]})
+        self.assertIsNone(sim_inst.h5_init.place_from)
+        for label, call in (("get_pos_ori_from_src",
+                             lambda: sim_inst.h5_init.get_pos_ori_from_src(filaments)),
+                            ("set_objects_from_src",
+                             lambda: sim_inst.h5_init.set_objects_from_src(filaments))):
+            with self.subTest(case="no place_from", method=label):
+                with self.assertRaises(RuntimeError) as ctx:
+                    call()
+                self.assertIn("place_from", str(ctx.exception))
+        self.assertEqual(len(sim_inst.sys.part), 0)
+
+    # -- placement is optional (place_from) --------------------------------
+    def test_load_from_src_without_place_from_copies_state_onto_an_existing_tree(self):
+        """No `place_from` (`samples/poly_BRACO.py`): state and topology land on the script's own tree, no particle added."""
+        filaments = self.build_filaments(bonded=True)
+        written = self.real_positions(filaments)
+        n_links = self.n_live_links()
+        self.assertGreater(n_links, 0, msg="fixture built no bonds")
+        path = self.write_source("existing_tree.h5", bonds=True)
+
+        self.rebuild()
+        filaments = self.build_filaments()          # built and placed locally, no bonds yet
+        for part in sim_inst.sys.part.all():
+            part.pos = part.pos + np.array([2.0, -1.0, 0.5])
+        n_particles = len(sim_inst.sys.part)
+        self.assertGreater(n_particles, 0, msg="the tree was not placed")
+
+        n_added = sim_inst.load_from_src(filaments, path,
+                                         src_to_loc={('real', 'real'): [('pos', 'pos')]},
+                                         bonds=True)
+        self.assertEqual(len(sim_inst.sys.part), n_particles)
+        for who, positions in self.real_positions(filaments).items():
+            np.testing.assert_allclose(positions, written[who], rtol=1e-10, atol=1e-10)
+        self.assertEqual(n_added, n_links)
+        self.assertEqual(self.n_live_links(), n_links)
+
+    def test_a_stored_type_number_reads_a_file_without_a_type_table(self):
+        """A numeric source type is the espresso type stored in the file, so a file with no type table still seeds."""
+        filaments = self.build_filaments()
+        written = self.real_positions(filaments)
+        real_type = int(sim_inst.part_types['real'])
+        no_table = self.edited_copy(self.write_source("type_resolution.h5"), "no_type_table.h5",
+                                    lambda f: f.pop("parameters/pressomancy/part_types"))
+
+        self.rebuild()
+        filaments = self.build_filaments(place=False)
+        sim_inst.load_from_src(filaments, no_table,
+                               src_to_loc={(real_type, 'real'): [('pos', 'pos')]},
+                               place_from=[real_type])
+        for who, positions in self.real_positions(filaments).items():
+            np.testing.assert_allclose(positions, written[who], rtol=1e-10, atol=1e-10)
+
+
+class OldLayoutFileTest(SourceFixture):
+    """A file without `parameters/pressomancy/layout` is pre-H5MD: every particle-data entry refuses it."""
+
+    def test_a_file_without_the_layout_attr_is_refused_with_the_convert_message(self):
+        self.build_filaments()
+        path = self.write_source("old_layout.h5")
+        with h5py.File(path, "r+") as h5_file:
+            del h5_file["parameters/pressomancy"].attrs["layout"]
+
+        self.rebuild()
+        filaments = self.build_filaments(place=False)
+        with h5py.File(path, "r") as handle:
+            entries = {
+                "H5DataSelector": lambda: H5DataSelector(handle, particle_group="Filament"),
+                "stored_steps": lambda: stored_steps(handle, "Filament"),
+            }
+            for name, call in entries.items():
+                with self.subTest(entry=name):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        call()
+                    self.assertIn("old pressomancy HDF5 layout", str(ctx.exception))
+        with self.assertRaises(RuntimeError) as ctx:
+            sim_inst.load_from_src(filaments, path,
+                                   src_to_loc={('real', 'real'): [('pos', 'pos')]},
+                                   place_from=['real'])
+        self.assertIn("old pressomancy HDF5 layout", str(ctx.exception))
+        self.assertEqual(len(sim_inst.sys.part), 0)
+
+
+class LoadNewPartTypesTest(SourceFixture):
+    """LOAD_NEW checks the file's type table against the live one instead of restoring it."""
+
+    def inscribe_load_new(self, path):
+        return sim_inst.inscribe_part_group_to_h5(group_type=[Filament], h5_data_path=path,
+                                                  mode='LOAD_NEW')
+
+    def test_the_type_table_is_checked_not_restored(self):
+        """A shared name with another number refuses; a file-only name is adopted; no table still guards the columns."""
+        filaments = self.build_filaments()
+        source = self.write_source("part_types.h5", steps=(0, 1))
+        live_type = int(sim_inst.part_types['real'])
+        table = "parameters/pressomancy/part_types"
+
+        with self.subTest(case="a name declared with another number"):
+            path = self.edited_copy(source, "types_mismatch.h5",
+                                    lambda f: f[table].attrs.create('real', live_type + 100))
+            try:
+                with self.assertRaises(RuntimeError) as ctx:
+                    self.inscribe_load_new(path)
+            finally:
+                self.reset_io_state()
+            self.assertIn("part_types mismatch", str(ctx.exception))
+
+        with self.subTest(case="a name only the file declares"):
+            path = self.edited_copy(source, "ghost_type.h5", lambda f: f[table].attrs.create('ghost', 999))
+            self.assertNotIn('ghost', sim_inst.part_types)
+            try:
+                self.assertEqual(self.inscribe_load_new(path), 2)
+                self.assertEqual(int(sim_inst.part_types['ghost']), 999)
+            finally:
+                sim_inst.part_types.pop('ghost', None)
+                self.reset_io_state()
+
+        with self.subTest(case="a file without the table"):
+            path = self.edited_copy(source, "types_absent.h5", lambda f: f.pop(table))
+            try:
+                self.assertEqual(self.inscribe_load_new(path), 2)
+            finally:
+                self.reset_io_state()
+            moved = filaments[0].type_part_dict['real'][0]
+            moved.pos = np.asarray(moved.pos) + np.array([1.0, 0.0, 0.0])
+            with self.assertRaises(RuntimeError) as ctx:
+                self.inscribe_load_new(path)
+            self.assertIn("refusing to append", str(ctx.exception))
+
+
+_SM_FEATURES = sorted(set(required_features_for('langevin')) | set(Elastomer.required_features))
+
+
+class SourceBondRestoreTest(SourceFixture):
+    """`set_bonds_from_src` onto a rebuilt tree: the topology it restores and the guards that fire before it attaches."""
+
+    def assert_links_match(self, got, want, exact_params=(), float32_params=()):
+        """Same (owner, partners, bond class) rows; the named parameters equal exactly or as float32 (stored)."""
+        self.assertEqual([link[:3] for link in got], [link[:3] for link in want])
+        for (*_, got_params), (*_, want_params) in zip(got, want):
+            for name in exact_params:
+                self.assertEqual(got_params[name], want_params[name], msg=name)
+            for name in float32_params:
+                self.assertEqual(np.float32(got_params[name]), np.float32(want_params[name]),
+                                 msg=name)
+
+    def test_elastomer_round_trip_overrides_r_cut(self):
+        elastomer = self.build_elastomer()
+        # A positive stored break distance, so the override is observable.
+        elastomer.random_harmonic_bonds(r_catch=2.5, bond_k=(0.01, 0.1), max_bonds=4, r_cut=3.0)
+        written = self.live_links(elastomer.get_owned_part()[0])
+        self.assertGreater(len(written), 0, msg="fixture built no bonds")
+        path = self.write_source("elastomer_bonds.h5", group_type=Elastomer, bonds=True)
+        with h5py.File(path, "r") as h5_file:
+            n_links = int(h5_file["connectivity/Elastomer/bonds"].attrs["n_links"])
+        self.assertEqual(n_links, len(written))
+
+        for r_cut_override, want_r_cut in ((0.0, 0.0), (None, 3.0)):
+            with self.subTest(r_cut_override=r_cut_override):
+                self.rebuild()
+                elastomer = self.build_elastomer(place=False)
+                n_added = sim_inst.load_from_src([elastomer], path,
+                                                 src_to_loc={('real', 'real'): []}, bonds=True,
+                                                 place_from=['real'],
+                                                 r_cut_override=r_cut_override)
+                self.assertEqual(n_added, n_links)
+                restored = self.live_links(elastomer.get_owned_part()[0])
+                self.assert_links_match(restored, written, float32_params=("k", "r_0"))
+                self.assertEqual({params["r_cut"] for *_, params in restored}, {want_r_cut})
+                # every link carries its own random k, so every parameter set is distinct
+                self.assertEqual(self.n_registered_bonds(), n_links)
+                sim_inst.sys.integrator.run(0)
+                self.assertLess(abs(sim_inst.sys.analysis.energy()["bonded"]), 1e-10)
+
+    def test_a_filament_round_trip_restores_pairs_and_angles_and_copies_nothing(self):
+        """Pairs and angles (own tables) come back once per parameter set; `[]` zips for the bonds but copies no dip."""
+        filaments = self.build_filaments(one_bond_handle=False, bonded=True, with_dipoles=True)
+        for filament in filaments:
+            filament.add_bending_potential(
+                type_name='real',
+                bond_handle=espressomd.interactions.AngleHarmonic(bend=3., phi0=np.pi))
+        written = self.live_links([part for filament in filaments for part in filament.get_owned_part()[0]])
+        n_pairs = self.n_filaments * (self.n_parts - 1)
+        n_angles = self.n_filaments * (self.n_parts - 2)
+        self.assertEqual(len(written), n_pairs + n_angles)
+        self.assertTrue(all(np.any(dips) for dips in self.typed_values(filaments, 'real', 'dip').values()),
+                        msg="source dips are zero")
+        path = self.write_source("filament_bonds.h5", bonds=True)
+        with h5py.File(path, "r") as h5_file:
+            for bond_class in ("FeneBond", "AngleHarmonic"):     # one stored parameter set per filament
+                self.assertEqual(len(h5_file[f"pressomancy/Filament/bond_params/{bond_class}"]),
+                                 self.n_filaments, msg=bond_class)
+            self.assertEqual(h5_file["connectivity/Filament/bonds"].shape, (n_pairs, 2))
+            self.assertEqual(h5_file["connectivity/Filament/angles"].shape, (n_angles, 3))
+            stored = sorted((owner, partners) for owner, partners, _ in
+                            read_bonds(h5_file, "Filament"))
+        self.assertEqual(stored, sorted((owner, partners) for owner, partners, *_ in written))
+
+        self.rebuild()
+        filaments = self.build_filaments(place=False)
+        n_added = sim_inst.load_from_src(filaments, path, src_to_loc={('real', 'real'): []},
+                                         bonds=True, place_from=['real'])
+        self.assertEqual(n_added, len(written))
+        restored = self.live_links([part for filament in filaments for part in filament.get_owned_part()[0]])
+        self.assertEqual([link[:3] for link in restored], [link[:3] for link in written])
+        # FeneBond has no r_cut, so the default override leaves its parameters exact
+        self.assert_links_match([link for link in restored if link[2] == 'FeneBond'],
+                                [link for link in written if link[2] == 'FeneBond'],
+                                exact_params=("k", "r_0", "d_r_max"))
+        self.assertEqual(self.n_registered_bonds(), 2)       # one FeneBond, one AngleHarmonic handle
+        for who, dips in self.typed_values(filaments, 'real', 'dip').items():
+            np.testing.assert_array_equal(dips, np.zeros((self.n_parts, 3)))
+
+    def test_every_bond_guard_fires_before_a_bond_is_attached(self):
+        """Every refusal leaves no live link and no new registration.
+
+        The dangling-bond guard is unreachable by seeding part of a group (the who_am_i set check forbids it):
+        a bond that leaves the mapped *types* ('real' to an anchor 'virt') reaches it, in both directions."""
+        filaments = self.build_filaments(with_anchors=True, bonded=True)
+        bondless = self.write_source("bondless.h5")
+        bonded = self.write_source("bonded.h5", bonds=True)
+        real, virt = filaments[0].type_part_dict['real'][0], filaments[0].type_part_dict['virt'][0]
+        filaments[0].bond_owned_part_pair(real, virt)
+        partner_outside = self.write_source("partner_outside.h5", bonds=True)
+        real.delete_bond((filaments[0].params['bond_handle'].get_raw_handle(), virt.id))
+        filaments[0].bond_owned_part_pair(virt, real)
+        owner_outside = self.write_source("owner_outside.h5", bonds=True)
+
+        self.rebuild()
+        filaments = self.build_filaments(place=False)
+        registered_before = self.n_registered_bonds()
+        n_placed = self.n_filaments * self.n_parts
+
+        def restore_bonds(path, src_to_loc=None):
+            sim_inst.h5_init.set_init_src(path, place_from=['real'],
+                                          src_to_loc={('real', 'real'): []} if src_to_loc is None else src_to_loc)
+            return sim_inst.h5_init.set_bonds_from_src(filaments)
+
+        def restore_bonds_onto_a_moved_tree():
+            for part in sim_inst.sys.part.all():
+                part.pos = part.pos + np.array([1.0, 0., 0.])
+            return restore_bonds(bonded)
+
+        # In order: the first two see an unplaced tree, the third places it from the file.
+        cases = [   # (label, error, fragment of the raise, call, particles afterwards)
+            ("no source declared", RuntimeError, "no source declared",
+             lambda: sim_inst.h5_init.set_bonds_from_src(filaments), 0),
+            ("bonds without a mapping", ValueError, "src_to_loc is empty",
+             lambda: sim_inst.load_from_src(filaments, bonded, None, bonds=True, place_from=['real']), 0),
+            ("partner outside the mapping", ValueError, "dangling bond",
+             lambda: sim_inst.load_from_src(filaments, partner_outside, {('real', 'real'): []},
+                                            bonds=True, place_from=['real']), n_placed),
+            ("owner outside the mapping", ValueError, "dangling bond",
+             lambda: restore_bonds(owner_outside), n_placed),
+            ("an unknown local type", KeyError, "no_such_type",
+             lambda: restore_bonds(bonded, {('real', 'no_such_type'): []}), n_placed),
+            ("a source type the file does not declare", KeyError, "no_such_type",
+             lambda: restore_bonds(bonded, {('no_such_type', 'real'): []}), n_placed),
+            ("a bondless source", KeyError, "no bond topology",
+             lambda: restore_bonds(bondless), n_placed),
+            # the zip is cross-checked against the source positions
+            ("objects placed elsewhere", ValueError, "positions differ",
+             restore_bonds_onto_a_moved_tree, n_placed),
+        ]
+        for label, error, fragment, call, n_particles in cases:
+            with self.subTest(case=label):
+                with self.assertRaises(error) as ctx:
+                    call()
+                self.assertIn(fragment, str(ctx.exception))
+                self.assertEqual(len(sim_inst.sys.part), n_particles)
+                self.assertEqual(self.n_live_links(), 0)
+                self.assertEqual(self.n_registered_bonds(), registered_before)
+
+    @unittest.skipIf(not all(api_agnostic_feature_check(f) for f in _SM_FEATURES),
+                     f"needs espresso features {_SM_FEATURES}")
+    def test_a_bare_sample_seeds_a_magnetizable_network(self):
+        """A bare Elastomer ('real') seeds a PointDipoleMagnetizable network ('pdm_real') in one `load_from_src`.
+
+        Local ids differ from source ids (each PDM owns a real and a virtual particle), so the
+        bond partners are compared through positions, independently of the zip convention."""
+        box_E, n_parts, size = [4., 4., 4.], 16, 1.
+        elastomer = Elastomer(config=Elastomer.config.specify(
+            box_E=box_E, n_parts=n_parts, size=size, bond_cutoff=2., max_bonds=4,
+            espresso_handle=sim_inst.sys, seed=sim_inst.seed))
+        sim_inst.store_objects([elastomer])
+        sim_inst.set_objects([elastomer])
+        # A mixed network leaves the build lattice's z range; source-driven placement must accept that.
+        real = elastomer.type_part_dict['real']
+        z = np.array([p.pos[2] for p in real])
+        low, high = real[int(np.argmin(z))], real[int(np.argmax(z))]
+        low.pos = low.pos - [0., 0., 0.2]
+        high.pos = high.pos + [0., 0., 0.2]
+        elastomer.cure_elastomer()
+        written_who_am_i = elastomer.who_am_i
+        sim_inst.io_dict['properties'] = list(self.SOURCE_PROPERTIES) + [('fix', 3, np.bool_)]
+        path = self.write_source("sample.h5", group_type=Elastomer, bonds=True)
+        with h5py.File(path, "r") as h5_file:
+            grp = h5_file["particles/Elastomer"]
+            types = grp[f"{element_name('type')}/value"][-1]
+            is_real = types == Elastomer.part_types['real']
+            src_ids = grp[f"{element_name('id')}/value"][-1][is_real]
+            src_pos = grp[f"{element_name('pos')}/value"][-1][is_real]
+            src_fix = grp["fix/value"][-1][is_real]     # a custom element keeps its own name
+            n_links = int(h5_file["connectivity/Elastomer/bonds"].attrs["n_links"])
+            params = read_bond_params(h5_file, "Elastomer")
+            # read_bonds speaks particle ids; the file stores column indices.
+            stored = {(owner, partners[0], float(params[bond_id][1]["k"]),
+                       float(params[bond_id][1]["r_0"]))
+                      for owner, partners, bond_id in read_bonds(h5_file, "Elastomer")}
+
+        self.rebuild()
+        pdm = [PointDipoleMagnetizable(config=PointDipoleMagnetizable.config.specify(
+            dipm_sat=1., mag_susc_0=0.1, magnetization_model='langevin', espresso_handle=sim_inst.sys))
+            for _ in range(n_parts)]
+        elastomer = Elastomer(config=Elastomer.config.specify(
+            box_E=box_E, n_parts=n_parts, size=size, associated_objects=pdm,
+            espresso_handle=sim_inst.sys, seed=sim_inst.seed))
+        sim_inst.store_objects([elastomer])
+        n_added = sim_inst.load_from_src([elastomer], path,
+                                         src_to_loc={('real', 'pdm_real'): [('fix', 'fix')]},
+                                         bonds=True, place_from=['real'])
+        handles = [p for p in elastomer.get_owned_part()[0] if p.type == sim_inst.part_types['pdm_real']]
+        ids = [int(p.id) for p in handles]
+        pos = np.array([p.pos for p in handles])
+        bonds = [(int(p.id), int(partner), bond.k, bond.r_0, bond.r_cut)
+                 for p in elastomer.get_owned_part()[0] for bond, partner in p.bonds]
+
+        self.assertEqual(elastomer.who_am_i, written_who_am_i)
+        # the source really leaves the strict build range, so the relaxed check was exercised
+        self.assertLess(src_pos[:, 2].min(), 1. + size / 2)
+
+        # positions and fix, both restored by the single load_from_src call, bit-exact in column order
+        self.assertEqual(len(ids), n_parts)
+        np.testing.assert_array_equal(pos, src_pos)
+        np.testing.assert_array_equal(np.array([p.fix for p in handles]), src_fix)
+        self.assertTrue(src_fix.any(), msg="cure pinned no bead; fix copy untested")
+        self.assertNotEqual(ids, src_ids.tolist(), msg="identity mapping hides mapping bugs")
+
+        # bonds: count, r_cut as cured (never-break 0; the override is pinned by the r_cut round trip)
+        self.assertEqual(n_added, n_links)
+        self.assertEqual(len(bonds), n_links)
+        self.assertEqual(self.n_registered_bonds(), n_links)
+        self.assertEqual({b[4] for b in bonds}, {0.0})
+
+        # partners through positions: local link -> source link, with its own k and r_0
+        src_by_pos = {tuple(p): int(sid) for sid, p in zip(src_ids, src_pos)}
+        loc_pos = dict(zip(ids, map(tuple, pos)))
+        mapped = {(src_by_pos[loc_pos[o]], src_by_pos[loc_pos[p]], float(np.float32(k)), float(np.float32(r0)))
+                  for o, p, k, r0, _ in bonds}
+        self.assertEqual(mapped, stored)
+
+
+def write_bond_tables(path, group_name, parts, sys):
+    """The smallest file `io/bonds.py` reads back: the group's id column (rows are column indices) and its tables."""
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset(f"particles/{group_name}/{element_name('id')}/value",
+                              data=np.array([[int(part.id) for part in parts]], dtype=np.int32))
+        return write_bonds(handle, group_name, particles=parts, sys=sys)
+
+
+class BondVerificationTest(IOTestCase):
+    """`verify_bond_params` compares each stored link with the bond attached to that particle, not by registration id."""
+
+    box_dim = SMALL_BOX
+    GROUP = "Probe"
+
+    @staticmethod
+    def attach(links):
+        """Register and attach `links` = [(owner, partner, k)] in the given order, one handle each."""
+        for owner, partner, k in links:
+            bond = espressomd.interactions.HarmonicBond(k=k, r_0=1.)
+            sim_inst.sys.bonded_inter.add(bond)
+            owner.add_bond((bond, partner.id))
+
+    @staticmethod
+    def restart(parts):
+        """Drop every bond and the whole registry, as a new process would."""
+        for part in parts:
+            part.delete_all_bonds()
+        sim_inst.sys.bonded_inter.clear()
+
+    def test_reordered_registration_is_silent_and_a_drifted_k_warns(self):
+        parts = [sim_inst.sys.part.add(pos=[1.0 + i, 1.0, 1.0], type=0) for i in range(4)]
+        links = [(parts[0], parts[1], 1.0), (parts[1], parts[2], 2.0), (parts[2], parts[3], 3.0)]
+        self.attach(links)
+        path = os.path.join(self.tmpdir.name, "bonds.h5")
+        write_bond_tables(path, self.GROUP, parts, sim_inst.sys)
+
+        self.restart(parts)
+        self.attach(list(reversed(links)))      # same topology, opposite registration order
+        with h5py.File(path, "r") as handle, self.assertNoLogs(level="WARNING"):
+            verify_bond_params(handle, self.GROUP, sim_inst.sys)
+
+        self.restart(parts)
+        self.attach([links[0], (parts[1], parts[2], 99.0), links[2]])     # same link, different stiffness
+        with h5py.File(path, "r") as handle, self.assertLogs(level="WARNING") as captured:
+            verify_bond_params(handle, self.GROUP, sim_inst.sys)
+        text = "\n".join(captured.output)
+        self.assertRegex(text, rf"""different parameters \(e\.g\. \[["']particle {parts[1].id} -> """)
+        self.assertIn("not registered in sys.bonded_inter", text)     # the registry check (a separate warning)
+
+class SourceFrameSelectionTest(SourceFixture):
+    """`frame` is a file index, `step` a stored step value, `time` a stored time: three numbers for one frame.
+
+    Every test gets a three-frame source and a rebuilt, unplaced tree, so a wrong frame is a wrong position."""
+
+    steps = (0, 5, 10)
+
+    def setUp(self):
+        super().setUp()
+        filaments = self.build_filaments(bonded=True)
+        self.n_links = self.n_live_links()
+        self.frames, self.directors = [], []
+
+        def advance():
+            # A distinct, known displacement and time per frame.
+            for part in sim_inst.sys.part.all():
+                part.pos = part.pos + np.array([0.5, 0., 0.])
+            sim_inst.sys.time = sim_inst.sys.time + 1.0
+            self.frames.append(self.real_positions(filaments))
+            self.directors.append(self.typed_values(filaments, 'real', 'director'))
+
+        self.path = self.write_source("frames.h5", bonds=True, steps=self.steps,
+                                      advance=advance)
+        with h5py.File(self.path, "r") as h5_file:
+            self.times = h5_file[f"particles/Filament/{element_name('pos')}/time"][...].tolist()
+
+        self.rebuild()
+        self.filaments = self.build_filaments(place=False)
+        sim_inst.h5_init.set_init_src(self.path, place_from=['real'],
+                                       src_to_loc={('real', 'real'): [('pos', 'pos')]})
+
+    def assert_at_frame(self, frame_index):
+        for who, positions in self.real_positions(self.filaments).items():
+            np.testing.assert_allclose(positions, self.frames[frame_index][who],
+                                       rtol=1e-10, atol=1e-10)
+
+    def test_every_selector_form_reads_the_same_frame(self):
+        """frame, step and time of one frame agree; no selector is the last frame; frame=-1 and agreeing selectors work."""
+        last = len(self.steps) - 1
+        cases = [(f"frame {index} by {name}", {name: value}, index)
+                 for index, step in enumerate(self.steps)
+                 for name, value in (("frame", index), ("step", step), ("time", self.times[index]))]
+        cases += [("no selector", {}, last),
+                  ("frame=-1", dict(frame=-1), last),
+                  ("frame, step and time agreeing", dict(frame=0, step=self.steps[0], time=self.times[0]), 0)]
+        for label, selector, index in cases:
+            with self.subTest(case=label):
+                positions, orientations = sim_inst.h5_init.get_pos_ori_from_src(self.filaments, **selector)
+                self.assertEqual(len(positions), len(self.filaments))
+                for filament, pos, ori in zip(self.filaments, positions, orientations):
+                    np.testing.assert_allclose(pos, self.frames[index][filament.who_am_i], rtol=0, atol=1e-12)
+                    np.testing.assert_allclose(ori, self.directors[index][filament.who_am_i], rtol=0, atol=1e-12)
+
+    def test_every_reader_honours_the_selector(self):
+        """Objects and bonds from step 5 (not the last frame; bonds cross-check positions), then props at every frame."""
+        sim_inst.h5_init.set_objects_from_src(self.filaments, step=self.steps[1])
+        self.assert_at_frame(1)
+        n_added = sim_inst.h5_init.set_bonds_from_src(self.filaments, step=self.steps[1])
+        self.assertEqual(n_added, self.n_links)
+        self.assertEqual(self.n_live_links(), self.n_links)
+        for index, step in enumerate(self.steps):
+            for label, selector in (("frame", dict(frame=index)),
+                                    ("step", dict(step=step)),
+                                    ("time", dict(time=self.times[index]))):
+                with self.subTest(frame=index, selector=label):
+                    for part in sim_inst.sys.part.all():
+                        part.pos = part.pos + np.array([7.0, 0., 0.])
+                    sim_inst.h5_init.set_prop_from_src(self.filaments, **selector)
+                    self.assert_at_frame(index)
+
+    def test_a_bad_selector_raises_before_anything_is_placed(self):
+        # without the range check a frame index would silently wrap around (frame % n_frames)
+        with self.subTest(case="an out-of-range frame"), self.assertRaises(IndexError):
+            sim_inst.h5_init.get_pos_ori_from_src(self.filaments, frame=len(self.steps))
+        conflicting = {
+            "get_pos_ori_from_src": lambda: sim_inst.h5_init.get_pos_ori_from_src(
+                self.filaments, frame=0, step=self.steps[1]),
+            "set_prop_from_src": lambda: sim_inst.h5_init.set_prop_from_src(
+                self.filaments, frame=0, step=self.steps[1]),
+            "set_bonds_from_src": lambda: sim_inst.h5_init.set_bonds_from_src(
+                self.filaments, frame=0, step=self.steps[1]),
+            "set_objects_from_src": lambda: sim_inst.h5_init.set_objects_from_src(
+                self.filaments, frame=0, time=self.times[1]),
+        }
+        for name, call in conflicting.items():
+            with self.subTest(method=name):
+                with self.assertRaises(ValueError) as ctx:
+                    call()
+                self.assertIn("select different frames", str(ctx.exception))
+        self.assertEqual(len(sim_inst.sys.part), 0)
+
+
+class BondSerializationTest(IOTestCase):
+    """`io/bonds.py` on its own: which table a link lands in, as column indices, and cross-group links."""
+
+    GROUP = "Probe"
+    box_dim = SMALL_BOX
+
+    @staticmethod
+    def add_particles(n, first_id=5):
+        """Ascending, gapped, non-zero-based ids: a column index never equals the id it stands for."""
+        return [sim_inst.sys.part.add(id=first_id + 2 * i, pos=[1.0 + i, 1.0, 1.0], type=0)
+                for i in range(n)]
+
+    def write(self, parts, name):
+        """``(path, n_links)`` of a file holding only this group's id column and tables."""
+        path = os.path.join(self.tmpdir.name, name)
+        return path, write_bond_tables(path, self.GROUP, parts, sim_inst.sys)
+
+    def test_links_are_stored_per_arity_as_column_indices(self):
+        """Rows are column indices in the table of their partner count (`bonds` even when empty); read_bonds maps back."""
+        from pressomancy.io.bonds import _bond_id_of
         fene = espressomd.interactions.FeneBond(k=10., r_0=1., d_r_max=2.)
+        angle = espressomd.interactions.AngleHarmonic(bend=1.0, phi0=np.pi)
         sim_inst.sys.bonded_inter.add(fene)
-        for a, b in zip(parts, parts[1:]):
+        sim_inst.sys.bonded_inter.add(angle)
+        mixed, angle_only = self.add_particles(4), self.add_particles(3, first_id=21)
+        for a, b in zip(mixed, mixed[1:]):
             a.add_bond((fene, b.id))
+        for parts in (mixed, angle_only):
+            parts[1].add_bond((angle, parts[0].id, parts[2].id))
 
-        particle_ids, offsets, links, max_partners = collect_bond_links(parts)
+        with self.subTest(case="pairs and an angle, gapped ids"):
+            path, n_links = self.write(mixed, "mixed.h5")
+            self.assertEqual(n_links, 4)
+            with h5py.File(path, "r") as handle:
+                conn = handle[f"connectivity/{self.GROUP}"]
+                np.testing.assert_array_equal(conn["bonds"][...], [[0, 1], [1, 2], [2, 3]])
+                np.testing.assert_array_equal(conn["angles"][...], [[1, 0, 2]])
+                self.assertEqual(int(conn["bonds"].attrs["n_links"]), 4)
+                self.assertEqual(conn["bonds"].attrs["particles_group"], f"/particles/{self.GROUP}")
+                np.testing.assert_array_equal(
+                    handle[f"pressomancy/{self.GROUP}/bond_params/bond_id"][...],
+                    [_bond_id_of(fene)] * 3)
+                recovered = sorted((pid, tuple(partners), bond)
+                                   for pid, partners, bond in read_bonds(handle, self.GROUP))
+            ids = [part.id for part in mixed]
+            self.assertEqual(recovered, sorted(
+                [(ids[i], (ids[i + 1],), _bond_id_of(fene)) for i in range(3)]
+                + [(ids[1], (ids[0], ids[2]), _bond_id_of(angle))]))
 
-        np.testing.assert_array_equal(particle_ids, [p.id for p in parts])
-        self.assertEqual(len(offsets), len(parts) + 1)
-        self.assertEqual(offsets[0], 0)
-        self.assertTrue(np.all(np.diff(offsets) >= 0), msg="offsets must be monotonic")
-        self.assertEqual(int(offsets[-1]), links.shape[0])
-        self.assertEqual(int(offsets[-1]), 3)
-        self.assertEqual(max_partners, 1)
-        self.assertEqual(links.shape[1], 2 + max_partners)
-        # Every row: (bond_id, n_partners, partner...)
-        for row in links:
-            self.assertEqual(int(row[1]), 1)
-            self.assertIn(int(row[2]), [p.id for p in parts])
+        with self.subTest(case="an angle only"):
+            path, n_links = self.write(angle_only, "angle.h5")
+            self.assertEqual(n_links, 1)
+            with h5py.File(path, "r") as handle:
+                conn = handle[f"connectivity/{self.GROUP}"]
+                np.testing.assert_array_equal(conn["angles"][...], [[1, 0, 2]])
+                self.assertEqual(conn["bonds"].shape, (0, 2))
+                self.assertEqual(int(conn["bonds"].attrs["n_links"]), 1)   # all tables
 
-    def test_multi_partner_bond_is_laid_out_and_padded(self):
-        """Angle bonds carry two partners; the fixtures elsewhere never do."""
-        from pressomancy.io.bonds import collect_bond_links
-        parts = self.add_particles(3)
-        angle = espressomd.interactions.AngleHarmonic(bend=1.0, phi0=np.pi)
-        sim_inst.sys.bonded_inter.add(angle)
-        parts[1].add_bond((angle, parts[0].id, parts[2].id))
-
-        _, offsets, links, max_partners = collect_bond_links(parts)
-        self.assertEqual(max_partners, 2)
-        self.assertEqual(links.shape[1], 4)
-        self.assertEqual(int(offsets[-1]), 1)
-        row = links[0]
-        self.assertEqual(int(row[1]), 2)
-        self.assertEqual({int(row[2]), int(row[3])}, {parts[0].id, parts[2].id})
-
-    def test_padding_uses_minus_one_when_partner_counts_differ(self):
-        from pressomancy.io.bonds import collect_bond_links
-        parts = self.add_particles(3)
-        fene = espressomd.interactions.FeneBond(k=10., r_0=1., d_r_max=2.)
-        angle = espressomd.interactions.AngleHarmonic(bend=1.0, phi0=np.pi)
-        sim_inst.sys.bonded_inter.add(fene)
-        sim_inst.sys.bonded_inter.add(angle)
-        parts[0].add_bond((fene, parts[1].id))
-        parts[1].add_bond((angle, parts[0].id, parts[2].id))
-
-        _, _, links, max_partners = collect_bond_links(parts)
-        self.assertEqual(max_partners, 2)
-        one_partner = [row for row in links if int(row[1]) == 1]
-        self.assertEqual(len(one_partner), 1)
-        # The unused partner slot is padded, not left as a stale id.
-        self.assertEqual(int(one_partner[0][3]), -1)
-
-    def test_partner_outside_the_group_is_kept_as_a_raw_id(self):
-        """The docstring promises a dangling partner stays visible."""
-        from pressomancy.io.bonds import collect_bond_links
+    def test_a_partner_outside_the_group_is_not_implemented(self):
+        """A column index cannot name a foreign particle: a cross-group bond raises NotImplementedError."""
         inside = self.add_particles(2)
         outside = sim_inst.sys.part.add(pos=[9.0, 9.0, 9.0], type=1)
         fene = espressomd.interactions.FeneBond(k=10., r_0=1., d_r_max=2.)
         sim_inst.sys.bonded_inter.add(fene)
         inside[0].add_bond((fene, outside.id))
 
-        _, _, links, _ = collect_bond_links(inside)
-        self.assertEqual(links.shape[0], 1)
-        self.assertEqual(int(links[0][2]), outside.id)
-        self.assertNotIn(outside.id, [p.id for p in inside])
+        with self.assertRaises(NotImplementedError) as ctx:
+            self.write(inside, "dangling.h5")
+        self.assertIn(f"partner {outside.id}", str(ctx.exception))
 
-    # -- parameter schema round trip ---------------------------------------
-    def test_bond_params_round_trip(self):
-        from pressomancy.io.bonds import (h5_dtype_for, write_bond_params,
-                                          read_bond_params, _bond_id_of)
-        fene = espressomd.interactions.FeneBond(k=11.5, r_0=1.25, d_r_max=2.5)
-        harmonic = espressomd.interactions.HarmonicBond(k=3.75, r_0=0.5)
-        sim_inst.sys.bonded_inter.add(fene)
-        sim_inst.sys.bonded_inter.add(harmonic)
 
-        dtype = h5_dtype_for(fene)
-        self.assertIn("bond_id", dtype.names)
-        for name in ("k", "r_0", "d_r_max"):
-            self.assertIn(name, dtype.names)
+# ``fix`` needs EXTERNAL_FORCES; it is the trajectory extra whose non-float dtype a
+# checkpoint must keep and that a restart copies through ``src_to_loc``. Without the
+# feature the same checks fall back on ``image_box`` (int32, always stored).
+_FIX_PROPERTY = [('fix', 3, np.bool_)] if api_agnostic_feature_check('EXTERNAL_FORCES') else []
+_FIX_PAIRS = {('real', 'real'): [('fix', 'fix')]} if _FIX_PROPERTY else None
+#: The per-particle state a checkpoint restores in this build, the contract's comparison list.
+_STATE_PROPERTIES = [attr for attr, _dim, feature in CHECKPOINT_PROPERTIES
+                     if feature is None or api_agnostic_feature_check(feature)]
 
-        path = os.path.join(self.tmpdir.name, "params.h5")
-        with h5py.File(path, "w") as handle:
-            write_bond_params(handle.require_group("bonds"), sim_inst.sys)
-        with h5py.File(path, "r") as handle:
-            table = read_bond_params(handle["bonds"])
 
-        for original in (fene, harmonic):
-            cls, kw = table[_bond_id_of(original)]
-            self.assertIs(cls, type(original))
-            live = original.get_params()
-            for name, value in kw.items():
-                self.assertAlmostEqual(float(value), float(live[name]), places=5,
-                                       msg=f"{type(original).__name__}.{name}")
-            rebuilt = cls(**kw)
-            self.assertIsInstance(rebuilt, type(original))
+class PropertiesListTest(SourceFixture):
+    """`io_dict['properties']` is validated at inscription and must describe the file exactly to resume."""
 
-    # -- read_bonds --------------------------------------------------------
-    def test_read_bonds_recovers_topology(self):
-        from pressomancy.io.bonds import write_bonds, read_bonds, _bond_id_of
-        parts = self.add_particles(3)
-        fene = espressomd.interactions.FeneBond(k=10., r_0=1., d_r_max=2.)
-        angle = espressomd.interactions.AngleHarmonic(bend=1.0, phi0=np.pi)
-        sim_inst.sys.bonded_inter.add(fene)
-        sim_inst.sys.bonded_inter.add(angle)
-        parts[0].add_bond((fene, parts[1].id))
-        parts[1].add_bond((angle, parts[0].id, parts[2].id))
+    def inscribe(self, path, mode='NEW', **kwargs):
+        return sim_inst.inscribe_part_group_to_h5(group_type=[Filament], h5_data_path=path,
+                                                  mode=mode, **kwargs)
 
-        path = os.path.join(self.tmpdir.name, "topology.h5")
-        with h5py.File(path, "w") as handle:
-            n_links = write_bonds(handle.require_group("connectivity"),
-                                  particles=parts, sys=sim_inst.sys, step=0)
-        self.assertEqual(n_links, 2)
+    def test_a_malformed_properties_list_is_refused_before_the_file_is_touched(self):
+        self.build_filaments()
+        head = [('id', None, np.int32), ('type', None, np.int16), ('pos', 3, np.float64)]
+        cases = {
+            'first three out of order': [head[1], head[0], head[2]],
+            'pos not floating': head[:2] + [('pos', 3, np.int32)],
+            'pos a scalar': head[:2] + [('pos', None, np.float64)],
+            'only two entries': head[:2],
+            'a duplicated attr': head + [('f', 3, np.float64), ('f', 3, np.float64)],
+            'a non-positive dim': head + [('v', 0, np.float64)],
+            'an unresolvable dtype': head + [('v', 3, 'nonsense')],
+            'not a list': tuple(head),
+        }
+        path = os.path.join(self.tmpdir.name, "malformed.h5")
+        for label, properties in cases.items():
+            with self.subTest(case=label):
+                sim_inst.io_dict['properties'] = properties
+                with self.assertRaises(ValueError):
+                    self.inscribe(path)
+                self.assertIsNone(sim_inst.io_dict['h5_file'])
+                self.assertFalse(os.path.exists(path))
 
-        with h5py.File(path, "r") as handle:
-            recovered = list(read_bonds(handle["connectivity/bonds"]))
-            live = list(read_bonds(handle["connectivity/bonds"], instantiate=True))
+    def test_the_properties_list_must_describe_the_file_to_resume(self):
+        """Missing, extra, retyped or reshaped: RuntimeError naming the element; the matching list resumes."""
+        self.build_filaments()
+        stored_properties = list(self.SOURCE_PROPERTIES) + [('fix', 3, np.bool_)]
+        sim_inst.io_dict['properties'] = list(stored_properties)
+        path = self.write_source("properties_match.h5", steps=(0, 1))
+        cases = {
+            'element missing from the list': (
+                [entry for entry in stored_properties if entry[0] != 'fix'], r"not in the list: \['fix'\]"),
+            'element extra in the list': (
+                stored_properties + [('v', 3, np.float64)], r"missing from the file: \['v'\]"),
+            'dtype mismatch': (list(self.SOURCE_PROPERTIES) + [('fix', 3, np.int8)], r"'fix' is stored as bool"),
+            'dim mismatch': (list(self.SOURCE_PROPERTIES) + [('fix', 1, np.bool_)], r"'fix' is stored as .* \(3,\)"),
+        }
+        for mode in ('LOAD', 'LOAD_NEW'):
+            for label, (properties, message) in cases.items():
+                with self.subTest(mode=mode, case=label):
+                    sim_inst.io_dict['properties'] = list(properties)
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        self.inscribe(path, mode)
+                    self.reset_io_state()
+            sim_inst.io_dict['properties'] = list(stored_properties)
+            self.assertEqual(self.inscribe(path, mode), 2, mode)
+            self.reset_io_state()
 
-        self.assertEqual(len(recovered), 2)
-        by_particle = {pid: (tuple(partners), bond) for pid, partners, bond in recovered}
-        self.assertEqual(by_particle[parts[0].id][0], (parts[1].id,))
-        self.assertEqual(by_particle[parts[0].id][1], _bond_id_of(fene))
-        self.assertEqual(set(by_particle[parts[1].id][0]), {parts[0].id, parts[2].id})
-        self.assertEqual(by_particle[parts[1].id][1], _bond_id_of(angle))
 
-        # instantiate=True must hand back live espresso objects, not ids.
-        kinds = {type(bond) for _, _, bond in live}
-        self.assertEqual(kinds, {espressomd.interactions.FeneBond,
-                                 espressomd.interactions.AngleHarmonic})
+class TruncationTest(SourceFixture):
+    """`rewind_to_step`/`force_resize_to_size` cut every stream of two groups (a cut reaching only the first fails)."""
+
+    observable_name = "probe"
+    GROUPS = (Filament, Crowder)
+
+    def setUp(self):
+        super().setUp()
+        self.build_filaments()
+        crowders = [Crowder(config=Crowder.config.specify(sigma=1., size=1., espresso_handle=sim_inst.sys))
+                    for _ in range(3)]
+        sim_inst.store_objects(crowders)
+        sim_inst.set_objects(crowders)
+        self.observable_value = np.zeros(3, dtype=np.float64)
+        self.path = os.path.join(self.tmpdir.name, f"{self.id().rsplit('.', 1)[-1]}.h5")
+        self.inscribe('particles', 'NEW')
+        self.inscribe('observables', 'NEW')
+        self.times = []
+        for step in range(3):
+            sim_inst.sys.time = 0.5 * step          # exact in the float32 time dataset
+            self.times.append(float(sim_inst.sys.time))
+            self.observable_value[:] = step
+            sim_inst.write_registered_to_h5(step=step)
+        self.reset_io_state()
+
+    def inscribe(self, stream, mode, path=None, **kwargs):
+        """Inscribe one stream ('particles' or 'observables') of the setUp file, or of ``path``."""
+        path = self.path if path is None else path
+        if stream == 'particles':
+            return sim_inst.inscribe_part_group_to_h5(group_type=list(self.GROUPS), h5_data_path=path,
+                                                      mode=mode, **kwargs)
+        return sim_inst.inscribe_observable_group_to_h5(
+            observable_defs=[(self.observable_name, 3, np.float64, self.observable_value)],
+            h5_data_path=path, mode=mode, **kwargs)
+
+    def frames_per_stream(self, h5_file):
+        """``{dataset path: frame count}`` of every element and box of every group, and of the observable."""
+        counts = {}
+        for group in self.GROUPS:
+            where = f"particles/{group.__name__}"
+            data_grp = h5_file[where]
+            counts.update({f"{where}/{name}": member["value"].shape[0]
+                           for name, member in data_grp.items() if name != 'box'})
+            counts[f"{where}/box/edges"] = data_grp["box/edges/value"].shape[0]
+            counts[f"{where}/step"] = data_grp[f"{element_name('pos')}/step"].shape[0]
+            counts[f"{where}/time"] = data_grp[f"{element_name('pos')}/time"].shape[0]
+        obs_group = h5_file["observables"][self.observable_name]
+        counts.update({f"observables/{name}": obs_group[name].shape[0]
+                       for name in ("step", "time", "value")})
+        return counts
+
+    def test_truncation_cuts_every_stream_and_the_run_appends(self):
+        """Both arguments, both resume modes: every stream keeps its first two frames, then takes the next one."""
+        n_particles = {group.__name__: sum(len(obj.get_owned_part()[0]) for obj in sim_inst.objects
+                                           if isinstance(obj, group))
+                       for group in self.GROUPS}
+        for truncation in (dict(rewind_to_step=1), dict(force_resize_to_size=2)):
+            for mode in ('LOAD_NEW', 'LOAD'):
+                with self.subTest(mode=mode, **truncation):
+                    path = os.path.join(self.tmpdir.name, f"{mode}_{next(iter(truncation))}.h5")
+                    shutil.copy2(self.path, path)
+                    sim_inst.sys.time = self.times[1]
+                    try:
+                        kept = [self.inscribe(stream, mode, path, **truncation)
+                                for stream in ('particles', 'observables')]
+                        self.assertEqual(kept, [2, 2])
+                        h5_file = sim_inst.io_dict['h5_file']
+                        for stream, count in self.frames_per_stream(h5_file).items():
+                            self.assertEqual(count, 2, msg=stream)
+                        for group, count in n_particles.items():
+                            np.testing.assert_array_equal(stored_steps(h5_file, group), [0, 1])
+                            dataview = H5DataSelector(h5_file, particle_group=group)
+                            np.testing.assert_allclose(dataview.time, self.times[:2])
+                            np.testing.assert_equal(dataview.common_dims, (2, count))
+                        observable = H5ObservableSelector(h5_file, observable_name=self.observable_name)
+                        np.testing.assert_array_equal(observable.step, [0, 1])
+                        np.testing.assert_allclose(observable.time, self.times[:2])
+                        np.testing.assert_allclose(observable.value, [[0., 0., 0.], [1., 1., 1.]])
+
+                        sim_inst.sys.time = 1.5
+                        self.observable_value[:] = 7.
+                        sim_inst.write_registered_to_h5(step=2)
+                        for group in n_particles:
+                            np.testing.assert_array_equal(stored_steps(h5_file, group), [0, 1, 2])
+                        for stream, count in self.frames_per_stream(h5_file).items():
+                            self.assertEqual(count, 3, msg=stream)
+                    finally:
+                        self.reset_io_state()
+
+    def test_a_refused_truncation_truncates_nothing(self):
+        # A numpy integer passes the type check, so its rows reach the step lookup
+        # and the size check; a bool is an int subclass and is refused explicitly
+        # (True would rewind to step 1 / keep one frame).
+        cases = {
+            'an unknown step': (KeyError, self.times[1], 'LOAD_NEW', dict(rewind_to_step=99)),
+            'an unknown numpy-integer step': (KeyError, self.times[1], 'LOAD_NEW',
+                                              dict(rewind_to_step=np.int64(99))),
+            'a numpy-integer size beyond the file': (ValueError, self.times[1], 'LOAD_NEW',
+                                                     dict(force_resize_to_size=np.int64(4))),
+            'a time mismatch': (RuntimeError, self.times[2], 'LOAD_NEW', dict(rewind_to_step=1)),
+            'both truncation arguments': (ValueError, self.times[1], 'LOAD_NEW',
+                                          dict(rewind_to_step=1, force_resize_to_size=2)),
+            'NEW mode': (ValueError, self.times[1], 'NEW', dict(rewind_to_step=1)),
+            'a non-integer step': (TypeError, self.times[1], 'LOAD_NEW', dict(rewind_to_step=1.0)),
+            'a bool step': (TypeError, self.times[1], 'LOAD_NEW', dict(rewind_to_step=True)),
+            'a bool size': (TypeError, self.times[1], 'LOAD_NEW', dict(force_resize_to_size=True)),
+        }
+        for label, (error, live_time, mode, kwargs) in cases.items():
+            for stream in ('particles', 'observables'):
+                with self.subTest(case=label, stream=stream):
+                    sim_inst.sys.time = live_time
+                    try:
+                        with self.assertRaises(error):
+                            self.inscribe(stream, mode, **kwargs)
+                    finally:
+                        self.reset_io_state()     # a row that failed must not hand on its open file
+        with h5py.File(self.path, "r") as h5_file:
+            for group in self.GROUPS:
+                np.testing.assert_array_equal(stored_steps(h5_file, group.__name__), [0, 1, 2])
+            for stream, count in self.frames_per_stream(h5_file).items():
+                self.assertEqual(count, 3, msg=stream)
+
+    def test_a_repeated_step_points_at_rewind(self):
+        """A step that does not strictly increase is a RuntimeError on both streams, pointing at rewind_to_step."""
+        sim_inst.sys.time = self.times[2]
+        self.inscribe('particles', 'LOAD_NEW')
+        self.inscribe('observables', 'LOAD_NEW')
+        for stream, call in (('particles', lambda: sim_inst.write_part_group_to_h5(step=2)),
+                             ('observables', lambda: sim_inst.write_observable_group_to_h5(step=1))):
+            with self.subTest(stream=stream), self.assertRaisesRegex(RuntimeError, "rewind_to_step"):
+                call()
+        for group in self.GROUPS:
+            np.testing.assert_array_equal(stored_steps(sim_inst.io_dict['h5_file'], group.__name__), [0, 1, 2])
+
+
+class CheckpointWriteTest(SourceFixture):
+    """`write_checkpoint` puts one verified float64 frame beside the open trajectory, or leaves a `.tmp`."""
+
+    thermostat_seed = 7
+
+    def setUp(self):
+        super().setUp()
+        self.build_filaments(bonded=True)
+        sim_inst.io_dict['properties'] = list(self.SOURCE_PROPERTIES) + _FIX_PROPERTY
+        if _FIX_PROPERTY:
+            sorted(sim_inst.sys.part.all(), key=lambda part: part.id)[0].fix = [True, False, False]
+        sim_inst.io_dict['bonds'] = True
+        self.traj = os.path.join(self.tmpdir.name, f"{self.id().rsplit('.', 1)[-1]}_traj.h5")
+        self.ckpt = os.path.join(self.tmpdir.name, f"{self.id().rsplit('.', 1)[-1]}_ckpt.h5")
+        sim_inst.inscribe_part_group_to_h5(group_type=[Filament], h5_data_path=self.traj, mode='NEW')
+        sim_inst.sys.thermostat.set_langevin(kT=1., gamma=1., seed=self.thermostat_seed)
+        sim_inst.write_part_group_to_h5(step=0)
+        sim_inst.sys.integrator.run(5)
+        sim_inst.write_part_group_to_h5(step=5)
+
+    def test_a_checkpoint_holds_one_float64_frame_of_the_restorable_state(self):
+        self.assertEqual(sim_inst.write_checkpoint([Filament], self.ckpt, step=5), 5)
+        self.assertFalse(os.path.exists(self.ckpt + ".tmp"))
+        expected = checkpoint_properties(sim_inst.io_dict['properties'])
+        with h5py.File(self.ckpt, "r") as h5_file:
+            data_grp = h5_file["particles/Filament"]
+            np.testing.assert_array_equal(stored_steps(h5_file, "Filament"), [5])
+            self.assertEqual({name for name in data_grp if name != 'box'},
+                             {element_name(attr) for attr, _dim, _dtype in expected})
+            # v and f are never feature-gated: their standard H5MD names, spelled out, since
+            # every other check here goes through element_name() and cannot see a wrong table
+            self.assertLessEqual({"position", "velocity", "force"}, set(data_grp))
+            for attr, dim, dtype in expected:
+                value = data_grp[f"{element_name(attr)}/value"]
+                self.assertEqual(value.dtype, np.dtype(dtype), msg=attr)
+                self.assertEqual(value.shape[0], 1, msg=attr)
+                self.assertEqual(tuple(value.shape[2:]), () if dim is None else (dim,), msg=attr)
+                if np.issubdtype(value.dtype, np.floating):
+                    self.assertEqual(value.dtype, np.float64, msg=attr)
+            # the trajectory's non-float extras (image_box, fix) keep their dtype
+            for attr, _dim, dtype in sim_inst.io_dict['properties']:
+                if not np.issubdtype(np.dtype(dtype), np.floating):
+                    self.assertEqual(data_grp[f"{element_name(attr)}/value"].dtype, np.dtype(dtype), msg=attr)
+            # feature-gated state is there exactly when this build has the feature
+            for attr, _dim, feature in CHECKPOINT_PROPERTIES:
+                self.assertEqual(element_name(attr) in data_grp,
+                                 feature is None or api_agnostic_feature_check(feature), msg=attr)
+            attrs = h5_file["pressomancy/checkpoint"].attrs
+            self.assertEqual(attrs['time'].dtype, np.float64)
+            self.assertEqual(float(attrs['time']), float(sim_inst.sys.time))
+            self.assertEqual(int(attrs['step']), 5)
+            self.assertEqual(int(attrs['langevin_philox_counter']),
+                             int(sim_inst.sys.thermostat.langevin.philox_counter))
+            self.assertEqual(int(h5_file["connectivity/Filament/bonds"].attrs['n_links']),
+                             sim_inst.io_dict['bond_links']['Filament'])
+        # the throwaway writer left the open trajectory alone
+        sim_inst.sys.integrator.run(5)
+        sim_inst.write_part_group_to_h5(step=10)
+        np.testing.assert_array_equal(stored_steps(sim_inst.io_dict['h5_file'], "Filament"), [0, 5, 10])
+
+    def test_a_refused_checkpoint_leaves_every_file_as_it_was(self):
+        """The trajectory's own path is refused; a failed verification keeps its `.tmp`, the old checkpoint intact."""
+        with self.assertRaisesRegex(ValueError, "trajectory"):
+            sim_inst.write_checkpoint([Filament], self.traj, step=5)
+        sim_inst.write_checkpoint([Filament], self.ckpt, step=5)
+        with open(self.ckpt, "rb") as handle:
+            before = handle.read()
+        sim_inst.sys.integrator.run(5)
+        with patch.object(write_module, "_check_load_new_columns", side_effect=RuntimeError("forced")):
+            with self.assertRaises(RuntimeError):
+                sim_inst.write_checkpoint([Filament], self.ckpt, step=10)
+        self.assertTrue(os.path.exists(self.ckpt + ".tmp"))
+        with open(self.ckpt, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+        sim_inst.write_part_group_to_h5(step=10)
+        np.testing.assert_array_equal(stored_steps(sim_inst.io_dict['h5_file'], "Filament"), [0, 5, 10])
+
+
+class CheckpointRestartTest(SourceFixture):
+    """N steps == N/2 + `write_checkpoint` + rebuild + `restart_from_checkpoint` + `run(N/2, reuse_forces=True)`."""
+
+    n_steps = 40
+    thermostat_seed = 11
+
+    def path(self, name):
+        return os.path.join(self.tmpdir.name, f"{self.id().rsplit('.', 1)[-1]}_{name}.h5")
+
+    def set_thermostat(self):
+        sim_inst.sys.thermostat.set_langevin(kT=1., gamma=1., seed=self.thermostat_seed)
+
+    @staticmethod
+    def state():
+        """The restorable state of every live particle, in ascending id."""
+        parts = sorted(sim_inst.sys.part.all(), key=lambda part: part.id)
+        return {attr: np.array([getattr(part, attr) for part in parts]) for attr in _STATE_PROPERTIES}
+
+    def assert_state_matches(self, reference):
+        state = self.state()
+        for attr in _STATE_PROPERTIES:
+            np.testing.assert_allclose(state[attr], reference[attr], rtol=0, atol=1e-10, err_msg=attr)
+
+    def test_a_restart_continues_the_uninterrupted_run_and_its_trajectory(self):
+        """The restart restores step, time, Philox counter and extras; the trajectory rewinds; the run matches."""
+        half, past = self.n_steps // 2, 10
+        traj, ckpt = self.path("traj"), self.path("ckpt")
+        properties = list(self.SOURCE_PROPERTIES) + _FIX_PROPERTY     # the trajectory's list
+
+        self.build_filaments(bonded=True)
+        sim_inst.io_dict['properties'] = list(properties)
+        if _FIX_PROPERTY:
+            sorted(sim_inst.sys.part.all(), key=lambda part: part.id)[0].fix = [True, False, False]
+        sim_inst.io_dict['bonds'] = True
+        sim_inst.inscribe_part_group_to_h5(group_type=[Filament], h5_data_path=traj, mode='NEW')
+        self.set_thermostat()
+        sim_inst.write_part_group_to_h5(step=0)
+        sim_inst.sys.integrator.run(half)
+        sim_inst.write_part_group_to_h5(step=half)
+        self.assertEqual(sim_inst.write_checkpoint([Filament], ckpt, step=half), half)
+        checkpoint_time = float(sim_inst.sys.time)
+        checkpoint_counter = int(sim_inst.sys.thermostat.langevin.philox_counter)
+        sim_inst.sys.integrator.run(past)
+        sim_inst.write_part_group_to_h5(step=half + past)     # a frame past the checkpoint
+        sim_inst.sys.integrator.run(half - past)
+        reference, reference_time = self.state(), float(sim_inst.sys.time)
+        reference_counter = int(sim_inst.sys.thermostat.langevin.philox_counter)
+        self.reset_io_state()
+
+        self.rebuild()
+        filaments = self.build_filaments(place=False)
+        self.set_thermostat()
+        step = sim_inst.restart_from_checkpoint(filaments, ckpt, src_to_loc=_FIX_PAIRS,
+                                                bonds=True, place_from=['real'])
+        self.assertEqual(step, half)
+        self.assertEqual(float(sim_inst.sys.time), checkpoint_time)
+        self.assertEqual(int(sim_inst.sys.thermostat.langevin.philox_counter), checkpoint_counter)
+        if _FIX_PROPERTY:
+            self.assertEqual(list(sorted(sim_inst.sys.part.all(), key=lambda p: p.id)[0].fix),
+                             [True, False, False])
+
+        # rebuild() re-pinned SOURCE_PROPERTIES only; resuming needs the trajectory's own list
+        sim_inst.io_dict['properties'] = list(properties)
+        sim_inst.io_dict['bonds'] = True
+        kept = sim_inst.inscribe_part_group_to_h5(group_type=[Filament], h5_data_path=traj,
+                                                  mode='LOAD_NEW', rewind_to_step=step)
+        self.assertEqual(kept, 2)       # the frame past the checkpoint is dropped
+        h5_file = sim_inst.io_dict['h5_file']
+        np.testing.assert_array_equal(stored_steps(h5_file, "Filament"), [0, half])
+
+        sim_inst.sys.integrator.run(half, reuse_forces=True)
+        sim_inst.write_part_group_to_h5(step=2 * half)
+        self.assert_state_matches(reference)
+        self.assertEqual(int(sim_inst.sys.thermostat.langevin.philox_counter), reference_counter)
+        self.assertAlmostEqual(float(sim_inst.sys.time), reference_time, places=9)
+        np.testing.assert_array_equal(stored_steps(h5_file, "Filament"), [0, half, 2 * half])
+        dataview = H5DataSelector(h5_file, particle_group="Filament")
+        np.testing.assert_allclose(dataview.timestep[-1].pos,
+                                   [part.pos for part in sorted(sim_inst.sys.part.all(), key=lambda p: p.id)])
+
+    def test_restart_refuses_what_it_cannot_continue(self):
+        """An inactive thermostat, a trajectory, and three tampered checkpoints: refused before anything is placed."""
+        traj, ckpt = self.path("traj"), self.path("ckpt")
+        self.build_filaments(bonded=True)
+        sim_inst.io_dict['bonds'] = True
+        sim_inst.inscribe_part_group_to_h5(group_type=[Filament], h5_data_path=traj, mode='NEW')
+        self.set_thermostat()
+        sim_inst.write_part_group_to_h5(step=0)
+        sim_inst.write_checkpoint([Filament], ckpt, step=0)
+        self.reset_io_state()
+        tampered = {   # label: (edit of a copy of the checkpoint, fragment of the raise)
+            "a missing restorable element": (
+                lambda f: f["particles/Filament"].pop(element_name('v')), "fewer features"),
+            "a stored type the table does not name": (
+                lambda f: f["parameters/pressomancy/part_types"].attrs.pop('real'), "does not name"),
+            "the counter of a thermostat this build lacks": (
+                lambda f: f["pressomancy/checkpoint"].attrs.create('imaginary_philox_counter', 0),
+                "compiled without the imaginary thermostat"),
+        }
+        cases = [   # (label, thermostat set, path, error, fragment of the raise)
+            ("an inactive thermostat", False, ckpt, RuntimeError, "thermostat"),
+            ("a trajectory", True, traj, ValueError, "load_from_src")]
+        cases += [(label, True, self.edited_copy(ckpt, f"tampered_{index}.h5", edit), RuntimeError, fragment)
+                  for index, (label, (edit, fragment)) in enumerate(tampered.items())]
+
+        self.rebuild()
+        filaments = self.build_filaments(place=False)
+        for label, thermostat, path, error, fragment in cases:
+            with self.subTest(case=label):
+                if thermostat:
+                    self.set_thermostat()
+                else:
+                    sim_inst.sys.thermostat.turn_off()
+                with self.assertRaisesRegex(error, fragment):
+                    sim_inst.restart_from_checkpoint(filaments, path, bonds=True, place_from=['real'])
+                self.assertEqual(len(sim_inst.sys.part), 0)
