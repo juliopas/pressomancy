@@ -156,10 +156,6 @@ class ManagedSimulation:
             self.instance.objects = []
             self.instance.no_objects = 0
             self.instance.part_types.clear()
-            self.instance.part_positions = []
-            self.instance.volume_centers = []
-            self.instance.volume_size = None
-            self.instance.partitioned = None
             self.instance = self.aClass(*self.init_args, **self.init_kwargs)
             self.instance.sys = self._espressomd_system
             # Back-reference so Simulation.rebind_sys can keep the cached handle

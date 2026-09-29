@@ -3,28 +3,31 @@ The core of pressomancy: the ``Simulation`` class that wraps an ESPResSo
 ``System`` handle and manages everything built on top of it.
 
 ``Simulation`` is instantiated as a process-wide singleton via the
-``ManagedSimulation`` decorator (see :mod:`pressomancy.helper_functions`).
+``ManagedSimulation`` decorator (see :mod:`pressomancy.infra`).
 It owns particle-type bookkeeping, storing/placing/deleting
 ``Simulation_Object`` instances (see :mod:`pressomancy.object_classes`),
 WCA/Lennard-Jones interactions, box-wall constraints, LB fluid setup,
 external magnetic fields, HDF5 (H5MD-style) I/O for particle groups and
-arbitrary observables, and source-file-driven initialization
-(``INIT_SRC``/``LOAD``/``LOAD_NEW`` modes).
+arbitrary observables, resuming into an existing file (``LOAD``/``LOAD_NEW``)
+and seeding a system from a source file (``load_from_src``).
 '''
 import espressomd
 from espressomd import shapes
-import espressomd.version
-if espressomd.version.major() == 4:
-    from espressomd.virtual_sites import VirtualSitesRelative
 import sys as sysos
 import numpy as np
 import os
+import warnings
 from itertools import combinations_with_replacement
 from pressomancy.object_classes import *
-from pressomancy.helper_functions import *
+from pressomancy.infra import (ManagedSimulation, MissingFeature, TypeDictSafe,
+                               api_agnostic_feature_check)
+from pressomancy.geometry import (add_box_constraints_func, remove_box_constraints_func,
+                                  generate_random_unit_vectors, normalize_vectors,
+                                  partition_cuboid_volume,
+                                  get_cross_lattice_nonintersecting_volumes)
 from pressomancy.magnetodynamics import configure_magnetization, contraction_ratio
-from pressomancy.io.h5_writer import H5Writer
-from pressomancy.io.h5_init import H5Init
+from pressomancy.io.write import H5Writer
+from pressomancy.io.init import H5Init
 import logging
 from collections import Counter
 import inspect
@@ -32,7 +35,7 @@ import inspect
 @ManagedSimulation
 class Simulation():
     """
-    A singleton class that manages a suspension of objects inside the ESPResSo molecular dynamics framework.
+    A singleton class that manages an arrangement of objects inside the ESPResSo molecular dynamics framework.
 
     `Simulation` wraps the ESPResSo `System` handle and owns everything built on top of it: particle-type
     bookkeeping, the lifetime of `Simulation_Object` instances, non-bonded interactions, box-wall
@@ -46,13 +49,10 @@ class Simulation():
     Attributes:
         no_objects (int): The number of objects currently stored in the simulation.
         objects (list): A list of objects stored in the simulation.
-        part_types (PartDictSafe): Maps a type name to its integer espresso type id. Constructed with
-            `default_factory=None`, so reading an unknown name raises `KeyError` rather than silently
-            creating an entry.
+        part_types (TypeDictSafe): Maps a type name (`str`) to its integer espresso type id, as a
+            strict bijection: reading an unknown name raises `KeyError`, and reassigning a name or
+            reusing a number raises `RuntimeError`.
         seed (int): A random seed for reproducibility, generated at initialization.
-        part_positions (list): Per-partition particle positions produced by `set_objects`.
-        volume_size (float): The size of the volume assigned to each object.
-        volume_centers (list): A list of centers of the partitioned volumes.
         io_dict (dict): HDF5 output state. Notable keys:
             `properties` -- the (name, dim, dtype) tuples written for every particle each frame;
             `bonds` -- set to True *before* inscribing to write bond topology into
@@ -64,18 +64,17 @@ class Simulation():
 
     Methods:
         Setup and system configuration
-            set_sys(timestep, min_global_cut, have_quaternion): configure cell system, time step and
+            set_sys(timestep, min_global_cut): configure cell system, time step and
                 the virtual-site scheme. NOT called automatically -- callers must invoke it.
             set_author(name, email): author metadata for new HDF5 files.
-            set_init_src(path, ...): declare an HDF5 source file for `INIT_SRC` initialization.
             rebind_sys(new_sys): rebind to a new espresso handle after a checkpoint load.
             modify_system_attribute(requester, attribute_name, action): permissioned mutation hook
                 used by objects.
 
         Object management
             store_objects(iterable_list, report): register objects and their particle types.
-            set_objects(objects, mode): partition the box and place objects without overlap.
-            place_objects(objects, positions, orientations): place at given coordinates, no overlap check.
+            set_objects(objects): partition the box and place objects without overlap.
+            place_objects(objects, positions, orientations): place at given coordinates, must have the positions for all the particles each object needs to place, no overlap check. **Prefer to use set_objects(objects)**.
             sanity_check(object): verify the build has the object's required features.
             mark_for_collision_detection(object_type, part_type): mark objects for covalent bonding.
 
@@ -96,19 +95,51 @@ class Simulation():
             init_lb(kT, agrid, dens, visc, gamma, timestep), create_flow_channel(slip_vel).
 
         HDF5 input/output
-            inscribe_part_group_to_h5(group_type, h5_data_path, mode, force_resize_to_size)
-            inscribe_observable_group_to_h5(observable_defs, h5_data_path, mode, force_resize_to_size)
-            write_part_group_to_h5(step, unique), write_observable_group_to_h5(time_step, unique),
-            write_registered_to_h5(time_step, unique): append one frame.
-            mk_src_file(original_data_file_path, dest_h5_file_path, prop_dim, time_step): copy a file,
-                shrink it to one frame, optionally append new properties.
-            set_prop_from_src(registered_objs, time_step): copy properties from a source file.
+            inscribe_part_group_to_h5(group_type, h5_data_path, mode, force_resize_to_size, rewind_to_step) / 
+            inscribe_observable_group_to_h5(observable_defs, h5_data_path, mode, force_resize_to_size,
+                rewind_to_step): register the streams; `io_dict['properties']` (id, type, pos)
+                is validated, and on LOAD/LOAD_NEW compared with the file (mismatch raises). The
+                two truncation forms (frame count / stored step, exclusive) run before the load checks.
+            write_part_group_to_h5(step) / write_observable_group_to_h5(step) / 
+                write_registered_to_h5(step): append one frame; `step` must strictly increase.
+            write_checkpoint(group_type, path, step): a verified one-frame restart file (full
+                float64 state, bonds, time and thermostat counters), written via `path + '.tmp'`
+                and `os.replace` (corruption safe); `restart_from_checkpoint` reads it back and
+                `inscribe_*(..., rewind_to_step=step)` re-aligns the trajectory.
+            restart_from_checkpoint(objects, path, src_to_loc, bonds, place_from, r_cut_override):
+                mirrors `load_from_src` over every stored type with the fixed state list
+                (`pressomancy.io.CHECKPOINT_PROPERTIES`), then `sys.time` and the thermostat Philox
+                counters (set the thermostat first); returns the stored step. **First run afterwards**:
+                `integrator.run(n, reuse_forces=True)`.
+            load_from_src(objects, path, src_to_loc, bonds, place_from, r_cut_override,
+                frame, step, time): the one call that seeds a system from a file (declare -> place
+                -> copy properties -> restore bonds); returns the bond links added. The individual
+                steps live on `pressomancy.io.init.H5Init` (`self._h5_init`).
+            Placement is optional: give `place_from` (a list of SOURCE types) when the file
+                should place your objects, which requires one stored particle of those types per
+                monomer; leave it out when you built the tree yourself (compound objects, running
+                systems) and only its state comes from the file.
+            `src_to_loc` is one dict, `{type pair(s): [(src_prop, loc_prop), ...]}`, every tuple
+                ordered (source, local): a key is one `(src_type, loc_type)` pair or a tuple of
+                them, its value the property pairs copied for those type pairs (`[]` = pair the
+                particles, copy nothing). It is also the type pairing `set_bonds_from_src` uses,
+                so it must be non-empty when `bonds` is true. Grammar and recipes:
+                `pressomancy.io.init`.
+            get_prop_from_src(objects, path, src_type, prop, frame, step, time): read one stored
+                property back per object (one `(N_i, dim)` array each, stored order) without
+                touching the system -- for everything that is not a 1:1 column copy and/or compatible
+                with `load_from_src`.
+            Frame selectors: `frame` (INDEX, -1 = last), `step` (stored step VALUE), `time` (stored
+                time VALUE, nearest within relative 1e-6); all None = last frame, multiple given
+                must resole to same frame. Source type names resolve through the file's own
+                `parameters/pressomancy/part_types`, local names through `part_types`. A SOURCE type
+                may also be given as an `int`, the numeric type stored in the file, which needs no
+                table (old files); local types stay names. The local object tree must be built in the
+                same order as the source's (who_am_i contract; see pressomancy.io.init).
 
     Notes:
-        - **ESPResSo 5.x is the supported version.** Version-4 branches survive in a few places but
-          are legacy and untested: `magnetodynamics.py` and `object_classes/multicore_particle.py`
-          both need `espressomd.propagation`, which does not exist in v4, so the magnetics cannot
-          run there at all. Required ESPResSo build features are listed in the README.
+        - **ESPResSo 5.x is the only supported version.** Required ESPResSo build features are
+          listed in the README.
         - The ESPResSo system handle is created and owned by the decorator; `self.sys` is bound at
           instantiation.
         - Objects must be built through the `Simulation_Object` metaclass to be safely usable here.
@@ -121,13 +152,7 @@ class Simulation():
         # Object bookkeeping
         self.no_objects = 0
         self.objects = []
-        self.part_types = PartDictSafe({}, default_factory=None)
-
-        # Partitioning stuff
-        self.partitioned=None
-        self.part_positions=[]
-        self.volume_size=None
-        self.volume_centers=[]
+        self.part_types = TypeDictSafe()
 
         # espresso system is accessed by .sys, e.g. self.sys.part.all()
         # I/O. The writer owns io_dict and the author metadata; Simulation exposes
@@ -141,44 +166,48 @@ class Simulation():
         # self.sys=espressomd.System(box_l=box_dim) is added and managed by the singleton decrator!
 
     # ------------------------------------------------------------------
-    # Seeding from an HDF5 source file. Implementation in io/h5_init.py.
+    # Seeding from an HDF5 source file. Implementation in io/init.py.
     # ------------------------------------------------------------------
-    @property
-    def src_params_set(self):
-        return self._h5_init.src_params_set
+    def load_from_src(self, objects, path, src_to_loc, bonds=False, place_from=None,
+                      r_cut_override=0.0, frame=None, step=None, time=None):
+        """Seed `objects` from a file in one call; returns the bond links added.
+        See H5Init.load_from_src.
 
-    @property
-    def src_path_h5(self):
-        return self._h5_init.src_path_h5
+        Give `place_from` (a list of SOURCE types: names, or the ints stored in the file) when the
+        file should place your objects, which requires one stored particle of those types per
+        monomer; leave it out when you built the tree yourself (compound objects, running systems).
+        """
+        return self._h5_init.load_from_src(objects, path, src_to_loc, bonds=bonds,
+                                           place_from=place_from, r_cut_override=r_cut_override,
+                                           frame=frame, step=step, time=time)
 
-    @property
-    def pos_ori_src_type(self):
-        return self._h5_init.pos_ori_src_type
+    def restart_from_checkpoint(self, objects, path, src_to_loc=None, bonds=False, place_from=None,
+                                r_cut_override=0.0):
+        """Restore `objects`, `sys.time` and the thermostat counters from a `write_checkpoint` file;
+        returns its step.
+        See H5Init.restart_from_checkpoint.
 
-    @property
-    def type_to_type_map(self):
-        return self._h5_init.type_to_type_map
+        Every stored type is paired with the local type of the same name and gets the fixed
+        state list (`pressomancy.io.CHECKPOINT_PROPERTIES`, in that order); `src_to_loc` adds
+        extras (e.g. `fix`). Set the thermostat with its seed BEFORE calling, and make the first
+        call afterwards `integrator.run(n, reuse_forces=True)` for an exact continuation.
+        """
+        return self._h5_init.restart_from_checkpoint(objects, path, src_to_loc=src_to_loc, bonds=bonds,
+                                                    place_from=place_from, r_cut_override=r_cut_override)
 
-    @property
-    def prop_to_prop_map(self):
-        return self._h5_init.prop_to_prop_map
+    def get_prop_from_src(self, objects, path, src_type, prop, frame=None, step=None, time=None):
+        """One stored property of one source type, per object, changing nothing.
+        See H5Init.get_prop_from_src.
 
-    def set_init_src(self, path, pos_ori_src_type=['real',], type_to_type_map=[], prop_to_prop_map=[], declare_types=[]):
-        """Declare an HDF5 source file to seed particle state from. See H5Init.set_init_src."""
-        return self._h5_init.set_init_src(path, pos_ori_src_type=pos_ori_src_type,
-                                          type_to_type_map=type_to_type_map,
-                                          prop_to_prop_map=prop_to_prop_map,
-                                          declare_types=declare_types)
+        Declares `path` as the source (as `load_from_src` does), then reads
+        `particles/<Group>/<prop>/value` for the `src_type` particles owned by each
+        object, in stored order: one `(N_i, dim)` array per object.
+        """
+        self._h5_init.set_init_src(path)
+        return self._h5_init.get_prop_from_src(objects, src_type, prop,
+                                               frame=frame, step=step, time=time)
 
-    def set_prop_from_src(self, registered_objs=None, time_step: int = -1):
-        """Copy particle properties from the declared source file. See H5Init.set_prop_from_src."""
-        return self._h5_init.set_prop_from_src(registered_objs=registered_objs, time_step=time_step)
-
-    def _get_pos_ori_from_src(self, registered_objs, time_step: int = -1):
-        """Positions and orientations from the declared source file."""
-        return self._h5_init.get_pos_ori_from_src(registered_objs, time_step=time_step)
-
-    def set_sys(self, timestep=0.01, min_global_cut=3.0, have_quaternion=False):
+    def set_sys(self, timestep=0.01, min_global_cut=3.0):
         '''
         Set espresso cellsystem params, and import virtual particle scheme.
 
@@ -189,9 +218,6 @@ class Simulation():
             attribute is `time_step`, and passing `time_step=` here is silently ignored.
         :param min_global_cut: float (=3.0) | minimum global interaction range. Together with the
             skin (fixed at 0.5) this is not guaranteed optimal and should be tuned per simulation.
-        :param have_quaternion: bool (=False) | espresso 4 only. Whether relative virtual sites
-            carry their own quaternion, so a virtual site can be oriented independently of its
-            anchor. Ignored on espresso 5, where the scheme is always available.
         :return: None
         '''
         np.random.seed(seed=self.seed)
@@ -200,8 +226,6 @@ class Simulation():
         self.sys.time_step = timestep
         self.sys.cell_system.skin = 0.5
         self.sys.min_global_cut = min_global_cut
-        if espressomd.version.major()==4:
-            self.sys.virtual_sites = VirtualSitesRelative(have_quaternion=have_quaternion)
         if not (api_agnostic_feature_check('VIRTUAL_SITES_RELATIVE')):
             raise MissingFeature('VirtualSitesRelative must be set. If not, anything involving virtual particles will not work correctly, but it might be very hard to figure out why. I have wasted days debugging issues only to remember i commented out this line!!!')
         logging.info(f'System params have been autoset. The values of min_global_cut and skin are not guaranteed to be optimal for your simulation and should be tuned by hand!!!')
@@ -214,19 +238,20 @@ class Simulation():
         :param attribute_name: str | The name of the attribute to modify.
         :param action: callable | A function that takes the current attribute value as input and modifies it.
         :return: None
+        :raises PermissionError: if `attribute_name` is not in `object_permissions` (or not an attribute).
         """
-        if hasattr(self, attribute_name) and attribute_name in self.object_permissions:
-            action(getattr(self,attribute_name))
+        if not (attribute_name in self.object_permissions and hasattr(self, attribute_name)):
+            raise PermissionError(
+                f"{requester!r} may not modify Simulation.{attribute_name!r}; "
+                f"modifiable attributes are {self.object_permissions}.")
+        action(getattr(self, attribute_name))
 
-        else:
-            logging.info("Requester does not have permission to modify attributes.")
-
-    def sanity_check(self,object):
+    def sanity_check(self, object):
         '''
         Method that checks if the object has the required features to be stored in the simulation. If the object has the required features it is stored in the self.objects list.
         '''
 
-        missing_features = set(object.required_features) - set(espressomd.features())
+        missing_features = [feature for feature in object.required_features if not api_agnostic_feature_check(feature)]
         if missing_features:
             raise MissingFeature(f"{object.__class__.__name__} requires features: {object.required_features}.\nMissing required features: {', '.join(missing_features)}.")
 
@@ -236,25 +261,39 @@ class Simulation():
         and the list of objects passed to the method is commensurate with the system level attribute n_tot_parts.
         Populates the self.part_types attribute with types found in the objects that are stored.
         All objects that are stored should have the same types stored, but this is not checked explicitly
+
+        :raises ValueError: if an object is already stored, or only part of an object's associated objects are
+        :raises MissingFeature: if the build lacks a feature an object requires (see sanity_check)
+
+        A refused call stores nothing: objects, no_objects and part_types are rolled back, including the
+        associated objects stored along the way.
         '''
+        objects_before, no_objects_before, part_types_before = list(self.objects), self.no_objects, dict(self.part_types)
         temp_dict={}
-        for element in iterable_list:
-            if element.params['associated_objects'] != None:
-                check_any=any(associated in self.objects for associated in element.params['associated_objects'])
-                if check_any:
-                    check_all=all(associated in self.objects for associated in element.params['associated_objects'])
-                    if not check_all:
-                        raise ValueError(f"Some associated objects {element.params['associated_objects']} but not all associated objects are stored in the simulation. This is a sign that smth major is fucked...Suffer in silence.")
-                else:
-                    self.store_objects(element.params['associated_objects'],report=False)
-            if not (element not in self.objects):
-                raise ValueError("Lists have common elements!")
-            self.sanity_check(element)
-            element.modify_system_attribute = self.modify_system_attribute
-            self.objects.append(element)
-            for key, val in element.part_types.items():
-                temp_dict[key]=val
-            self.no_objects += 1
+        try:
+            for element in iterable_list:
+                if element.params['associated_objects'] != None:
+                    check_any=any(associated in self.objects for associated in element.params['associated_objects'])
+                    if check_any:
+                        check_all=all(associated in self.objects for associated in element.params['associated_objects'])
+                        if not check_all:
+                            raise ValueError(f"Some associated objects {element.params['associated_objects']} but not all associated objects are stored in the simulation. This is a sign that smth major is fucked...Suffer in silence.")
+                    else:
+                        self.store_objects(element.params['associated_objects'],report=False)
+                if not (element not in self.objects):
+                    raise ValueError("Lists have common elements!")
+                self.sanity_check(element)
+                element.modify_system_attribute = self.modify_system_attribute
+                self.objects.append(element)
+                for key, val in element.part_types.items():
+                    temp_dict[key]=val
+                self.no_objects += 1
+        except Exception:
+            self.objects[:] = objects_before
+            self.no_objects = no_objects_before
+            self.part_types.clear()
+            self.part_types.update(part_types_before)
+            raise
         self.part_types.update(temp_dict)
         if report:
             names = [element.__class__.__name__ for element in self.objects]
@@ -262,82 +301,123 @@ class Simulation():
             formatted = ", ".join(f"{count} {name}" for name, count in counts.items())
             logging.info(f"{formatted} stored")
 
-    def set_objects(self, objects, mode='NEW'):
+    def set_objects(self, objects):
         """Set objects' positions and orientations in a box. Defaults to the Simulation box.
-        This method places objects in the simulation box using a partitioning scheme. For the first placement, it generates exactly the required number of positions. For subsequent placements, it searches for non-overlapping positions with existing objects. This guarantees non-overlapping of the objects.
+        This method places objects in the simulation box using a partitioning scheme: each object
+        gets a spherical volume of diameter ``params['size']`` (its meaning: `ObjectConfigParams`),
+        and the volumes are chosen so that they intersect neither each other nor any obstacle.
+        
+        The obstacles are derived at each call from every stored object that owns particles,
+        however it was placed (`set_objects`, `place_objects`, `load_from_src`,
+        `restart_from_checkpoint`): one sphere of its ``size`` at its particles' mean.
+        Particles not owned by a stored object are ignored.
+        Objects with ``size=None`` (`Elastomer`) lay themselves out: they skip the lattice, each
+        one's ``build_function`` is called directly and its result placed, and while one of them
+        owns particles nothing else can be placed. They are never checked against obstacles
+        (other stored objects' placement spheres), in either direction: this method does not test
+        their own placement against existing obstacles, nor can a later call place anything next
+        to one that already owns particles (it raises instead, see below). The only guard against
+        overlap is `Elastomer`'s own empty-``box_E`` check in `set_object`, and it sees particle
+        centres only, not obstacle spheres.
+        To place objects at the coordinates stored in an HDF5 file use `load_from_src` and 
+        specify `place_from`.
         Parameters
         ----------
         objects : list
-            A list of simulation objects to place. All objects must be instances of the same type.
-        mode : {'NEW', 'INIT_SRC'}, optional
-            'NEW' (default) partitions `self.sys.box_l` and generates fresh positions and
-            orientations. 'INIT_SRC' instead reads them from the HDF5 source declared by
-            `set_init_src`, via `_get_pos_ori_from_src`.
+            A list of simulation objects to place. All objects must be instances of the same type
+            and share ``params['size']`` and the ``build_function`` fields ``num_monomers``,
+            ``spacing`` and ``monomer_size``.
 
         Raises
         ------
-        AssertionError
-            If not all objects are of the same type.
-        NotImplementedError
-            If trying to place objects when more than one previous partition exists.
+        ValueError
+            If not all objects are of the same type, or if they differ in ``params['size']`` or in
+            ``build_function.num_monomers``/``spacing``/``monomer_size`` (the partition uses
+            objects[0]'s size and build function for all), or if some of them already own
+            particles (`set_objects` only places new objects), or if a stored object with
+            ``size=None`` owns particles.
+
+        Warns
+        -----
+        UserWarning
+            If a just-placed object's particle centres reach beyond ``size / 2`` from their mean
+            (not checked for ``size=None`` or for associated objects).
+
         Notes
         -----
-        The current implementation supports placing objects either in an empty system or in a system with exactly one previous partition. The method uses partition_cuboid_volume to generate positions and orientations, and for subsequent placements, ensures no overlaps with existing objects through get_cross_lattice_nonintersecting_volumes. The method automatically adjusts the search space (by increasing the factor) if it cannot find enough non-overlapping positions in subsequent placements.
+        The method uses partition_cuboid_volume to generate positions and orientations, and
+        get_cross_lattice_nonintersecting_volumes to discard sites that intersect other objects.
+        If too few sites are free, it retries adjusting the search space (increasing the factor).
+        The check is volume-level: the spheres of diameter ``size`` must not intersect;
+        the particles inside them are not compared.
         """
 
         # Ensure all objects are of the same type.
         if not (all(isinstance(item, type(objects[0])) for item in objects)):
             raise ValueError("Not all items have the same type!")
-        if mode=="INIT_SRC":
-            positions, orientations=self._get_pos_ori_from_src(objects)
-        else:
-            # centeres, polymer_positions = partition_cuboid_volume_oriented_rectangles(big_box_dim=self.sys.box_l, num_spheres=len(filaments), small_box_dim=np.array([filaments[0].sigma, filaments[0].sigma, filaments[0].size]), num_monomers=filaments[0].n_parts)
-            if len(self.part_positions)== 0:
-                # First placement: generate exactly len(objects) positions.
-                centeres, positions, orientations = partition_cuboid_volume(
-                    box_lengths=self.sys.box_l,
-                    num_spheres=len(objects),
-                    sphere_diameter=objects[0].params['size'],
-                    routine_per_volume=objects[0].build_function
-                )
-                self.volume_centers.append(centeres)
-                self.part_positions.append(positions)
-                self.volume_size = objects[0].params['size']
-            elif len(self.part_positions) == 1:
-                # Subsequent placements: search for positions without overlaps.
-                factor = 1
-                while True:
-                    centeres, positions, orientations = partition_cuboid_volume(
-                        box_lengths=self.sys.box_l,
-                        num_spheres=len(objects) * factor,
-                        sphere_diameter=objects[0].params['size'],
-                        routine_per_volume=objects[0].build_function
+        # Placement uses objects[0]'s size and build_function for every item.
+        layouts = {(obj.params['size'], obj.build_function.num_monomers, obj.build_function.spacing, obj.build_function.monomer_size) for obj in objects}
+        if len(layouts) > 1:
+            raise ValueError("Items differ in (size, num_monomers, spacing, monomer_size): "
+                             f"{sorted(layouts, key=str)}; place them in separate set_objects calls.")
+        if any(obj.get_owned_part()[0] for obj in objects):
+            raise ValueError("Some items already own particles; set_objects only places new objects.")
+        size = objects[0].params['size']
+        # This call's objects own nothing yet; sub-objects are counted as well as their parent
+        # (redundant but safe). p.pos is unfolded, so the mean stays contiguous across the box edge.
+        placed = {}
+        for obj in self.objects:
+            pos = [p.pos for p in obj.get_owned_part()[0]]
+            if pos:
+                if obj.params['size'] is None:
+                    raise ValueError(f"{type(obj).__name__} has no placement size (it lays itself out); "
+                                     "set_objects cannot place anything next to it.")
+                placed.setdefault(obj.params['size'], []).append(np.mean(pos, axis=0))
+        if size is None:
+            # Use their own partitioning function directly in build_function.
+            # May not check against overlaps. E.g. Elastomer is intended to only have on instance set
+            for obj in objects:
+                orientations, positions = obj.build_function(
+                    center=None, num_monomers=obj.build_function.num_monomers, sphere_radius=None,
+                    spacing=obj.build_function.spacing, box_dim=self.sys.box_l)
+                self.place_objects([obj], [positions], [orientations])
+            return
+        factor = 1
+        while True:
+            centers, positions, orientations = partition_cuboid_volume(
+                box_dim=self.sys.box_l,
+                num_spheres=len(objects) * factor,
+                sphere_diameter=size,
+                routine_per_volume=objects[0].build_function
+            )
+            free = np.ones(len(centers), dtype=bool)
+            for placed_size, placed_centers in placed.items():
+                res = get_cross_lattice_nonintersecting_volumes(
+                    current_lattice_centers=centers,
+                    current_lattice_diam=size,
+                    other_lattice_centers=np.asarray(placed_centers),
+                    other_lattice_diam=placed_size,
+                    box_dim=self.sys.box_l
                     )
-                    res=get_cross_lattice_nonintersecting_volumes(
-                        current_lattice_centers=centeres,
-                        current_lattice_grouped_part_pos=positions,
-                        current_lattice_diam=objects[0].params['size'],
-                        other_lattice_centers=self.volume_centers[0],
-                        other_lattice_grouped_part_pos=self.part_positions[0],
-                        other_lattice_diam=self.volume_size,
-                        box_lengths=self.sys.box_l
-                        )
-                    mask=[key for key,val in res.items() if all(val)]
-                    positions=positions[mask]
-                    orientations=orientations[mask]
-                    if len(positions) >= len(objects):
-                        break
-                    else :
-                        factor += 1
-                        logging.info('Failed to find enough space; (found, needed): (%d, %d). Will retry by requesting %d times the number of parts', len(positions), len(objects),factor)
-            else:
-                raise NotImplementedError('The repartitioning scheme can currently handle only the case where one previos partition exists. More than than is still not supported')
-
-        self.place_objects(objects, positions, orientations)
+                free &= [all(res[i]) for i in range(len(centers))]
+            if free.sum() >= len(objects):
+                break
+            factor += 1
+            logging.info('Failed to find enough space; (found, needed): (%d, %d). Will retry by requesting %d times the number of parts', free.sum(), len(objects),factor)
+        keep = np.flatnonzero(free)[:len(objects)]
+        self.place_objects(objects, positions[keep], orientations[keep])
+        # Warn for objects with particles outise their size
+        reach = max(np.linalg.norm(pos - pos.mean(axis=0), axis=1).max()
+                    for pos in (np.array([p.pos for p in obj.get_owned_part()[0]]) for obj in objects))
+        if reach > size / 2:
+            warnings.warn(f"{type(objects[0]).__name__} particle centres reach {reach:.3g} from the "
+                          f"object's centre, beyond size/2 = {size / 2:.3g}: placed objects may overlap. "
+                          "Set `size` to bound the build (see `size` in ObjectConfigParams).",
+                          stacklevel=2)
 
     def place_objects(self, objects, positions, orientations=None):
-        """Set objects' positions and orientations in a box.
-        This method places objects at given coordinates within the simulation box and sets their orientations.
+        """Place objects' positions and orientations in a box.
+
         If orientations are not provided, random unit vectors are generated.
         This method does not guarantee non-overlapping of objects, in any way.
 
@@ -352,14 +432,20 @@ class Simulation():
 
         Raises
         ------
-        AssertionError
-            If the number of objects, positions, and orientations do not match.
+        ValueError
+            If the number of objects, positions, and orientations do not match (checked before
+            anything is placed).
         """
         objects= np.atleast_1d(objects)
+        if any(obj.get_owned_part()[0] for obj in objects):
+            raise ValueError("Some items already own particles; you can only places new objects.")
         if orientations is None:
             orientations = generate_random_unit_vectors(len(positions))
         else:
             orientations = normalize_vectors(orientations)
+        if not len(objects) == len(positions) == len(orientations):
+            raise ValueError(f"place_objects got {len(objects)} objects, {len(positions)} positions "
+                             f"and {len(orientations)} orientations")
         for obj, pos, ori in zip(objects, positions, orientations):
             obj.set_object(pos, ori)
         names = [element.__class__.__name__ for element in objects]
@@ -371,37 +457,27 @@ class Simulation():
         if not (any(isinstance(ele, object_type) for ele in self.objects)):
             raise ValueError("method assumes simulation holds correct type object")
 
-        self.part_types['marked'] = part_type
         objects_iter = [ele for ele in self.objects if isinstance(ele, object_type)]
         if not (all((hasattr(ob, 'mark_covalent_bonds') and callable(getattr(ob, 'mark_covalent_bonds')))
                    for ob in objects_iter)):
             raise TypeError("method requires that stored objects have mark_covalent_bonds() method")
+        self.part_types['marked'] = part_type
         for obj_el in objects_iter:
             obj_el.mark_covalent_bonds(part_type=part_type)
 
-    def init_magnetic_inter(self, actor_handle):
+    def init_magnetic_inter(self, solver_handle):
         '''
         Attach a dipolar solver actor.
-
-        ESPResSo 5 is the supported version. The v4 branch below is legacy and
-        untested -- see the Notes on this class.
         '''
-        if espressomd.version.major()==4:
-            self.sys.actors.clear()
-            self.sys.actors.add(actor_handle)
-        elif espressomd.version.major()==5:
-            self.sys.magnetostatics.clear()
-            self.sys.magnetostatics.solver = actor_handle
-        else:
-            raise NotImplementedError(
-                f'ESPResSo 5 is the supported version; found major version '
-                f'{espressomd.version.major()}. Version 4 has a legacy, untested code path.')
+        self.sys.magnetostatics.clear()
+        self.sys.magnetostatics.solver = solver_handle
 
-        logging.info(f'{actor_handle} magnetic interactions actor initiated')
+        logging.info(f'{solver_handle} magnetic interactions actor initiated')
 
     def set_steric(self, key=('nonmagn',), wca_eps=1., sigma=1.):
         '''
         Set WCA interactions between particles of types given in the key parameter.
+
         :param key: tuple of keys from self.part_types | Default only nonmagn WCA
         :param wca_epsilon: float | strength of the steric repulsion.
 
@@ -427,7 +503,7 @@ class Simulation():
         :param wca_eps: list of float | Strength of the WCA repulsion (epsilon) for each pair. Defaults to [1.0].
         :param sigma: list of float | Interaction range (sigma) for each pair. Defaults to [1.0].
         :return: None
-        :raises AssertionError: If the lengths of `pairs`, `wca_eps`, and `sigma` do not match.
+        :raises ValueError: If the lengths of `pairs`, `wca_eps`, and `sigma` do not match.
         """
         if not (len(pairs) == len(wca_eps) and len(pairs) == len(
             sigma)):
@@ -467,7 +543,7 @@ class Simulation():
         :param lj_sigma: list of float | Interaction range (sigma) for each pair. Defaults to [1.0].
         :return: None
 
-        :raises AssertionError: If the lengths of `pairs`, `lj_eps`, and `lj_sigma` are not equal.
+        :raises ValueError: If the lengths of `pairs`, `lj_eps`, and `lj_sigma` are not equal.
         """
 
         if not (len(pairs) == len(lj_eps) and len(pairs) == len(
@@ -491,10 +567,10 @@ class Simulation():
         """
         Adds flat wall constraints to the simulation box along the specified sides.
 
-        Thin wrapper over :func:`pressomancy.helper_functions.add_box_constraints_func`, which
+        Thin wrapper over :func:`pressomancy.geometry.add_box_constraints_func`, which
         carries the full parameter documentation -- including the `sides` grammar ('all', 'sides',
         individual faces, and 'no-<side>' exclusions), the per-face position overrides, and how
-        `inter` sets up the wall interaction. Read it there rather than here, so the two cannot drift.
+        `inter` sets up the wall interaction.
 
         By default:
             bottom - z=0; top - z=self.sys.box_l[2];
@@ -503,7 +579,7 @@ class Simulation():
 
         :param wall_type: int (=0) | particle type used for the walls. Must not collide with a type
             already present in the system, and must be passed again to `remove_box_constraints`.
-        :param sides: list of str (=['all']) | which faces to build.
+        :param sides: list of str (=['all']) | which faces to build. ('bottom', 'top', 'sides', 'left', 'right', 'back', 'front', 'no-*')
         :param inter: str or list of str (=None) | interaction to enable between wall and particles.
             Currently only 'wca'.
         :param types_: list of int (=None) | particle types that interact with the walls. Defaults to
@@ -525,7 +601,7 @@ class Simulation():
             whose particle type is `wall_type`.
             If part_types is not None, remove only interactions with those particle types.
 
-            Calls helper_functions.remove_box_constraints_func.
+            Calls geometry.remove_box_constraints_func.
 
         :param wall_constraints: list of espressomd.constraints.ShapeBasedConstraint | walls to remove.
             If None, walls are discovered from the system by `wall_type`.
@@ -558,31 +634,16 @@ class Simulation():
         if len(self.sys.part):
             self.sys.part.all().v = (0, 0, 0)
 
-        if espressomd.version.major() == 4:
-            param_dict={'kT':kT, 'seed':self.seed, 'agrid':agrid, 'dens':dens, 'visc':visc, 'tau':timestep}
-        elif espressomd.version.major() == 5:
-            param_dict={'kT':kT, 'seed':self.seed, 'agrid':agrid, 'density':dens, 'kinematic_viscosity':visc, 'tau':timestep}
+        param_dict={'kT':kT, 'seed':self.seed, 'agrid':agrid, 'density':dens, 'kinematic_viscosity':visc, 'tau':timestep}
 
         if api_agnostic_feature_check('CUDA'):
             param_dict['gpu']=True
             logging.info('GPU LB method is beeing initiated')
-            if espressomd.version.major() == 4:
-                lbf = espressomd.lb.LBFluidWalberlaGPU(**param_dict)
-            elif espressomd.version.major() == 5:
-                lbf = espressomd.lb.LBFluid(**param_dict)
         else:
             logging.info('CPU LB method is beeing initiated')
-            if espressomd.version.major() == 4:
-                lbf = espressomd.lb.LBFluidWalberla(**param_dict)
-            elif espressomd.version.major() == 5:
-                lbf = espressomd.lb.LBFluid(**param_dict)
+        lbf = espressomd.lb.LBFluid(**param_dict)
 
-        if espressomd.version.major() == 4:
-            if len(self.sys.actors.active_actors) == 2:
-                self.sys.actors.remove(self.sys.actors.active_actors[-1])
-            self.sys.actors.add(lbf)
-        else:
-            self.sys.lb = lbf
+        self.sys.lb = lbf
 
         gamma_MD = gamma
         logging.info(f'gamma_MD: {gamma_MD}')
@@ -611,8 +672,6 @@ class Simulation():
         True when no thermostat mode is active.
         """
         thermostat = self.sys.thermostat
-        if espressomd.version.major() == 4:
-            return thermostat.call_method("is_off")
         if thermostat.kT is None:
             return True
         return not any(getattr(thermostat, name).is_active
@@ -621,13 +680,14 @@ class Simulation():
     def avoid_explosion(self, F_TOL, MAX_STEPS=5, F_incr=100, I_incr=100):
         """
         Iteratively caps forces to prevent simulation instabilities.
+        
         :param F_TOL: float | Force change tolerance between iterations to determine convergence.
         :param MAX_STEPS: int | Maximum number of steps for force iteration. Default is 5.
-        :param F_incr: int | Amount to increase force cap by each iteration. Default is 100.
-        :param I_incr: int | Amount to increase integration steps by each iteration. Default is 100.
+        :param F_incr: int | Force cap of the first iteration, doubled every iteration. Default is 100.
+        :param I_incr: int | Integration steps of the first iteration, doubled every iteration. Default is 100.
         :return: None
 
-        The method gradually increases both the force cap and integration timestep while monitoring the relative force change between iterations. If the relative change falls below F_TOL or MAX_STEPS is reached, the iteration stops.
+        The method raises the timestep linearly to its original value over MAX_STEPS iterations, doubling the force cap and the number of integration steps each iteration, while monitoring the relative change of the maximum force between iterations. It stops when that change falls below F_TOL, when no force is left to relax (max |f| is 0), or after MAX_STEPS iterations; the force cap and the timestep are then restored.
         """
         timestep_og=self.sys.time_step
         timestep_icr=timestep_og/MAX_STEPS
@@ -638,6 +698,9 @@ class Simulation():
             self.sys.time_step=timestep_icr*STEP
             old_force = np.max(np.linalg.norm(
                 self.sys.part.all().f, axis=1))
+            if old_force == 0.:
+                logging.info('EXPLOSION AVOIDED: no force left to relax.')
+                break
             self.sys.force_cap = F_incr
             self.sys.integrator.run(I_incr)
             force = np.max(np.linalg.norm(self.sys.part.all().f, axis=1))
@@ -651,7 +714,7 @@ class Simulation():
 
         self.sys.force_cap = 0
         self.sys.time_step=timestep_og
-        logging.info('explosions avoided sucessfully!')
+        logging.info('EXPLOSION AVOIDED sucessfully!')
 
     def set_magnetization_model(self, part_list, model, dipm_sat, mag_susc_0):
         '''
@@ -722,12 +785,12 @@ class Simulation():
         return np.asarray(fields).sum(axis=0)
 
     # ------------------------------------------------------------------
-    # HDF5 output. The implementation lives in pressomancy/io/h5_writer.py;
+    # HDF5 output. The implementation lives in pressomancy/io/write.py;
     # these are thin delegators, the same pattern used for box constraints.
     # ------------------------------------------------------------------
     @property
     def io_dict(self):
-        """HDF5 output state. Owned by the H5Writer; see pressomancy.io.h5_writer."""
+        """HDF5 output state. Owned by the H5Writer; see pressomancy.io.write."""
         return self._h5_writer.io_dict
 
     @property
@@ -746,34 +809,36 @@ class Simulation():
         """Flat preorder list of every object reachable via ``.associated_objects``."""
         return self._h5_writer._collect_instances_recursively(roots)
 
-    def inscribe_part_group_to_h5(self, group_type=None, h5_data_path=None, mode='NEW', force_resize_to_size=None):
+    def inscribe_part_group_to_h5(self, group_type=None, h5_data_path=None, mode='NEW',
+                                  force_resize_to_size=None, rewind_to_step=None):
         """Inscribe particle groups into an HDF5 file. See H5Writer.inscribe_part_group_to_h5."""
         return self._h5_writer.inscribe_part_group_to_h5(
             group_type=group_type, h5_data_path=h5_data_path, mode=mode,
-            force_resize_to_size=force_resize_to_size)
+            force_resize_to_size=force_resize_to_size, rewind_to_step=rewind_to_step)
 
-    def inscribe_observable_group_to_h5(self, observable_defs=None, h5_data_path=None, mode='NEW', force_resize_to_size=None):
+    def inscribe_observable_group_to_h5(self, observable_defs=None, h5_data_path=None, mode='NEW',
+                                        force_resize_to_size=None, rewind_to_step=None):
         """Inscribe observable streams into an HDF5 file. See H5Writer.inscribe_observable_group_to_h5."""
         return self._h5_writer.inscribe_observable_group_to_h5(
             observable_defs=observable_defs, h5_data_path=h5_data_path, mode=mode,
-            force_resize_to_size=force_resize_to_size)
+            force_resize_to_size=force_resize_to_size, rewind_to_step=rewind_to_step)
 
-    def write_part_group_to_h5(self, step, unique=False):
+    def write_part_group_to_h5(self, step):
         """Append one particle frame. See H5Writer.write_part_group_to_h5."""
-        return self._h5_writer.write_part_group_to_h5(step, unique=unique)
+        return self._h5_writer.write_part_group_to_h5(step)
 
-    def write_observable_group_to_h5(self, time_step=None, unique=False):
+    def write_observable_group_to_h5(self, step=None):
         """Append one observable frame. See H5Writer.write_observable_group_to_h5."""
-        return self._h5_writer.write_observable_group_to_h5(time_step=time_step, unique=unique)
+        return self._h5_writer.write_observable_group_to_h5(step=step)
 
-    def write_registered_to_h5(self, time_step=None, unique=False):
-        """Append one synchronized frame to every registered stream."""
-        return self._h5_writer.write_registered_to_h5(time_step=time_step, unique=unique)
+    def write_registered_to_h5(self, step=None):
+        """Append one synchronized frame to every registered stream. See H5Writer.write_registered_to_h5."""
+        return self._h5_writer.write_registered_to_h5(step=step)
 
-    def mk_src_file(self, original_data_file_path, dest_h5_file_path, prop_dim=None, time_step=-1):
-        """Copy an HDF5 file, shrink it to one frame, optionally append properties."""
-        return self._h5_writer.mk_src_file(original_data_file_path, dest_h5_file_path,
-                                           prop_dim=prop_dim, time_step=time_step)
+    def write_checkpoint(self, group_type, path, step):
+        """Write a verified one-frame checkpoint of `group_type` to `path` (via `path + '.tmp'` and
+        `os.replace`); returns `step`. See H5Writer.write_checkpoint."""
+        return self._h5_writer.write_checkpoint(group_type, path, step)
 
     def rebind_sys(self, new_sys):
         ''' Rebind the simulation to a new espresso system handle. This must be called after loading a checkpoint, otherwise the gloabal scope and internal reference to espressomd System will not match

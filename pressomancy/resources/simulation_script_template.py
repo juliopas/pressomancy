@@ -17,9 +17,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument('-path_data', '--path_data', type=str, required=True,
                     help='absolute path to data')
 parser.add_argument('-MODE', '--MODE', type=str, required=True,
-                    help='start clean (NEW) or load from a checkpoint (LOAD_NEW)', choices=['NEW', 'LOAD', 'LOAD_NEW', 'INIT_SRC'])
+                    help='start clean (NEW) or load from a checkpoint (LOAD_NEW)', choices=['NEW', 'LOAD', 'LOAD_NEW'])
 parser.add_argument('-SRC_PATH', '--SRC_PATH', type=str, required=False,
-                    help='path to the data file from which to initialise init config')
+                    help='path to the data file to seed the initial config from (NEW only; see load_from_src below)')
 # add custom input parameters here such as particle size, time step, etc. For example:
 # parser.add_argument('-n_part', '--n_part', type=int, required=True, default=10, help='number of particles in the system')
 args = parser.parse_args()
@@ -62,21 +62,6 @@ sim_inst.set_sys()
 # //////////////////////////////////////////////////////////////////////////////
 
 # //////////////////////////////////////////////////////////////////////////////
-if args.MODE == 'INIT_SRC':
-    if not (args.SRC_PATH):
-        raise ValueError('MODE INIT_SRC requires that SRC_PATH is specified')
-    CONTEXT_STRING_SRC = '_'.join([
-        str(val) for key, val in parser_dict.items() if key not in STANDARD_ARG_DESTINATIONS
-    ])
-    mapping_dict = {'pos_ori_src_type': [], 'type_to_type_map': [], 'prop_to_prop_map': []}
-    # mapping_dict['pos_ori_src_type'].append('real')
-    # mapping_dict['type_to_type_map'].append(('real', 'yolk'))
-    # mapping_dict['prop_to_prop_map'].append(('dip','dip'))
-    sim_inst.set_init_src(
-        path=os.path.join(args.SRC_PATH, f'custom_data_wip_{CONTEXT_STRING_SRC}.h5'), **mapping_dict)
-# //////////////////////////////////////////////////////////////////////////////
-
-# //////////////////////////////////////////////////////////////////////////////
 if args.MODE == 'LOAD_NEW':
     logging.info(f'Loading checkpoint {CONTEXT_STRING} at {args.path_data}')
     checkpoint = checkpointing.Checkpoint(
@@ -99,8 +84,23 @@ else:
     objects_list=list()
 
     # //////////////////////////////////////////////////////////////////////////
-    if args.MODE == 'INIT_SRC':
-        sim_inst.set_prop_from_src(objects_list)
+    if args.SRC_PATH:
+        CONTEXT_STRING_SRC = '_'.join([
+            str(val) for key, val in parser_dict.items() if key not in STANDARD_ARG_DESTINATIONS
+        ])
+        # fill in for the objects/types this script builds, e.g.:
+        # src_to_loc={('real', 'yolk'): [('dip', 'dip')]}, place_from=['real']
+        sim_inst.load_from_src(
+            objects_list,
+            os.path.join(args.SRC_PATH, f'custom_data_wip_{CONTEXT_STRING_SRC}.h5'),
+            # {(src_type, loc_type) or a tuple of them: [(src_prop, loc_prop), ...]}, always (source, local)
+            src_to_loc={},
+            bonds=False,
+            # SOURCE type names the file places these objects from -- needs one stored particle of
+            # those types per monomer. Leave it None when this script builds and places the tree
+            # itself (compound objects, running systems) and only its state comes from the file.
+            place_from=None,
+        )
     # //////////////////////////////////////////////////////////////////////////
 
     # //////////////////////////////////////////////////////////////////////////
@@ -143,18 +143,6 @@ else:
 # //////////////////////////////////////////////////////////////////////////////
 
 # //////////////////////////////////////////////////////////////////////////////
-if os.getenv("MK_SRC_MODE") in {"1", "true", "yes", "on"}:
-    logging.info('MK_SRC_MODE environmental variable found and enabled the MK_SRC mode')
-    if not (args.SRC_PATH):
-        raise ValueError('MK_SRC_MODE requires that SRC_PATH is specified')
-    if not (args.SRC_PATH != args.path_data):
-        raise ValueError('path_data and src path must not be the same in MK_SRC mode. You are accidentally attempting to overwrite data!')
-    sim_inst.mk_src_file(H5_DATA_PATH, os.path.join(args.SRC_PATH, f'custom_data_wip_{CONTEXT_STRING}.h5'), prop_dim=[('director', 3), ('image_box', 3)])
-    logging.info('sucessfuly wrote SRC files and exited')
-    sysos.exit(0)
-# //////////////////////////////////////////////////////////////////////////////
-
-# //////////////////////////////////////////////////////////////////////////////
 benchmark_SAMPLING_INTERVAL = [0.,]
 t1 = 0.
 while GLOBAL_COUNTER < SAMPLING_ITERATIONS:
@@ -164,7 +152,7 @@ while GLOBAL_COUNTER < SAMPLING_ITERATIONS:
         sim_inst.sys.integrator.run(SNAPSHOT_SEPARATION)
         vtf.writevcf(sim_inst.sys, fp)
         fp.flush()
-        sim_inst.write_part_group_to_h5(time_step=GLOBAL_COUNTER)
+        sim_inst.write_part_group_to_h5(step=GLOBAL_COUNTER)
         GLOBAL_COUNTER += 1
         if GLOBAL_COUNTER == SAMPLING_ITERATIONS:
             checkpoint.save()

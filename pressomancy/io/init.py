@@ -8,7 +8,7 @@ properties onto already-built objects, ``set_bonds_from_src`` re-creates the
 stored bond topology on them, and ``load_from_src`` chains all of them so a
 script seeds a system from a file in one call (``Simulation.load_from_src`` is
 the only public seeding entry; the steps stay reachable on
-``Simulation.h5_init``). ``get_prop_from_src`` reads a stored property back
+``Simulation._h5_init``). ``get_prop_from_src`` reads a stored property back
 per object without touching the system, for everything that is not a 1:1 copy.
 
 **Placement is optional (``place_from``).** Give ``place_from`` (a list of

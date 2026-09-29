@@ -8,6 +8,7 @@ from pressomancy.object_classes.object_class import (ObjectConfigParams,
                                                      Simulation_Object,
                                                      SIMULATION_TYPE_OWNERS)
 from pressomancy.object_classes.filament_class import Filament
+from pressomancy.object_classes.crowder_class import Crowder
 from pressomancy.simulation import Simulation
 
 
@@ -19,6 +20,14 @@ def make_object_class(name, simulation_type):
         'simulation_type': simulation_type,
         'config': ObjectConfigParams(),
     })
+
+
+class ObjectConfigParamsTest(BaseTestCase):
+    def test_sigma_only_where_it_is_read(self):
+        """`sigma` is no common key: a class that ignores it rejects it."""
+        with self.assertRaisesRegex(ValueError, "Invalid keys"):
+            Crowder.config.specify(sigma=1.)
+        self.assertEqual(Filament.config.specify(sigma=2.)['sigma'], 2.)
 
 
 class TypeDictSafeTest(BaseTestCase):

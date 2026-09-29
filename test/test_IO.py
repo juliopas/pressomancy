@@ -4,6 +4,7 @@ from .create_system import sim_inst, BaseTestCase, BoxTestCase
 from pressomancy.simulation import (Filament, Quartet, Quadriplex, Crowder, Elastomer,
                                     PointDipolePermanent, PointDipoleMagnetizable)
 from pressomancy.infra import BondWrapper, api_agnostic_feature_check
+from pressomancy.geometry import WCA_CONTACT_FACTOR, min_img_dist
 from pressomancy.magnetodynamics import required_features_for
 from pressomancy.io import (H5DataSelector, H5ObservableSelector, stored_steps,
                             CHECKPOINT_PROPERTIES, checkpoint_properties)
@@ -364,7 +365,7 @@ class FilamentFixture(CommonH5DataSelectorTests, BaseTestCase):
         sim_inst.store_objects(filaments)
         sim_inst.set_objects(filaments)
 
-        crowder_configuration=Crowder.config.specify(sigma=1., size=1., espresso_handle=sim_inst.sys)
+        crowder_configuration=Crowder.config.specify(size=1., espresso_handle=sim_inst.sys)
         crowders = [Crowder(config=crowder_configuration) for _ in range(cls.no_crowders)]
         sim_inst.store_objects(crowders)
         sim_inst.set_objects(crowders)
@@ -513,7 +514,7 @@ class SourceFixture(IOTestCase):
 
     def build_elastomer(self, place=True):
         elastomer = Elastomer(config=Elastomer.config.specify(
-            box_E=[3, 3, 9], n_parts=10, size=1., espresso_handle=sim_inst.sys,
+            box_E=[3, 3, 9], n_parts=10, sigma=1. / WCA_CONTACT_FACTOR, espresso_handle=sim_inst.sys,
             seed=sim_inst.seed))
         sim_inst.store_objects([elastomer])
         if place:
@@ -607,15 +608,15 @@ class SourceSeedingTest(SourceFixture):
         for part in sim_inst.sys.part.all():
             part.director = [0., 0., 1.]
         dip_to_director = {('real', 'real'): [('dip', 'director')]}
-        sim_inst.h5_init.set_init_src(path, place_from=['real'], src_to_loc=dip_to_director)
-        sim_inst.h5_init.set_prop_from_src(filaments)
+        sim_inst._h5_init.set_init_src(path, place_from=['real'], src_to_loc=dip_to_director)
+        sim_inst._h5_init.set_prop_from_src(filaments)
         for who, directors in self.typed_values(filaments, 'real', 'director').items():
             want = dips[who] / np.linalg.norm(dips[who], axis=1, keepdims=True)
             np.testing.assert_allclose(directors, want, rtol=0, atol=1e-12)
 
-        sim_inst.h5_init.set_init_src(zero_path, place_from=['real'], src_to_loc=dip_to_director)
+        sim_inst._h5_init.set_init_src(zero_path, place_from=['real'], src_to_loc=dip_to_director)
         with self.assertRaises(ValueError) as ctx:
-            sim_inst.h5_init.set_prop_from_src(filaments)
+            sim_inst._h5_init.set_prop_from_src(filaments)
         self.assertIn("dip moment magnitude is 0", str(ctx.exception))
 
     def test_each_type_pair_copies_its_own_property_list(self):
@@ -636,9 +637,9 @@ class SourceSeedingTest(SourceFixture):
                 self.assertFalse(np.allclose(positions, written[(name, 'pos')][who]),
                                  msg=f"the fixture did not move {name}")
 
-        sim_inst.h5_init.set_init_src(path, place_from=['real'], src_to_loc={
+        sim_inst._h5_init.set_init_src(path, place_from=['real'], src_to_loc={
             (('real', 'real'), ('virt', 'virt')): [('pos', 'pos')], ('real', 'real'): [('dip', 'dip')]})
-        sim_inst.h5_init.set_prop_from_src(filaments)
+        sim_inst._h5_init.set_prop_from_src(filaments)
         for name in ('real', 'virt'):
             for who, positions in self.typed_values(filaments, name).items():
                 np.testing.assert_allclose(positions, written[(name, 'pos')][who], rtol=1e-10, atol=1e-10)
@@ -656,10 +657,10 @@ class SourceSeedingTest(SourceFixture):
             self.rebuild()
             filaments = self.build_filaments(with_anchors=True)
             before = self.typed_values(filaments, 'virt')
-            sim_inst.h5_init.set_init_src(path, place_from=['real'],
+            sim_inst._h5_init.set_init_src(path, place_from=['real'],
                                           src_to_loc={('real', 'virt'): [('pos', 'pos')]})
             with self.assertRaises(ValueError) as ctx:
-                sim_inst.h5_init.set_prop_from_src(filaments)
+                sim_inst._h5_init.set_prop_from_src(filaments)
             self.assertIn(f"{self.n_parts} source particles vs {2 * self.n_parts} local particles",
                           str(ctx.exception))
             for who, positions in self.typed_values(filaments, 'virt').items():
@@ -676,15 +677,15 @@ class SourceSeedingTest(SourceFixture):
             self.assertIn(f"{self.n_parts} source particles vs 0 local particles", str(ctx.exception))
             self.assertEqual(len(sim_inst.sys.part), 0)
         with self.subTest(case="an empty property list still pairs"):
-            sim_inst.h5_init.set_init_src(path, place_from=['real'], src_to_loc={('real', 'virt'): []})
+            sim_inst._h5_init.set_init_src(path, place_from=['real'], src_to_loc={('real', 'virt'): []})
             with self.assertRaises(ValueError) as ctx:
-                sim_inst.h5_init.set_prop_from_src(filaments)
+                sim_inst._h5_init.set_prop_from_src(filaments)
             self.assertIn(f"{self.n_parts} source particles vs 0 local particles", str(ctx.exception))
-        sim_inst.h5_init.set_init_src(path, place_from=['real'])
+        sim_inst._h5_init.set_init_src(path, place_from=['real'])
         for label, subset in (("a who_am_i subset", larger[:1]), ("a who_am_i superset", larger)):
             with self.subTest(case=label):
                 with self.assertRaises(ValueError) as ctx:
-                    sim_inst.h5_init.get_pos_ori_from_src(subset)
+                    sim_inst._h5_init.get_pos_ori_from_src(subset)
                 self.assertIn("who_am_i", str(ctx.exception))
         self.assertEqual(len(sim_inst.sys.part), 0)
 
@@ -716,10 +717,10 @@ class SourceSeedingTest(SourceFixture):
         for label, (src_to_loc, place_from, fragment) in cases.items():
             with self.subTest(case=label):
                 with self.assertRaises(ValueError) as ctx:
-                    sim_inst.h5_init.set_init_src(path, src_to_loc=src_to_loc, place_from=place_from)
+                    sim_inst._h5_init.set_init_src(path, src_to_loc=src_to_loc, place_from=place_from)
                 self.assertIn(fragment, str(ctx.exception))
-                self.assertEqual(sim_inst.h5_init.src_to_loc, {})
-                self.assertIsNone(sim_inst.h5_init.place_from)
+                self.assertEqual(sim_inst._h5_init.src_to_loc, {})
+                self.assertIsNone(sim_inst._h5_init.place_from)
 
     def test_get_prop_from_src_returns_the_written_values_per_object(self):
         """Read a stored column back per object on an unplaced tree, naming a missing dataset."""
@@ -749,9 +750,9 @@ class SourceSeedingTest(SourceFixture):
 
         self.rebuild()
         filaments = self.build_filaments(place=False)
-        self.assertIsNone(sim_inst.h5_init.src_path_h5)
-        for label, call in (("set_prop_from_src", lambda: sim_inst.h5_init.set_prop_from_src(filaments)),
-                            ("get_pos_ori_from_src", lambda: sim_inst.h5_init.get_pos_ori_from_src(filaments))):
+        self.assertIsNone(sim_inst._h5_init.src_path_h5)
+        for label, call in (("set_prop_from_src", lambda: sim_inst._h5_init.set_prop_from_src(filaments)),
+                            ("get_pos_ori_from_src", lambda: sim_inst._h5_init.get_pos_ori_from_src(filaments))):
             with self.subTest(case="no source declared", method=label):
                 with self.assertRaises(RuntimeError):
                     call()
@@ -759,17 +760,17 @@ class SourceSeedingTest(SourceFixture):
         missing = os.path.join(self.tmpdir.name, "no_such_source.h5")
         with self.subTest(case="a missing source file"):
             with self.assertRaises(FileNotFoundError) as ctx:
-                sim_inst.h5_init.set_init_src(missing, src_to_loc={('real', 'real'): [('pos', 'pos')]},
+                sim_inst._h5_init.set_init_src(missing, src_to_loc={('real', 'real'): [('pos', 'pos')]},
                                               place_from=['real'])
             self.assertIn(missing, str(ctx.exception))
-            self.assertIsNone(sim_inst.h5_init.src_path_h5)
+            self.assertIsNone(sim_inst._h5_init.src_path_h5)
 
-        sim_inst.h5_init.set_init_src(path, src_to_loc={('real', 'real'): [('pos', 'pos')]})
-        self.assertIsNone(sim_inst.h5_init.place_from)
+        sim_inst._h5_init.set_init_src(path, src_to_loc={('real', 'real'): [('pos', 'pos')]})
+        self.assertIsNone(sim_inst._h5_init.place_from)
         for label, call in (("get_pos_ori_from_src",
-                             lambda: sim_inst.h5_init.get_pos_ori_from_src(filaments)),
+                             lambda: sim_inst._h5_init.get_pos_ori_from_src(filaments)),
                             ("set_objects_from_src",
-                             lambda: sim_inst.h5_init.set_objects_from_src(filaments))):
+                             lambda: sim_inst._h5_init.set_objects_from_src(filaments))):
             with self.subTest(case="no place_from", method=label):
                 with self.assertRaises(RuntimeError) as ctx:
                     call()
@@ -816,6 +817,29 @@ class SourceSeedingTest(SourceFixture):
                                place_from=[real_type])
         for who, positions in self.real_positions(filaments).items():
             np.testing.assert_allclose(positions, written[who], rtol=1e-10, atol=1e-10)
+
+
+class SeededObjectsAreObstaclesTest(SourceFixture):
+    """Objects placed by `load_from_src` used to be invisible to a later `set_objects`."""
+
+    def test_set_objects_avoids_seeded_filaments(self):
+        """Of the size-1 sites in the 16^3 box, ~19% lie within reach of the two filaments (size 8),
+        so 200 random ones miss them by chance with probability ~1e-18."""
+        self.build_filaments()
+        path = self.write_source("seed.h5")
+
+        self.rebuild()
+        filaments = self.build_filaments(place=False)
+        sim_inst.load_from_src(filaments, path, src_to_loc={('real', 'real'): [('pos', 'pos')]},
+                               place_from=['real'])
+        seeded = [np.mean([part.pos for part in fil.get_owned_part()[0]], axis=0) for fil in filaments]
+        crowders = [Crowder(config=Crowder.config.specify(size=1., espresso_handle=sim_inst.sys))
+                    for _ in range(200)]
+        sim_inst.store_objects(crowders)
+        sim_inst.set_objects(crowders)
+        centres = np.array([crowder.get_owned_part()[0][0].pos for crowder in crowders])
+        dist = np.linalg.norm(min_img_dist(centres[:, None], np.asarray(seeded)[None], sim_inst.sys.box_l), axis=-1)
+        self.assertGreaterEqual(dist.min(), 0.5 * (filaments[0].params['size'] + 1.) - 1e-9)
 
 
 class OldLayoutFileTest(SourceFixture):
@@ -998,9 +1022,9 @@ class SourceBondRestoreTest(SourceFixture):
         n_placed = self.n_filaments * self.n_parts
 
         def restore_bonds(path, src_to_loc=None):
-            sim_inst.h5_init.set_init_src(path, place_from=['real'],
+            sim_inst._h5_init.set_init_src(path, place_from=['real'],
                                           src_to_loc={('real', 'real'): []} if src_to_loc is None else src_to_loc)
-            return sim_inst.h5_init.set_bonds_from_src(filaments)
+            return sim_inst._h5_init.set_bonds_from_src(filaments)
 
         def restore_bonds_onto_a_moved_tree():
             for part in sim_inst.sys.part.all():
@@ -1010,7 +1034,7 @@ class SourceBondRestoreTest(SourceFixture):
         # In order: the first two see an unplaced tree, the third places it from the file.
         cases = [   # (label, error, fragment of the raise, call, particles afterwards)
             ("no source declared", RuntimeError, "no source declared",
-             lambda: sim_inst.h5_init.set_bonds_from_src(filaments), 0),
+             lambda: sim_inst._h5_init.set_bonds_from_src(filaments), 0),
             ("bonds without a mapping", ValueError, "src_to_loc is empty",
              lambda: sim_inst.load_from_src(filaments, bonded, None, bonds=True, place_from=['real']), 0),
             ("partner outside the mapping", ValueError, "dangling bond",
@@ -1044,9 +1068,9 @@ class SourceBondRestoreTest(SourceFixture):
 
         Local ids differ from source ids (each PDM owns a real and a virtual particle), so the
         bond partners are compared through positions, independently of the zip convention."""
-        box_E, n_parts, size = [4., 4., 4.], 16, 1.
+        box_E, n_parts, sigma = [4., 4., 4.], 16, 1. / WCA_CONTACT_FACTOR
         elastomer = Elastomer(config=Elastomer.config.specify(
-            box_E=box_E, n_parts=n_parts, size=size, bond_cutoff=2., max_bonds=4,
+            box_E=box_E, n_parts=n_parts, sigma=sigma, bond_cutoff=2., max_bonds=4,
             espresso_handle=sim_inst.sys, seed=sim_inst.seed))
         sim_inst.store_objects([elastomer])
         sim_inst.set_objects([elastomer])
@@ -1079,7 +1103,7 @@ class SourceBondRestoreTest(SourceFixture):
             dipm_sat=1., mag_susc_0=0.1, magnetization_model='langevin', espresso_handle=sim_inst.sys))
             for _ in range(n_parts)]
         elastomer = Elastomer(config=Elastomer.config.specify(
-            box_E=box_E, n_parts=n_parts, size=size, associated_objects=pdm,
+            box_E=box_E, n_parts=n_parts, sigma=sigma, associated_objects=pdm,
             espresso_handle=sim_inst.sys, seed=sim_inst.seed))
         sim_inst.store_objects([elastomer])
         n_added = sim_inst.load_from_src([elastomer], path,
@@ -1093,7 +1117,7 @@ class SourceBondRestoreTest(SourceFixture):
 
         self.assertEqual(elastomer.who_am_i, written_who_am_i)
         # the source really leaves the strict build range, so the relaxed check was exercised
-        self.assertLess(src_pos[:, 2].min(), 1. + size / 2)
+        self.assertLess(src_pos[:, 2].min(), 1. + elastomer._bead_size / 2)
 
         # positions and fix, both restored by the single load_from_src call, bit-exact in column order
         self.assertEqual(len(ids), n_parts)
@@ -1193,7 +1217,7 @@ class SourceFrameSelectionTest(SourceFixture):
 
         self.rebuild()
         self.filaments = self.build_filaments(place=False)
-        sim_inst.h5_init.set_init_src(self.path, place_from=['real'],
+        sim_inst._h5_init.set_init_src(self.path, place_from=['real'],
                                        src_to_loc={('real', 'real'): [('pos', 'pos')]})
 
     def assert_at_frame(self, frame_index):
@@ -1212,7 +1236,7 @@ class SourceFrameSelectionTest(SourceFixture):
                   ("frame, step and time agreeing", dict(frame=0, step=self.steps[0], time=self.times[0]), 0)]
         for label, selector, index in cases:
             with self.subTest(case=label):
-                positions, orientations = sim_inst.h5_init.get_pos_ori_from_src(self.filaments, **selector)
+                positions, orientations = sim_inst._h5_init.get_pos_ori_from_src(self.filaments, **selector)
                 self.assertEqual(len(positions), len(self.filaments))
                 for filament, pos, ori in zip(self.filaments, positions, orientations):
                     np.testing.assert_allclose(pos, self.frames[index][filament.who_am_i], rtol=0, atol=1e-12)
@@ -1220,9 +1244,9 @@ class SourceFrameSelectionTest(SourceFixture):
 
     def test_every_reader_honours_the_selector(self):
         """Objects and bonds from step 5 (not the last frame; bonds cross-check positions), then props at every frame."""
-        sim_inst.h5_init.set_objects_from_src(self.filaments, step=self.steps[1])
+        sim_inst._h5_init.set_objects_from_src(self.filaments, step=self.steps[1])
         self.assert_at_frame(1)
-        n_added = sim_inst.h5_init.set_bonds_from_src(self.filaments, step=self.steps[1])
+        n_added = sim_inst._h5_init.set_bonds_from_src(self.filaments, step=self.steps[1])
         self.assertEqual(n_added, self.n_links)
         self.assertEqual(self.n_live_links(), self.n_links)
         for index, step in enumerate(self.steps):
@@ -1232,21 +1256,21 @@ class SourceFrameSelectionTest(SourceFixture):
                 with self.subTest(frame=index, selector=label):
                     for part in sim_inst.sys.part.all():
                         part.pos = part.pos + np.array([7.0, 0., 0.])
-                    sim_inst.h5_init.set_prop_from_src(self.filaments, **selector)
+                    sim_inst._h5_init.set_prop_from_src(self.filaments, **selector)
                     self.assert_at_frame(index)
 
     def test_a_bad_selector_raises_before_anything_is_placed(self):
         # without the range check a frame index would silently wrap around (frame % n_frames)
         with self.subTest(case="an out-of-range frame"), self.assertRaises(IndexError):
-            sim_inst.h5_init.get_pos_ori_from_src(self.filaments, frame=len(self.steps))
+            sim_inst._h5_init.get_pos_ori_from_src(self.filaments, frame=len(self.steps))
         conflicting = {
-            "get_pos_ori_from_src": lambda: sim_inst.h5_init.get_pos_ori_from_src(
+            "get_pos_ori_from_src": lambda: sim_inst._h5_init.get_pos_ori_from_src(
                 self.filaments, frame=0, step=self.steps[1]),
-            "set_prop_from_src": lambda: sim_inst.h5_init.set_prop_from_src(
+            "set_prop_from_src": lambda: sim_inst._h5_init.set_prop_from_src(
                 self.filaments, frame=0, step=self.steps[1]),
-            "set_bonds_from_src": lambda: sim_inst.h5_init.set_bonds_from_src(
+            "set_bonds_from_src": lambda: sim_inst._h5_init.set_bonds_from_src(
                 self.filaments, frame=0, step=self.steps[1]),
-            "set_objects_from_src": lambda: sim_inst.h5_init.set_objects_from_src(
+            "set_objects_from_src": lambda: sim_inst._h5_init.set_objects_from_src(
                 self.filaments, frame=0, time=self.times[1]),
         }
         for name, call in conflicting.items():
@@ -1402,7 +1426,7 @@ class TruncationTest(SourceFixture):
     def setUp(self):
         super().setUp()
         self.build_filaments()
-        crowders = [Crowder(config=Crowder.config.specify(sigma=1., size=1., espresso_handle=sim_inst.sys))
+        crowders = [Crowder(config=Crowder.config.specify(size=1., espresso_handle=sim_inst.sys))
                     for _ in range(3)]
         sim_inst.store_objects(crowders)
         sim_inst.set_objects(crowders)

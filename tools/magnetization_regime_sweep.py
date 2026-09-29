@@ -48,6 +48,7 @@ import espressomd
 from espressomd.magnetostatics import DipolarDirectSum
 
 from pressomancy.simulation import Simulation, Elastomer, PointDipoleMagnetizable
+from pressomancy.geometry import WCA_CONTACT_FACTOR
 
 #: Field used for every measurement. Small on purpose -- see the module docstring.
 PROBE_FIELD = 0.01
@@ -61,7 +62,7 @@ SATURATION_CUTOFF = 0.5
 #: the fixed point is then highly parameter-sensitive.
 AMPLIFICATION_CUTOFF = 10.0
 
-SIZE_PART = 2.0 ** (1.0 / 6.0)
+SIZE_PART = WCA_CONTACT_FACTOR
 
 
 def _isolated_moment(chi0, field, m_sat=1.0):
@@ -125,7 +126,7 @@ def measure_mae(sim, chi0, prefactor, n_parts=60, density=0.3, n_iter=40):
     dipoles = [PointDipoleMagnetizable(config=cfg) for _ in range(n_parts)]
     cfg_e = Elastomer.config.specify(
         layer_height=layer, n_parts=n_parts, associated_objects=dipoles,
-        bond_K_lims=(0.01, 0.1), size=SIZE_PART, sigma=1.0,
+        bond_K_lims=(0.01, 0.1), sigma=1.0,
         espresso_handle=sim.sys, seed=sim.seed)
     elastomer = Elastomer(config=cfg_e)
     sim.store_objects([elastomer])
