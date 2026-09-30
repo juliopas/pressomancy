@@ -8,11 +8,10 @@ import numpy as np
 import espressomd
 from pressomancy.object_classes.object_class import ObjectConfigParams
 from pressomancy.object_classes.rigid_obj import GenericRigidObj
-from pressomancy.helper_functions import PartDictSafe, api_agnostic_feature_check
-from pressomancy.helper_functions import MissingFeature
-if espressomd.version.major() == 5:
-    import espressomd.propagation
-    Propagation = espressomd.propagation.Propagation
+from pressomancy.infra import TypeDictSafe, api_agnostic_feature_check
+from pressomancy.infra import MissingFeature
+import espressomd.propagation
+Propagation = espressomd.propagation.Propagation
 
 class MulticorePart(GenericRigidObj):
 
@@ -26,15 +25,13 @@ class MulticorePart(GenericRigidObj):
     of cores, so the core pattern's absolute orientation is not physically meaningful.
     '''
     required_features = GenericRigidObj.required_features + ['DIPOLES']
-    numInstances = 0
-    part_types = PartDictSafe()
+    part_types = TypeDictSafe()
     config=ObjectConfigParams(
         alias='multicore'
     )
 
     def __init__(self, config: ObjectConfigParams):
         super().__init__(config)
-        MulticorePart.numInstances += 1
 
     def add_dipole_moments_to_virtuals(self, dip_moments, selection='random', anisotropy={'kind':'infinite','params': {}}):
         """
@@ -82,7 +79,7 @@ class MulticorePart(GenericRigidObj):
         - For the Egg model, selected particles are retyped to a ``'yolk'`` part
         type.
         """
-        if not (anisotropy['kind'] in ['infinite', 'finite_egg']):
+        if anisotropy['kind'] not in ['infinite', 'finite_egg']:
             raise ValueError('Supporting infinite anisotropy and finite anisotropy via the Egg model')
         
         dip_moments=np.atleast_2d(dip_moments)
@@ -111,23 +108,14 @@ class MulticorePart(GenericRigidObj):
             MulticorePart.part_types.update({'yolk': 11})
             for x,dip_mom_per_part in zip(part_handles, dip_moments):
                 x.dip = dip_mom_per_part
-                if espressomd.version.major() == 5:
-                    x.rotation = (True, True, True)
-                    x.magnetodynamics.egg = {
-                        "is_enabled": True,
-                        "gamma": anisotropy['params']['egg_gamma'],
-                        "anisotropy_energy": anisotropy['params']['aniso_energy'],
-                    }
-                    x.propagation = (Propagation.TRANS_VS_RELATIVE |
-                                     Propagation.ROT_VS_INDEPENDENT)
-                elif espressomd.version.major() == 4:
-                    x.egg_model_params = {
-                        "use_egg_model": True,
-                        "egg_gamma": anisotropy['params']['egg_gamma'],
-                        "aniso_energy": anisotropy['params']['aniso_energy'],
-                    }
-                else:
-                    raise ImportError(f"Unsupported espressomd version: {espressomd.version.major()}")
+                x.rotation = (True, True, True)
+                x.magnetodynamics.egg = {
+                    "is_enabled": True,
+                    "gamma": anisotropy['params']['egg_gamma'],
+                    "anisotropy_energy": anisotropy['params']['aniso_energy'],
+                }
+                x.propagation = (Propagation.TRANS_VS_RELATIVE |
+                                 Propagation.ROT_VS_INDEPENDENT)
                 self.change_part_type(x,'yolk')
     
     

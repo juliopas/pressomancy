@@ -6,16 +6,12 @@ import os
 import sys
 from .create_system import sim_inst, BaseTestCase
 from unittest import mock
-from pressomancy.helper_functions import MissingFeature
+from pressomancy.infra import MissingFeature
 
 class SampleScriptTest(BaseTestCase):
 
-    def tearDown(self) -> None:
-        self.cleanup()
-        self.assertEqual(len(sim_inst.objects), 0)
-        self.assertEqual(len(sim_inst.sys.part), 0)
-
     def test_sample_scripts(self):
+        """Every script under samples/ imports (or skips on a MissingFeature) and leaves no objects or particles behind."""
         def get_current_sim_instance(*args, **kwargs):
             """Helper function to return the latest `sim_inst`."""
             if 'box_dim' in kwargs:
@@ -29,7 +25,7 @@ class SampleScriptTest(BaseTestCase):
                         logging.warning(f"Importing {full_module_name}...")
                         module = importlib.import_module(full_module_name)
                     except MissingFeature as excp:
-                        logging.warning(f"Skipping {module_name} because it requires a feature that is not available. Caught exception {excp}")
+                        self.skipTest(str(excp))
                     else:
                         if os.getenv("PRESSOMANCY_TESTS_DUMP_VTF") in {"1", "true", "yes", "on"}:
                             from espressomd.io.writer import vtf

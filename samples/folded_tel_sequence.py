@@ -1,5 +1,5 @@
 from pressomancy.simulation import Simulation, TelSeq, Quartet, Quadriplex
-from pressomancy.helper_functions import BondWrapper
+from pressomancy.infra import BondWrapper
 import espressomd
 import numpy as np
 import logging

@@ -5,14 +5,11 @@ with ``THERMAL_STONER_WOHLFARTH`` (which itself requires NLOPT).
 '''
 from pressomancy.object_classes.part_class import GenericPart
 from pressomancy.object_classes.object_class import ObjectConfigParams
-from pressomancy.helper_functions import PartDictSafe, SinglePairDict
+from pressomancy.infra import TypeDictSafe, SimulationType
 import espressomd
+import espressomd.propagation
 import numpy as np
-if espressomd.version.major() == 5:
-    import espressomd.propagation
-    Propagation = espressomd.propagation.Propagation
-# else:
-#     raise ImportError(f"Unsupported espressomd version: {espressomd.version.major()}. This code requires espressomd version 5 or higher.")
+Propagation = espressomd.propagation.Propagation
 
 class SWPart(GenericPart):
 
@@ -21,9 +18,8 @@ class SWPart(GenericPart):
     '''
     required_features=GenericPart.required_features + ['THERMAL_STONER_WOHLFARTH', 'DIPOLES', 'VIRTUAL_SITES_RELATIVE']
 
-    numInstances = 0
-    simulation_type= SinglePairDict('sw_part', 13)
-    part_types = PartDictSafe({'sw_real': 9,'sw_virt': 10})
+    simulation_type= SimulationType('sw_part', 13)
+    part_types = TypeDictSafe({'sw_real': 9,'sw_virt': 10})
     config = ObjectConfigParams(
         anisotropy_field_inv=0.175, # inverse anisotropy field (1/H_k) in reduced units
         sat_mag=1.75, # saturation magnetisation in reduced units
@@ -53,8 +49,7 @@ class SWPart(GenericPart):
         particl_virt=self.add_particle(type_name='sw_virt', pos=pos, rotation=(False, False, False), dip=self.params['sat_mag']*ori)
         particl_virt.magnetodynamics = magnetodynamics_setup
         particl_virt.vs_auto_relate_to(particl_real)
-        if espressomd.version.major() == 5:
-            particl_virt.propagation = Propagation.TRANS_VS_RELATIVE | Propagation.ROT_VS_INDEPENDENT
+        particl_virt.propagation = Propagation.TRANS_VS_RELATIVE | Propagation.ROT_VS_INDEPENDENT
 
         written = particl_virt.magnetodynamics
         assert written['is_enabled'], \

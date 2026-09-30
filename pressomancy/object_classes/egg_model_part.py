@@ -5,11 +5,10 @@ particle carrying the dipole moment. Gated behind the ``EGG_MODEL`` feature.
 '''
 from pressomancy.object_classes.part_class import GenericPart
 from pressomancy.object_classes.object_class import ObjectConfigParams
-from pressomancy.helper_functions import PartDictSafe, SinglePairDict
+from pressomancy.infra import TypeDictSafe, SimulationType
 import espressomd
-if espressomd.version.major() == 5:
-    import espressomd.propagation
-    Propagation = espressomd.propagation.Propagation
+import espressomd.propagation
+Propagation = espressomd.propagation.Propagation
 
 class EGGPart(GenericPart):
     """
@@ -29,9 +28,8 @@ class EGGPart(GenericPart):
     with ``ori``.
     """
     required_features = GenericPart.required_features + ['EGG_MODEL', 'DIPOLES', 'VIRTUAL_SITES_RELATIVE']
-    numInstances = 0
-    simulation_type = SinglePairDict('egg_part', 74)
-    part_types = PartDictSafe({'yolk': 11})
+    simulation_type = SimulationType('egg_part', 74)
+    part_types = TypeDictSafe({'yolk': 11})
     config = ObjectConfigParams(
         dipm=1,
         gamma=1.,
@@ -53,9 +51,7 @@ class EGGPart(GenericPart):
         self.sys = config['espresso_handle']
         self.params = config
         self.associated_objects = config['associated_objects']
-        self.type_part_dict = PartDictSafe(
-            {key: [] for key in EGGPart.part_types.keys()})
-        EGGPart.numInstances += 1
+        self.type_part_dict = {key: [] for key in EGGPart.part_types}
 
     def set_object(self, pos, ori):
         """
@@ -82,25 +78,14 @@ class EGGPart(GenericPart):
             director=ori, dipm=self.params['dipm'])
         particl_virt.vs_auto_relate_to(particl_real)
 
-        if espressomd.version.major() == 5:
-            magnetodynamics_setup = {
-                "is_enabled": True,
-                "gamma": self.params['gamma'],
-                "anisotropy_energy": self.params['anisotropy_energy'],
-                "axis_quat_body": self.params['axis_quat_body'],
-            }
-            particl_virt.magnetodynamics.egg = magnetodynamics_setup
-            particl_virt.propagation = (Propagation.TRANS_VS_RELATIVE |
-                                        Propagation.ROT_VS_INDEPENDENT)
-        elif espressomd.version.major() == 4:
-            particl_virt.egg_model_params = {
-                "use_egg_model": True,
-                "egg_gamma": self.params['gamma'],
-                "aniso_energy": self.params['anisotropy_energy'],
-            }
-        else:
-            raise ImportError(
-                f"Unsupported espressomd version: {espressomd.version.major()}. "
-                "This code requires espressomd version 4 or higher.")
+        magnetodynamics_setup = {
+            "is_enabled": True,
+            "gamma": self.params['gamma'],
+            "anisotropy_energy": self.params['anisotropy_energy'],
+            "axis_quat_body": self.params['axis_quat_body'],
+        }
+        particl_virt.magnetodynamics.egg = magnetodynamics_setup
+        particl_virt.propagation = (Propagation.TRANS_VS_RELATIVE |
+                                    Propagation.ROT_VS_INDEPENDENT)
 
         return self

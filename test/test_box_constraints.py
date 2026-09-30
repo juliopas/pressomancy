@@ -1,5 +1,4 @@
 from .create_system import sim_inst, BoxTestCase
-from pressomancy.geometry import WCA_CONTACT_FACTOR
 import numpy as np
 
 
@@ -48,7 +47,7 @@ class BoxWallsTest(BoxTestCase):
         # (sigma, epsilon > 0) of each type's WCA with the wall type, after every step
         def wall_wca():
             return [(inter[t, 0].wca.sigma, inter[t, 0].wca.epsilon > 0) for t in (1, 2, 3)]
-        on = [(inter[t, t].wca.sigma / 2 / WCA_CONTACT_FACTOR, True) for t in (1, 2, 3)]
+        on = [(inter[t, t].wca.sigma / 2, True) for t in (1, 2, 3)]
         off = (0, False)
         self.assertEqual(wall_wca(), on)
 

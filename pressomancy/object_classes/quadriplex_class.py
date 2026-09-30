@@ -10,10 +10,11 @@ import warnings
 import logging
 import espressomd
 import numpy as np
-from pressomancy.helper_functions import PartDictSafe, SinglePairDict, align_vectors
+from pressomancy.infra import TypeDictSafe, SimulationType
+from pressomancy.geometry import align_vectors
 from pressomancy.object_classes.object_class import Simulation_Object, ObjectConfigParams
 from pressomancy.object_classes.rigid_obj import GenericRigidObj
-from pressomancy.helper_functions import BondWrapper
+from pressomancy.infra import BondWrapper
 
 class Quartet(GenericRigidObj):
 
@@ -30,7 +31,6 @@ class Quartet(GenericRigidObj):
     on a Quartet silently does nothing.
     '''
     required_features = GenericRigidObj.required_features + ['EXCLUSIONS']
-    numInstances = 0
 
     recipe_dictA = {'assoc': {1: [2, 3, 6, 7, 8],
                               5: [4, 9, 10, 13, 14],
@@ -85,7 +85,7 @@ class Quartet(GenericRigidObj):
     # Do not change
     CORNER_DIAGONAL = np.sqrt(2) * 4
 
-    part_types = PartDictSafe()
+    part_types = TypeDictSafe()
     config = ObjectConfigParams(
         n_parts=25,
         alias='quartet',
@@ -97,15 +97,15 @@ class Quartet(GenericRigidObj):
         Initialisation of a quartet object requires the specification of particle size, number of parts and a handle to the espresso system
         '''
         super().__init__(config)
-        if not (config['type'] in ['solid', 'brokenA', 'brokenB']):
+        if config['type'] not in ['solid', 'brokenA', 'brokenB']:
             raise ValueError('type must be either solid, brokenA or brokenB!!!')
         if config['type'] == 'solid':
             self.required_features = Quartet.required_features + ['ROTATIONAL_INERTIA']
         else:
             self.required_features = Quartet.required_features + ['ELECTROSTATICS']
-        if not (self.params['alias'] in ['quartet', 'quartet_11x11']):
+        if self.params['alias'] not in ['quartet', 'quartet_11x11']:
             raise ValueError('unsupported quartet alias!!!')
-        if not (config['n_parts'] == len(self._reference_sheet[self.params['alias']])):
+        if config['n_parts'] != len(self._reference_sheet[self.params['alias']]):
             raise ValueError('n_parts must be equal to the number of parts in the reference sheet!!!')
         self.recipe_dictA, self.recipe_dictB = self.__class__.recipe_dicts_by_alias[self.params['alias']]
         if self.params['type'] in ['brokenA', 'brokenB']:
@@ -113,7 +113,6 @@ class Quartet(GenericRigidObj):
                   'squareA': 24, 'squareB': 25, 'cation': 27})
         self.orientor = np.empty(shape=3, dtype=float)
         self.corner_particles = []
-        Quartet.numInstances += 1
 
     def set_object(self,  pos, ori, triplet=None):
         '''
@@ -265,9 +264,8 @@ class Quadriplex(metaclass=Simulation_Object):
     Class that contains quadriplex relevant parameters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instance there will be only one type of a Quadriplex. Therefore many relevant parameters are class specific, not instance specific.
     '''
     required_features=['VIRTUAL_SITES_RELATIVE', 'ROTATION']
-    numInstances = 0
-    part_types = PartDictSafe()
-    simulation_type=SinglePairDict('quadriplex',22)
+    part_types = TypeDictSafe()
+    simulation_type=SimulationType('quadriplex',22)
     config = ObjectConfigParams(
         n_parts=3,
         size=6.,
@@ -287,12 +285,11 @@ class Quadriplex(metaclass=Simulation_Object):
             configuration=Quartet.config.specify(espresso_handle=self.sys)
             self.params['associated_objects']=[Quartet(config=configuration) for _ in range(3)]
         self.associated_objects=self.params['associated_objects']
-        if not (config['n_parts'] == len(config['associated_objects'])):
+        if config['n_parts'] != len(config['associated_objects']):
             raise ValueError(f'n_parts must be equal to the number of associated objects!!! {config["n_parts"], len(config["associated_objects"])}')
         self.has_been_set=False
         self.orientor = np.empty(shape=3, dtype=float)
-        self.type_part_dict=PartDictSafe({key: [] for key in Quadriplex.part_types.keys()})
-        Quadriplex.numInstances += 1
+        self.type_part_dict={key: [] for key in Quadriplex.part_types}
 
     def set_object(self,  pos, ori):
         '''
@@ -304,7 +301,7 @@ class Quadriplex(metaclass=Simulation_Object):
         '''
         if self.has_been_set:
             raise RuntimeError(f'object {self.__class__.__name__} with id {self.who_am_i} was attempted to be set but it already exists!!!')
-        if not (self.params['n_parts'] == 3):
+        if self.params['n_parts'] != 3:
             raise ValueError("a quadriplex can only be created from 3 quartets!!! ")
         if not (all([x.simulation_type==self.associated_objects[0].simulation_type for x in self.associated_objects[1:]])):
             raise ValueError('all objects must have the same simulation type!')
@@ -335,20 +332,18 @@ class Quadriplex(metaclass=Simulation_Object):
         part_hndl_a.add_exclusion(part_hndl_b.id)        
  
     def _bond_quartets_center_to_center(self):
-        if not (len(
-            self.associated_objects) == 3):
+        if len(self.associated_objects) != 3:
             raise ValueError("a quadriplex can only be created from 3 quartets!!! ")
-        if not (self.params['bonding_mode'] == 'ctc'):
+        if self.params['bonding_mode'] != 'ctc':
             raise RuntimeError('this method is only valid for center to center bonding!!!')
         self.bond_owned_part_pair(self.associated_objects[0].type_part_dict['real'][0], self.associated_objects[1].type_part_dict['real'][0])   
 
         self.bond_owned_part_pair(self.associated_objects[0].type_part_dict['real'][0], self.associated_objects[2].type_part_dict['real'][0])
 
     def _bond_quartets_corner_to_corner(self):
-        if not (len(
-            self.associated_objects) == 3):
+        if len(self.associated_objects) != 3:
             raise ValueError("a quadriplex can only be created from 3 quartets!!! ")
-        if not (self.params['bonding_mode'] == 'ftf'):
+        if self.params['bonding_mode'] != 'ftf':
             raise RuntimeError('this method is only valid for corner to corner bonding!!!')
         candidate1, candidate2, candidate3, pair_distances = self.associated_objects[
             0].corner_particles, self.associated_objects[1].corner_particles, self.associated_objects[2].corner_particles, []
@@ -394,8 +389,7 @@ class Quadriplex(metaclass=Simulation_Object):
                     (self.bending_potential_handle, top,  bottom))
 
     def mark_covalent_bonds(self, part_type=666):
-        if not (len(
-            self.associated_objects) == 3):
+        if len(self.associated_objects) != 3:
             raise ValueError("a quadriplex can only be created from 3 quartets!!! ")
         self.associated_objects[1].mark_covalent_corner(
             part_type=part_type)

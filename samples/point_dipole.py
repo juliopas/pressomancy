@@ -1,17 +1,10 @@
 import espressomd
-import espressomd.version
 import numpy as np
 
-from pressomancy.helper_functions import api_agnostic_feature_check
+from espressomd.magnetostatics import DipolarDirectSum
+from pressomancy.infra import api_agnostic_feature_check
 from pressomancy.magnetodynamics import required_features_for
 from pressomancy.simulation import Simulation, PointDipolePermanent, PointDipoleMagnetizable
-
-if espressomd.version.major() == 5:
-    from espressomd.magnetostatics import DipolarDirectSum
-elif espressomd.version.major() == 4:
-    from espressomd.magnetostatics import DipolarDirectSumCpu
-else:
-    raise RuntimeError(f"Unsupported ESPResSo version {espressomd.version}")
 
 MODEL = 'langevin'
 HAS_MAGNETIZABLE_FEATURES = all(
@@ -75,10 +68,7 @@ if HAS_MAGNETIZABLE_FEATURES:
         part_real.fix = [True, True, True]
 
     sim_inst.sys.thermostat.set_langevin(kT=1.0, gamma=1.0, seed=sim_inst.seed)
-    if espressomd.version.major() == 5:
-        sim_inst.init_magnetic_inter(DipolarDirectSum(prefactor=1))
-    else:
-        sim_inst.init_magnetic_inter(DipolarDirectSumCpu(prefactor=1))
+    sim_inst.init_magnetic_inter(DipolarDirectSum(prefactor=1))
 
     sim_inst.set_H_ext(H=[0, 0, H])
     sim_inst.sys.integrator.run(10)

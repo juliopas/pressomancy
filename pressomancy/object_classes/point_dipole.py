@@ -5,7 +5,7 @@ one of the native magnetization models in :mod:`pressomancy.magnetodynamics`),
 and ``PointDipoleSuperparamagnetic`` (dipm/kT-parameterized Langevin dipole).
 '''
 from pressomancy.object_classes.object_class import Simulation_Object, ObjectConfigParams
-from pressomancy.helper_functions import PartDictSafe, SinglePairDict
+from pressomancy.infra import TypeDictSafe, SimulationType
 from pressomancy.magnetodynamics import (COMMON_FEATURES, configure_magnetization,
                                          required_features_for, susceptibility_from_kT,
                                          validate_model)
@@ -16,9 +16,8 @@ class PointDipolePermanent(metaclass=Simulation_Object):
     '''
 
     required_features=['DIPOLES', 'ROTATION']
-    numInstances = 0
-    simulation_type= SinglePairDict('point_dipole_permanent', 3)
-    part_types = PartDictSafe({'pdp_real': 61})
+    simulation_type= SimulationType('point_dipole_permanent', 3)
+    part_types = TypeDictSafe({'pdp_real': 61})
     config = ObjectConfigParams(
          dipm=1.
     )
@@ -30,10 +29,9 @@ class PointDipolePermanent(metaclass=Simulation_Object):
         self.sys=config['espresso_handle']
         self.params=config
         self.associated_objects=config['associated_objects']
-        self.type_part_dict=PartDictSafe({key: [] for key in PointDipolePermanent.part_types.keys()})
-        if not (self.associated_objects is None):
+        self.type_part_dict={key: [] for key in PointDipolePermanent.part_types}
+        if self.associated_objects is not None:
             raise ValueError("Point dipoles can not have associated objects. They are singular particles, as basic as possible.")
-        PointDipolePermanent.numInstances += 1
 
     def set_object(self,  pos, ori):
         '''
@@ -64,9 +62,8 @@ class PointDipoleMagnetizable(metaclass=Simulation_Object):
     '''
 
     required_features=list(COMMON_FEATURES) + ['ROTATION']
-    numInstances = 0
-    simulation_type= SinglePairDict('point_dipole_magnetizable', 4)
-    part_types = PartDictSafe({'pdm_real': 62, 'pdm_virt': 622})
+    simulation_type= SimulationType('point_dipole_magnetizable', 4)
+    part_types = TypeDictSafe({'pdm_real': 62, 'pdm_virt': 622})
     config = ObjectConfigParams(
         magnetization_model='langevin',
         dipm_sat=1.,
@@ -82,10 +79,9 @@ class PointDipoleMagnetizable(metaclass=Simulation_Object):
         validate_model(config['magnetization_model'])
         self.required_features=required_features_for(config['magnetization_model'])
         self.associated_objects=config['associated_objects']
-        self.type_part_dict=PartDictSafe({key: [] for key in PointDipoleMagnetizable.part_types.keys()})
-        if not (self.associated_objects is None):
+        self.type_part_dict={key: [] for key in PointDipoleMagnetizable.part_types}
+        if self.associated_objects is not None:
             raise ValueError("Point dipoles can not have associated objects. They are singular particles, as basic as possible.")
-        PointDipoleMagnetizable.numInstances += 1
 
     def set_object(self,  pos, ori):
         '''
@@ -125,9 +121,8 @@ class PointDipoleSuperparamagnetic(metaclass=Simulation_Object):
     '''
 
     required_features=list(COMMON_FEATURES) + ['ROTATION']
-    numInstances = 0
-    simulation_type= SinglePairDict('point_dipole_superparamagnetic', 7)
-    part_types = PartDictSafe({'pds_real': 63, 'pds_virt': 633})
+    simulation_type= SimulationType('point_dipole_superparamagnetic', 7)
+    part_types = TypeDictSafe({'pds_real': 63, 'pds_virt': 633})
     config = ObjectConfigParams(
         magnetization_model='langevin',
         dipm=1.,
@@ -145,10 +140,9 @@ class PointDipoleSuperparamagnetic(metaclass=Simulation_Object):
         susceptibility_from_kT(config['dipm'], config['kT'])
         self.required_features=required_features_for(config['magnetization_model'])
         self.associated_objects=config['associated_objects']
-        self.type_part_dict=PartDictSafe({key: [] for key in PointDipoleSuperparamagnetic.part_types.keys()})
-        if not (self.associated_objects is None):
+        self.type_part_dict={key: [] for key in PointDipoleSuperparamagnetic.part_types}
+        if self.associated_objects is not None:
             raise ValueError("Point dipoles can not have associated objects. They are singular particles, as basic as possible.")
-        PointDipoleSuperparamagnetic.numInstances += 1
 
     def set_object(self,  pos, ori):
         '''

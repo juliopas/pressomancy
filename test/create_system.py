@@ -75,3 +75,8 @@ class BoxTestCase(BaseTestCase):
 
 sim_inst = Simulation(box_dim=BaseTestCase.box_dim)
 sim_inst.set_sys(min_global_cut=BaseTestCase.min_global_cut)
+
+
+def bonds_using(handle):
+    """The number of ``part.bonds`` entries, over every particle, whose bond is the espresso bond ``handle``."""
+    return sum(bond[0] == handle for part in sim_inst.sys.part.all() for bond in part.bonds)

@@ -4,7 +4,8 @@ plus a fixed arrangement of virtual sites loaded from a geometry file in
 :mod:`pressomancy.resources`, related to the CoM via ``vs_relative``.
 '''
 from pressomancy.object_classes.object_class import Simulation_Object, ObjectConfigParams
-from pressomancy.helper_functions import PartDictSafe, SinglePairDict, load_coord_file
+from pressomancy.infra import TypeDictSafe, SimulationType
+from pressomancy.geometry import load_coord_file
 import os
 import numpy as np
 
@@ -37,12 +38,9 @@ class GenericRigidObj(metaclass=Simulation_Object):
     Attributes
     ----------
     required_features : ``['VIRTUAL_SITES_RELATIVE']``.
-    numInstances : int
-        Monotonic id allocator (number of instances ever constructed); the
-        metaclass uses it to assign ``who_am_i`` and never rolls it back.
-    simulation_type : SinglePairDict
+    simulation_type : SimulationType
         Object type identifier (name and integer code).
-    part_types : PartDictSafe instance containing ('real', 'virt').
+    part_types : TypeDictSafe instance containing ('real', 'virt').
     config : ObjectConfigParams
         Copy of the provided configuration with ``n_parts`` populated.
     params : ObjectConfigParams
@@ -54,7 +52,7 @@ class GenericRigidObj(metaclass=Simulation_Object):
     who_am_i : int
         Per-instance ordinal ID, assigned by the ``Simulation_Object`` metaclass
         once construction has succeeded.
-    type_part_dict : PartDictSafe
+    type_part_dict : dict
         Mutable mapping of part-type names to lists of particle handles created
         by this object.
 
@@ -88,13 +86,12 @@ class GenericRigidObj(metaclass=Simulation_Object):
     """
 
     required_features = ['VIRTUAL_SITES_RELATIVE', 'ROTATION']
-    numInstances = 0
     _resources_dir = os.path.join(os.path.dirname(__file__), '..', 'resources')
     _resource_file: dict = {}
     _reference_sheet: dict = {}
 
-    simulation_type = SinglePairDict('generic_rigid_object', 68)
-    part_types = PartDictSafe({'real': 1, 'virt': 2})
+    simulation_type = SimulationType('generic_rigid_object', 68)
+    part_types = TypeDictSafe({'real': 1, 'virt': 2})
     config = ObjectConfigParams(
         n_parts=None,
         alias='raspberry_sphere'
@@ -118,7 +115,7 @@ class GenericRigidObj(metaclass=Simulation_Object):
         AssertionError
             If ``config['alias']`` is ``None``.
         """
-        if not (config['alias'] is not None):
+        if config['alias'] is None:
             raise ValueError('Generic rigid object must have an alias; it is used to locate the '
             'reference geometry file in resources!')
         alias = config['alias']
@@ -128,7 +125,8 @@ class GenericRigidObj(metaclass=Simulation_Object):
         if existing_path is None:
             path = os.path.join(self._resources_dir, f"{alias}.txt")
             GenericRigidObj._resource_file[alias] = path
-            GenericRigidObj._reference_sheet[alias] = load_coord_file(path)
+            # row 0 is the real CoM particle at the body origin; the file lists only the virtual sites
+            GenericRigidObj._reference_sheet[alias] = np.vstack([np.zeros(3), load_coord_file(path)])
 
         # Compute n_parts from cached reference coordinates
         config['n_parts'] = len(GenericRigidObj._reference_sheet[alias])
@@ -136,10 +134,7 @@ class GenericRigidObj(metaclass=Simulation_Object):
         self.params = config
         self.sys = config['espresso_handle']
         self.associated_objects = config['associated_objects']
-        self.type_part_dict = PartDictSafe(
-            {key: [] for key in GenericRigidObj.part_types.keys()}
-        )
-        GenericRigidObj.numInstances += 1
+        self.type_part_dict = {key: [] for key in GenericRigidObj.part_types}
 
     def set_object(self, pos, ori):
         """

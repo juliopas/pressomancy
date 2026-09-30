@@ -3,7 +3,7 @@
 '''
 from pressomancy.object_classes.part_class import GenericPart
 from pressomancy.object_classes.object_class import ObjectConfigParams
-from pressomancy.helper_functions import PartDictSafe, SinglePairDict
+from pressomancy.infra import TypeDictSafe, SimulationType
 
 class Crowder(GenericPart):
 
@@ -12,9 +12,8 @@ class Crowder(GenericPart):
     '''
     
     required_features=GenericPart.required_features
-    numInstances = 0
-    simulation_type= SinglePairDict('crowder', 5)
-    part_types = PartDictSafe({'crowder': 5})
+    simulation_type= SimulationType('crowder', 5)
+    part_types = TypeDictSafe({'crowder': 5})
     config = ObjectConfigParams()
 
     def __init__(self, config: ObjectConfigParams):

@@ -8,21 +8,25 @@ import numpy as np
 import random
 from itertools import product, pairwise
 from pressomancy.object_classes.object_class import Simulation_Object, ObjectConfigParams
-from pressomancy.helper_functions import RoutineWithArgs, make_centered_rand_orient_point_array, PartDictSafe, SinglePairDict, BondWrapper, get_orientation_vec
+from pressomancy.infra import RoutineWithArgs, TypeDictSafe, SimulationType, BondWrapper
+from pressomancy.geometry import make_centered_rand_orient_point_array, get_orientation_vec
 import logging
 import warnings
 
 class Filament(metaclass=Simulation_Object):
     '''
     Class that contains filament relevant parameters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instance there will be only one type of a Filament. Therefore many relevant parameters are class specific, not instance specific.
+
+    `config['sigma']` is the monomers' LJ sigma, used to put the anchors at +/- sigma/2; it does not set interactions.
     '''
     required_features=['DIPOLES', 'VIRTUAL_SITES_RELATIVE', 'ROTATION']
-    numInstances = 0
-    simulation_type=SinglePairDict('filament', 54)
-    part_types = PartDictSafe({'real': 1, 'virt': 2})
+    simulation_type=SimulationType('filament', 54)
+    part_types = TypeDictSafe({'real': 1, 'virt': 2})
     config = ObjectConfigParams(
         bond_handle=BondWrapper(espressomd.interactions.FeneBond(k=0, r_0=0, d_r_max=0)),
-        spacing=None,)
+        spacing=None,
+        dip_magnitude=None,
+        sigma=1,)
 
     def __init__(self, config: ObjectConfigParams):
         '''
@@ -43,8 +47,8 @@ class Filament(metaclass=Simulation_Object):
         else:
             self.build_function.monomer_size=self.associated_objects[0].params['size']
         self.orientor = np.empty(shape=3, dtype=float)
-        self.type_part_dict=PartDictSafe({key: [] for key in Filament.part_types.keys()})
-        Filament.numInstances += 1
+        self.type_part_dict={key: [] for key in Filament.part_types}
+        self.dip_magnitude = config['dip_magnitude']
 
     def set_object(self,  pos, ori):
         '''
@@ -132,7 +136,7 @@ class Filament(metaclass=Simulation_Object):
 
         '''
         self.magnetizable_virts=[]
-        Filament.dip_magnitude = dip_magnitude
+        self.dip_magnitude = dip_magnitude
         handles=[]
         self.__class__.part_types.update({'to_be_magnetized': 3})
         if self.associated_objects!=None:
@@ -143,22 +147,31 @@ class Filament(metaclass=Simulation_Object):
         else:
             handles = self.type_part_dict[type_name]
         for pp in handles:
-            p_hndl=self.add_particle(type_name='to_be_magnetized', pos=pp.pos,dip=Filament.dip_magnitude*pp.director, rotation=(False, False, False))
+            p_hndl=self.add_particle(type_name='to_be_magnetized', pos=pp.pos,dip=self.dip_magnitude*pp.director, rotation=(False, False, False))
             p_hndl.vs_auto_relate_to(pp)
             self.magnetizable_virts.append(p_hndl.id)
 
-    def add_dipole_to_type(self, type_name, dip_magnitude=1.):
+    def add_dipole_to_type(self, type_name, dip_magnitude=None):
         '''
         Adds dipoles to real particles.
 
-        :param dip_magnitude: float | magnitude of the dipole moment to be assigned using the part.director unit vector. Default=1.
+        :param dip_magnitude: float | magnitude of the dipole moment to be assigned using the
+            part.director unit vector. If omitted, the instance's `dip_magnitude` (set at
+            construction from config, or by a prior `add_dipole_to_embedded_virt` call) is used.
         :return: None
+        :raises ValueError: if no magnitude was given here and none is set on the instance.
 
         '''
-        Filament.dip_magnitude = dip_magnitude
+        if dip_magnitude is not None:
+            self.dip_magnitude = dip_magnitude
+        if self.dip_magnitude is None:
+            raise ValueError(
+                "dip_magnitude was not passed and Filament.dip_magnitude is not set; "
+                "pass dip_magnitude explicitly, set it via config, or call "
+                "add_dipole_to_embedded_virt first.")
         handles = self.type_part_dict[type_name]
         for x in handles:
-            x.dip = Filament.dip_magnitude*x.director
+            x.dip = self.dip_magnitude*x.director
 
     def bond_center_to_center(self, type_name):
         
@@ -189,10 +202,10 @@ class Filament(metaclass=Simulation_Object):
         :param type_name: particle type key to select from each associated object
         :type type_name: str
         '''
+        if self.associated_objects is None:
+            raise RuntimeError('self.associated_objects must not be None for this method ot work correctly')
         if not (all([type_name in x.part_types.keys() for x in self.associated_objects])):
             raise KeyError('type key must exist in the part_types of all associated monomers!')
-        if not (self.associated_objects != None):
-            raise RuntimeError('self.associated_objects must not be None for this method ot work correctly')
         len_sq=pow(self.associated_objects[0].params['n_parts'],2)
         for el1,el2 in pairwise(self.associated_objects):
             el1_pos=np.mean([x.pos for x in el1.type_part_dict['real']],axis=0)
@@ -239,7 +252,13 @@ class Filament(metaclass=Simulation_Object):
         
     def bond_quadriplexes(self, mode='hinge'):
         '''
-        associated_objects contains monomer objects (assume quadriplex). We add corner particles in each quadriplex pair to a pool of candidate corners: candidate1 and candidate2. Finally checks which corner pairs have a distance self.params['sigma']-2*fene_r0. Relies on np.isclose().
+        associated_objects contains monomer objects (assumed to be Quadriplex). For each
+        consecutive quadriplex pair (quadriplex[i], quadriplex[i+1]), pools the corner particles
+        of quartets associated_objects[1] and associated_objects[2] of quadriplex[i] into
+        candidate1, and the same two quartets' corners of quadriplex[i+1] into candidate2, then
+        bonds the candidate1/candidate2 corner pairs whose distance equals (np.isclose) the FENE
+        r_0 of quadriplex[i]'s own bond_handle (the earlier quadriplex of the pair): one random
+        such pair for mode='hinge', all of them for mode='all'.
         :return: None
 
         '''

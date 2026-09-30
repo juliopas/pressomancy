@@ -4,7 +4,8 @@ rigid-bond constraints and intramolecular exclusions.
 '''
 import espressomd
 import os
-from pressomancy.helper_functions import load_coord_file, PartDictSafe, SinglePairDict, align_vectors,BondWrapper
+from pressomancy.infra import TypeDictSafe, SimulationType, BondWrapper
+from pressomancy.geometry import load_coord_file, align_vectors
 import numpy as np
 from pressomancy.object_classes.object_class import Simulation_Object, ObjectConfigParams
 
@@ -15,17 +16,15 @@ class OTP(metaclass=Simulation_Object):
     Class that contains OTP relevant parameters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instance there will be only one type of a OTP. Therefore many relevant parameters are class specific, not instance specific.
     '''
     required_features=['EXCLUSIONS']
-    numInstances = 0
 
     _resources_dir = os.path.join( os.path.dirname(__file__), '..', 'resources')
     _resource_file = os.path.join(_resources_dir, 'otp_coordinates.txt')
-    _reference_sheet = load_coord_file(_resource_file)[1:]
+    _reference_sheet = load_coord_file(_resource_file)
     _reference_sheet-=np.mean(_reference_sheet, axis=0)
-    simulation_type= SinglePairDict('otp', 6)
-    part_types = PartDictSafe(simulation_type)
+    simulation_type= SimulationType('otp', 6)
+    part_types = TypeDictSafe([simulation_type])
     config = ObjectConfigParams(
         n_parts=len(_reference_sheet),
-        sigma=0.483,
         long_side=0.7191944807239401,
         rig_bond_long = BondWrapper(espressomd.interactions.RigidBond(r=0.7191944807239401, ptol=1e-12, vtol=1e-12)), 
         rig_bond_short = BondWrapper(espressomd.interactions.RigidBond(r=0.483, ptol=1e-12, vtol=1e-12))
@@ -36,15 +35,14 @@ class OTP(metaclass=Simulation_Object):
         '''
         Initialisation of an OTP object requires the specification of particle size and a handle to the espresso system
         '''
-        if not (config['n_parts'] == len(OTP._reference_sheet)):
+        if config['n_parts'] != len(OTP._reference_sheet):
             raise ValueError('n_parts must be equal to the number of parts in the reference sheet!!!')
         self.sys=config['espresso_handle']
         self.params=config
         self.realz_indices = []
         self.virts_indices = []
         self.associated_objects=self.params['associated_objects']        
-        self.type_part_dict=PartDictSafe({key: [] for key in OTP.part_types.keys()})
-        OTP.numInstances += 1
+        self.type_part_dict={key: [] for key in OTP.part_types}
 
     def set_object(self,  pos, ori):
         '''

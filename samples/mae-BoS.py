@@ -1,12 +1,7 @@
 import espressomd
-import espressomd.version
-from pressomancy.helper_functions import api_agnostic_feature_check
-if espressomd.version.major()==5:
-    from espressomd.magnetostatics import DipolarDirectSum
-elif espressomd.version.major()==4:
-    from espressomd.magnetostatics import DipolarDirectSumCpu
-else:
-    raise ImportError(f"Unsupported ESPResSo version: {espressomd.version}. Please use version 4 or 5.")
+from espressomd.magnetostatics import DipolarDirectSum
+from pressomancy.infra import api_agnostic_feature_check
+from pressomancy.geometry import WCA_CONTACT_FACTOR
 
 espressomd.assert_features(['WCA', 'ROTATION', 'DIPOLES', 'DP3M',
                             'VIRTUAL_SITES', 'VIRTUAL_SITES_RELATIVE',
@@ -38,7 +33,7 @@ MAE_LAYER_HEIGHT_parts = sim_params['HEIGHT'] # in part size units
 N_M_FULL_BOX = sim_params['N_FULL_BOX']
 
 SIGMA_PART = 1.
-SIZE_PART = SIGMA_PART*pow(2, 1/6)  # in sim_inst units
+SIZE_PART = SIGMA_PART*WCA_CONTACT_FACTOR  # in sim_inst units
 
 R_PART= SIZE_PART/2
 
@@ -84,7 +79,7 @@ if HAS_MAGNETIZABLE_FEATURES:
 associated_objects.extend([PointDipolePermanent(config=config_pdp) for _ in range(n_pdp)])
 steric_keys.append("pdp_real")
 assert len(associated_objects) == N_PART
-config_E = Elastomer.config.specify(layer_height=MAE_LAYER_HEIGHT, n_parts=N_PART, associated_objects=associated_objects, bond_K_lims=BOND_LIMITS_A, size=SIZE_PART, sigma=SIGMA_PART, espresso_handle=sim_inst.sys, seed=sim_inst.seed)
+config_E = Elastomer.config.specify(layer_height=MAE_LAYER_HEIGHT, n_parts=N_PART, associated_objects=associated_objects, bond_K_lims=BOND_LIMITS_A, sigma=SIGMA_PART, espresso_handle=sim_inst.sys, seed=sim_inst.seed)
 elastomer=[Elastomer(config=config_E) for _ in range(1)]
 sim_inst.store_objects(elastomer)
 sim_inst.set_objects(elastomer)
@@ -103,10 +98,7 @@ elastomer.cure_elastomer()
 
 # Add magnetic dipole interactions - direct sum, non-preiodic in z
 sim_inst.sys.periodicity = [True, True, False]
-if espressomd.version.major()==5:
-    sim_inst.init_magnetic_inter(DipolarDirectSum(prefactor=1))
-else:
-    sim_inst.init_magnetic_inter(DipolarDirectSumCpu(prefactor=1))
+sim_inst.init_magnetic_inter(DipolarDirectSum(prefactor=1))
 sim_inst.sys.integrator.run(0)
 
 # STABILIZE MAE WITH MAGNETIC FIELD

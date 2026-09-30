@@ -5,7 +5,7 @@ properties (rotational inertia, mass) on top of ``GenericRigidObj``.
 import numpy as np
 from pressomancy.object_classes.object_class import ObjectConfigParams
 from pressomancy.object_classes.rigid_obj import GenericRigidObj
-from pressomancy.helper_functions import PartDictSafe
+from pressomancy.infra import TypeDictSafe
 
 class RaspberrySphere(GenericRigidObj):
 
@@ -13,15 +13,13 @@ class RaspberrySphere(GenericRigidObj):
     Class that contains RaspberrySphere relevant parameters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instance there will be only one type of a RaspberrySphere. Therefore many relevant parameters are class specific, not instance specific.
     '''
     required_features = GenericRigidObj.required_features + ['MASS', 'ROTATIONAL_INERTIA']
-    numInstances = 0
-    part_types = PartDictSafe()
+    part_types = TypeDictSafe()
     config=ObjectConfigParams(
         alias='raspberry_sphere'
     )
 
     def __init__(self, config: ObjectConfigParams):
         super().__init__(config)
-        RaspberrySphere.numInstances += 1
 
     def set_hydrod_props(self,rot_inertia ,mass):
         for part in self.type_part_dict['real']:

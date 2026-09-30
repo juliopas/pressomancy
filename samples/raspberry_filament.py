@@ -1,5 +1,5 @@
 from pressomancy.simulation import Simulation, RaspberrySphere, Filament
-from pressomancy.helper_functions import BondWrapper, api_agnostic_feature_check
+from pressomancy.infra import BondWrapper, api_agnostic_feature_check
 import espressomd
 box_dim=(100,100,100)
 sim_inst = Simulation(box_dim=box_dim)
@@ -7,7 +7,7 @@ sim_inst.set_sys(timestep=0.001)
 no_obj=20
 part_per_fil=10
 rasp_sigm=3
-raspberries_config=RaspberrySphere.config.specify(sigma=1, size=rasp_sigm, espresso_handle=sim_inst.sys)
+raspberries_config=RaspberrySphere.config.specify(size=rasp_sigm, espresso_handle=sim_inst.sys)
 raspberries= [RaspberrySphere(config=raspberries_config) for x in range(no_obj)]
 sim_inst.store_objects(raspberries)
 

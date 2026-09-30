@@ -602,7 +602,7 @@ def partition_cubic_volume_oriented_rectangles(box_dim, num_spheres, small_box_d
         for i in range(1, len(sphere_centers), 2):
             sphere_centers[i, 2] = box_dim[2] - 0.5 * z_len
 
-    if not (len(sphere_centers) >= num_spheres):
+    if len(sphere_centers) < num_spheres:
         raise ValueError('Must be enough possible volumes. Introduce a scaling factor.')
 
     take_index = np.arange(len(sphere_centers))
@@ -812,7 +812,9 @@ def add_box_constraints_func(sys, wall_type=0, wall_epsilon=1E6, sides=['all'], 
             - 'no-<side>': exclude specific sides, e.g., 'no-top', 'no-right', 'no-sides'.
     inter : str or list of str, optional
         Type(s) of interaction to enable between wall and specified particle types. Currently supports:
-            - 'wca': Weeks-Chandler-Andersen potential with large epsilon.
+            - 'wca': Weeks-Chandler-Andersen potential with large epsilon (`wall_epsilon`) and, for each
+              type, half that type's own WCA sigma, so a particle stops at its contact radius
+              ``WCA_CONTACT_FACTOR * sigma / 2`` from the wall.
     types_ : list of int, optional
         Particle types that will interact with the walls. If None, all non-wall types in the system are used.
     object_types : list of type, optional
@@ -928,9 +930,10 @@ def add_box_constraints_func(sys, wall_type=0, wall_epsilon=1E6, sides=['all'], 
 
         if 'wca' in inter:
             for type_ in types_:
-                # Dividing by WCA_CONTACT_FACTOR is what keeps particles sitting at
-                # their equilibrium distance from the wall instead of a stiff overlap.
-                sigma = sys.non_bonded_inter[type_,type_].wca.sigma/2 / WCA_CONTACT_FACTOR
+                # Half the type's own sigma: the wall's zero-force distance is then
+                # WCA_CONTACT_FACTOR * sigma_tt / 2, the particle's contact radius, the same
+                # distance at which two such particles touch.
+                sigma = sys.non_bonded_inter[type_,type_].wca.sigma/2
                 if sigma < 0.001:
                     warnings.warn(f"Interaction of type {type_} with wall is 0, has these particles have no interaction defined. If you would like to have no interactions between particles, but only with wall, then hange this function or do it with normal espresso constraints.")
                 sys.non_bonded_inter[wall_type,type_].wca.set_params(epsilon=wall_epsilon, sigma=sigma)

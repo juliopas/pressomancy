@@ -11,7 +11,8 @@ import random
 from pressomancy.object_classes.quadriplex_class import *
 from pressomancy.object_classes.object_class import Simulation_Object, ObjectConfigParams
 from pressomancy.object_classes.rigid_obj import GenericRigidObj
-from pressomancy.helper_functions import RoutineWithArgs, make_centered_rand_orient_point_array, PartDictSafe, SinglePairDict, BondWrapper, get_orientation_vec, get_perpendicular, align_vectors, load_coord_file
+from pressomancy.infra import RoutineWithArgs, TypeDictSafe, SimulationType, BondWrapper
+from pressomancy.geometry import make_centered_rand_orient_point_array, get_orientation_vec, get_perpendicular, align_vectors, load_coord_file
 import logging
 import warnings
 
@@ -68,16 +69,15 @@ def _geometric_corner_local_ids(alias):
     ``Quartet.set_object`` uses to build ``corner_particles`` (both read the
     distance from ``Quartet.CORNER_DIAGONAL``, so there is one definition).
 
-    Reads ``resources/<alias>.txt`` directly (via ``load_coord_file``, which
-    staples the CoM particle in at local index 0, matching how
-    ``GenericRigidObj``/``Quartet`` load it), rather than relying on a live
+    Reads ``resources/<alias>.txt`` directly and puts the CoM particle at
+    local index 0, as ``GenericRigidObj`` does, rather than relying on a live
     ``Quartet`` instance, so no espresso system is needed.
 
     :param alias: str | a Quartet resource-file alias (e.g. 'quartet')
     :return: set(int) | local indices of the geometric corner particles
     """
     path = os.path.join(GenericRigidObj._resources_dir, f"{alias}.txt")
-    sheet = load_coord_file(path)
+    sheet = np.vstack([np.zeros(3), load_coord_file(path)])
     separations = np.linalg.norm(sheet[:, None, :] - sheet[None, :, :], axis=-1)
     rows, cols = np.nonzero(np.isclose(separations, Quartet.CORNER_DIAGONAL, atol=1e-6))
     return set(rows.tolist()) | set(cols.tolist())
@@ -211,9 +211,8 @@ class TelSeq(metaclass=Simulation_Object):
     Class that contains TelSeq relevant parameters and methods. At construction one must pass an espresso handle because the class manages parameters that are both internal and external to espresso. It is assumed that in any simulation instance there will be only one type of a TelSeq. Therefore many relevant parameters are class specific, not instance specific.
     '''
     required_features=['MORSE',]
-    numInstances = 0
-    simulation_type=SinglePairDict('tel_seq', 37)
-    part_types = PartDictSafe({'real': 1, 'virt': 2,'to_be_magnetized':3})
+    simulation_type=SimulationType('tel_seq', 37)
+    part_types = TypeDictSafe({'real': 1, 'virt': 2,'to_be_magnetized':3})
     config = ObjectConfigParams(
         bond_handle=BondWrapper(espressomd.interactions.FeneBond(k=0, r_0=0, d_r_max=0)),
         diag_bond_handle=BondWrapper(espressomd.interactions.FeneBond(k=0, r_0=0, d_r_max=0)),
@@ -227,7 +226,7 @@ class TelSeq(metaclass=Simulation_Object):
         Initialisation of a TelSeq object requires the specification of particle size, number of parts and a handle to the espresso system
         '''
         self.sys=config['espresso_handle']
-        if not (config['type'] in ['parallel', 'antiparallel','hybrid']):
+        if config['type'] not in ['parallel', 'antiparallel','hybrid']:
             raise ValueError('type must be either parallel, antiparallel or hybrid!!!')
         self.params=config
         if self.params['associated_objects'] is None:
@@ -242,8 +241,7 @@ class TelSeq(metaclass=Simulation_Object):
 
         self.build_function=RoutineWithArgs(func=make_centered_rand_orient_point_array,num_monomers=self.params['n_parts'],spacing=config['spacing'])
         self.orientor = np.empty(shape=3, dtype=float)
-        self.type_part_dict=PartDictSafe({key: [] for key in TelSeq.part_types.keys()})
-        TelSeq.numInstances += 1
+        self.type_part_dict={key: [] for key in TelSeq.part_types}
 
     def _choose_antiparallel_phi(self, chain_dir, n_phi=720):
         chain_dir = np.asarray(chain_dir, dtype=float)
@@ -280,8 +278,7 @@ class TelSeq(metaclass=Simulation_Object):
             pos) == self.params['n_parts'], 'there is a missmatch between the pos lenth and TelSeq n_parts'
         self.orientor = get_orientation_vec(pos)
 
-        if not (self.params['n_parts'] == len(
-            self.associated_objects)):
+        if self.params['n_parts'] != len(self.associated_objects):
             raise ValueError(" there doesn't seem to be enough monomers stored!!! ")
         if not (all([x.simulation_type==self.associated_objects[0].simulation_type for x in self.associated_objects[1:]])):
             raise ValueError('all objects must have the same simulation type!')
@@ -295,7 +292,7 @@ class TelSeq(metaclass=Simulation_Object):
 
     def wrap_into_Tel(self):
         '''
-        associated_objects contains monomer objects (assume quadriplex). We add corner particles in each quadriplex pair to a pool of candidate corners: candidate1 and candidate2. Finally checks which corner pairs have a distance self.params['sigma']-2*fene_r0. Relies on np.isclose().
+        associated_objects contains monomer objects (assume quadriplex). For each quadriplex, bonds its corner particles by the fold rule of params['type'] (diag_bond_handle/across_bond_handle), then bonds the rule's free end (or its start corner, whichever is closer) to the nearest corner of the next quadriplex, which becomes that quadriplex's start corner.
         :return: None
 
         '''

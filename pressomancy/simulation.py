@@ -272,7 +272,7 @@ class Simulation():
         temp_dict={}
         try:
             for element in iterable_list:
-                if element.params['associated_objects'] != None:
+                if element.params['associated_objects'] is not None:
                     check_any=any(associated in self.objects for associated in element.params['associated_objects'])
                     if check_any:
                         check_all=all(associated in self.objects for associated in element.params['associated_objects'])
@@ -280,7 +280,7 @@ class Simulation():
                             raise ValueError(f"Some associated objects {element.params['associated_objects']} but not all associated objects are stored in the simulation. This is a sign that smth major is fucked...Suffer in silence.")
                     else:
                         self.store_objects(element.params['associated_objects'],report=False)
-                if not (element not in self.objects):
+                if element in self.objects:
                     raise ValueError("Lists have common elements!")
                 self.sanity_check(element)
                 element.modify_system_attribute = self.modify_system_attribute
@@ -505,8 +505,7 @@ class Simulation():
         :return: None
         :raises ValueError: If the lengths of `pairs`, `wca_eps`, and `sigma` do not match.
         """
-        if not (len(pairs) == len(wca_eps) and len(pairs) == len(
-            sigma)):
+        if not (len(pairs) == len(wca_eps) == len(sigma)):
             raise ValueError('epsilon and sigma must be specified explicitly for each type pair')
         logging.info('WCA interactions initiated')
         for (key_el, key_el2), eps, sgm in zip(pairs, wca_eps, sigma):
@@ -546,8 +545,7 @@ class Simulation():
         :raises ValueError: If the lengths of `pairs`, `lj_eps`, and `lj_sigma` are not equal.
         """
 
-        if not (len(pairs) == len(lj_eps) and len(pairs) == len(
-            lj_sigma)):
+        if not (len(pairs) == len(lj_eps) == len(lj_sigma)):
             raise ValueError('epsilon and sigma must be specified explicitly for each type pair')
         if lj_cutoffs is None:
             for (key_el, key_el2), eps, sgm in zip(pairs, lj_eps, lj_sigma):
@@ -555,7 +553,7 @@ class Simulation():
                 self.sys.non_bonded_inter[self.part_types[key_el], self.part_types[key_el2]].lennard_jones.set_params(
                     epsilon=eps, sigma=sgm, cutoff=lj_cut, shift=0, min=r_min)
         else:
-            if not (len(pairs) == len(lj_cutoffs)):
+            if len(pairs) != len(lj_cutoffs):
                 raise ValueError('cutoffs must be specified explicitly for each type pair')
             for (key_el, key_el2), eps, sgm, cut in zip(pairs, lj_eps, lj_sigma, lj_cutoffs):
                 self.sys.non_bonded_inter[self.part_types[key_el], self.part_types[key_el2]].lennard_jones.set_params(

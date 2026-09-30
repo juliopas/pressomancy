@@ -9,7 +9,7 @@ class- and instance-level attributes on every object class (see
 (``__eq__``/``__hash__``/``__iter__``/``__del__``), and ``ObjectConfigParams``,
 a locked-key ``dict`` subclass used for per-class default configuration.
 '''
-from pressomancy.helper_functions import RoutineWithArgs, PartDictSafe, SinglePairDict
+from pressomancy.infra import RoutineWithArgs, TypeDictSafe, SimulationType
 import types
 from functools import partial
 import logging
@@ -17,6 +17,7 @@ import espressomd
 import itertools
 import numpy as np
 import sys
+import weakref
 
 def _generic_type_exception(scope, name, attribute_name, expected_type):
     raise NotImplementedError(
@@ -27,6 +28,34 @@ def _generic_type_exception(scope, name, attribute_name, expected_type):
 # Create partials for class and instance exceptions
 generic_type_exception = partial(_generic_type_exception, "class")
 generic_type_exception_inst = partial(_generic_type_exception, "instance")
+
+SIMULATION_TYPE_OWNERS = {}
+
+
+def _register_simulation_type(name, simulation_type):
+    """Validate a freshly declared `simulation_type` and keep the pairs unique.
+
+    Raises `TypeError` if the pair is not `str` -> `int` (`bool` is not an `int`
+    here), and `ValueError` if another class already declared the same name or
+    the same number -- both are written into HDF5 output, so a collision makes two
+    object classes indistinguishable on read-back.
+    """
+    key, value = simulation_type.key, simulation_type.value
+    if not isinstance(key, str) or not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(
+            f"simulation_type of '{name}' must be a SimulationType(key: str, value: int), "
+            f"got SimulationType({key!r}, {value!r})."
+        )
+    for other_name, other in SIMULATION_TYPE_OWNERS.items():
+        if other_name == name:
+            continue
+        if other.key == key or other.value == value:
+            raise ValueError(
+                f"simulation_type {tuple(simulation_type)} of '{name}' clashes with "
+                f"{tuple(other)} of '{other_name}': the name and the number must both be "
+                f"unique across simulation object classes."
+            )
+    SIMULATION_TYPE_OWNERS[name] = simulation_type
 
 def generic_modify_system_attribute(self, clas_self, attribute_name,action):
     raise NotImplementedError('the reference to a manager class has not been set')
@@ -66,23 +95,30 @@ class Simulation_Object(type):
     --------------------------------
     - `required_features` : list
         List of required features for the simulation object.
-    - `numInstances` : int
-        Number of instances of the class ever *created*. Declare it as ``0``;
-        each subclass is responsible for incrementing it in its own `__init__`,
-        and the metaclass decrements it in `_del` as instances are garbage
-        collected.
-    - `part_types` : PartDictSafe
-        Dictionary-like object mapping particle types to their identifiers.
-    - `simulation_type` : SinglePairDict
-        A single key-value pair representing the type of simulation object.
+    - `part_types` : TypeDictSafe
+        Strict `str` -> `int` map of particle type name to numeric espresso type.
+    - `simulation_type` : SimulationType
+        The `(name, number)` pair naming the object class. A class that declares one
+        must not reuse the name or the number of another class (`ValueError`); a
+        subclass may inherit its base's pair instead of declaring one.
     - `config` : ObjectConfigParams
-        Locked-key default configuration for the class.
+        Locked-key default configuration for the class. Its `size` default should bound the
+        class's default geometry; see `ObjectConfigParams`.
 
     Metaclass-Managed Class Attributes
     ----------------------------------
-    - `live_instances` : int
-        Number of instances of the class currently alive. Maintained by
-        `__call__`/`_del`; do not declare it in a subclass.
+    - `numInstances` : int
+        Number of instances of the class ever *created*. Owned by the metaclass:
+        initialised to ``0`` per class in `__init__` and incremented in `__call__`;
+        never decremented, so it stays a monotonic creation count. Do not declare
+        or increment it in a subclass.
+    - `live_instances` : weakref.WeakSet
+        The *population* of instances of the class currently alive. A
+        `weakref.WeakSet` rather than a plain count/list, so an instance
+        disappears from it on its own once nothing else references it, with no
+        explicit decrement needed. Initialised per class in `__init__` (so
+        subclasses do not share one set with their base); populated in
+        `__call__`. Do not declare it in a subclass.
     - `instance_id_counter` : int
         Monotonic id allocator: defaults to ``0`` and is owned by the metaclass
         from then on, incrementing on every `__call__` and never rolling back,
@@ -95,8 +131,9 @@ class Simulation_Object(type):
         Unique identifier for the instance. Assigned by the metaclass from
         `instance_id_counter` once `__init__` has returned successfully; subclasses must
         *not* set it themselves.
-    - `type_part_dict` : PartDictSafe
-        Tracks particle handles grouped by type.
+    - `type_part_dict` : dict
+        Tracks particle handles grouped by type name; a plain dict, whose lists a
+        late-registered type name gets through `setdefault`.
     - `associated_objects` : list
         List of related simulation objects, if any.
 
@@ -169,9 +206,8 @@ class Simulation_Object(type):
             cls.__del__ = Simulation_Object._del
         required_attributes = {
             "required_features": list,
-            "numInstances": int,
-            "part_types": PartDictSafe,
-            "simulation_type": SinglePairDict,
+            "part_types": TypeDictSafe,
+            "simulation_type": SimulationType,
             "config": ObjectConfigParams,
         }
         for attr, expected_type in required_attributes.items():
@@ -181,9 +217,14 @@ class Simulation_Object(type):
             elif not isinstance(getattr(cls, attr), expected_type):
                 generic_type_exception(name, attr, expected_type)
 
+        if "simulation_type" in class_dict:
+            _register_simulation_type(name, cls.simulation_type)
+
         if "instance_id_counter" not in class_dict:
             cls.instance_id_counter = 0
-        cls.live_instances = 0
+        # Owned by the metaclass, one per class (not shared with a base's dict entry).
+        cls.numInstances = 0
+        cls.live_instances = weakref.WeakSet()
 
         # Merge ObjectConfigParams from base classes
         merged_config_data = {}
@@ -191,12 +232,12 @@ class Simulation_Object(type):
             merged_config_data.update(base.config)
         merged_config_data.update(class_dict["config"])
         cls.config = ObjectConfigParams(**merged_config_data)
-         # Merge PartDictSafe from base classes
+         # Merge part_types from base classes
         merged_config_data = {}
         for base in bases:
             merged_config_data.update(base.part_types)
         merged_config_data.update(class_dict["part_types"])
-        cls.part_types = PartDictSafe(**merged_config_data)
+        cls.part_types = TypeDictSafe(merged_config_data)
 
 
     def __call__(cls, *args, **kwargs):
@@ -225,8 +266,8 @@ class Simulation_Object(type):
         instance = super().__call__(*args, **kwargs)
         instance.who_am_i = cls.instance_id_counter
         cls.instance_id_counter += 1
-        cls.live_instances += 1
-        instance._is_live = True
+        cls.numInstances += 1
+        cls.live_instances.add(instance)
         # Assign the build_function to the class if it does not already have one
 
         helper_set_attribute(instance,"build_function",RoutineWithArgs())
@@ -238,7 +279,7 @@ class Simulation_Object(type):
         helper_set_attribute(instance,"modify_system_attribute",generic_modify_system_attribute)
         helper_set_attribute(instance,"delete_owned_parts",Simulation_Object.delete_owned_parts)
 
-        required_attributes = {"who_am_i": int,'type_part_dict'  :PartDictSafe,'associated_objects': list, "sys": espressomd.System}
+        required_attributes = {"who_am_i": int,'type_part_dict'  :dict,'associated_objects': list, "sys": espressomd.System}
         for attr, expected_type in required_attributes.items():
             # Check for required instance attribute `who_am_i`
             if not hasattr(instance, attr):
@@ -279,25 +320,21 @@ class Simulation_Object(type):
     @staticmethod
     def _del(self):
         """
-        Best-effort owned-particle and live-instance cleanup.
+        Best-effort owned-particle cleanup.
 
         The simulation lifecycle explicitly releases stored objects. During
         interpreter shutdown we avoid calling back into ESPResSo from Python
         finalizers, because the underlying script interface may already be
         tearing down.
+
+        `numInstances` is a monotonic creation count and is never touched here.
+        `live_instances` is a `weakref.WeakSet`, so this instance drops out of it
+        on its own once nothing else references it -- no explicit removal needed.
         """
         if sys.is_finalizing():
             return
         if hasattr(self, "delete_owned_parts"):
             self.delete_owned_parts()
-        if getattr(self, "_is_live", False):
-            self._is_live = False
-            for self_cls in self.__class__.mro():
-                if hasattr(self_cls, "numInstances"):
-                    self_cls.numInstances -= 1
-            cls = type(self)
-            if cls.live_instances > 0:
-                cls.live_instances -= 1
 
     @staticmethod
     def _cusiter(self):
@@ -314,6 +351,12 @@ class Simulation_Object(type):
     def set_object(self, *args,**kwargs):
         """
         Abstract method for setting up simulation objects. Must be implemented by subclasses.
+
+        The build must put the particles' mean at the placement centre it is given: that is
+        either the class's `build_function` (which computes the positions handed to
+        `set_object`), or `set_object` itself for a single-centre object that places its one
+        particle straight at the given centre. `Simulation.set_objects` takes that mean as the
+        object's centre when it later keeps other objects' placement spheres away from it.
 
         Raises
         ------
@@ -414,7 +457,7 @@ class Simulation_Object(type):
         part_params.update(**kwargs)
 
         part_hndl = self.sys.part.add(**part_params)
-        self.type_part_dict[type_name].append(part_hndl)
+        self.type_part_dict.setdefault(type_name, []).append(part_hndl)
         self.modify_system_attribute(self,'part_types', lambda current_value: current_value.update({type_name: part_params['type']}))
         return part_hndl
 
@@ -473,7 +516,7 @@ class Simulation_Object(type):
             )
         self.type_part_dict[current_key].remove(particle)
         particle.type=self.part_types[new_type_name]
-        self.type_part_dict[new_type_name].append(particle)
+        self.type_part_dict.setdefault(new_type_name, []).append(particle)
         self.modify_system_attribute(self,'part_types', lambda current_value: current_value.update({new_type_name: self.part_types[new_type_name]}))
 
 
@@ -488,7 +531,49 @@ class ObjectConfigParams(dict):
     Attributes
     ----------
     common_keys : dict
-        Common configuration keys with default values.
+        Common configuration keys, one entry documented below.
+    espresso_handle : espressomd.System, default None
+        The espressomd `System` handle the object is built into. Every class stores it as
+        `self.sys` in `__init__`.
+    associated_objects : list, default None
+        Child `Simulation_Object` instances (e.g. a Filament's monomers), or `None` for a
+        leaf object. Stored as `self.associated_objects`; `get_owned_part`/`delete_owned_parts`
+        recurse into it, and `Simulation.set_objects`'s obstacle rule counts a stored object's
+        associated objects too (redundant with the parent, but safe).
+    n_parts : int, default 1
+        Number of particles (or, for a compound object, associated sub-objects) `set_object`
+        is expected to place.
+    size : float or None, default 1
+        The object's placement diameter, a contact diameter: `Simulation.set_objects` gives every
+        object a sphere of this diameter and only keeps those spheres apart; it never compares
+        the particles of different objects. The sphere is centred on the mean of all the
+        object's particle positions (associated objects' particles and virtual sites included);
+        `size` is right when the sphere holds every particle together with its radius:
+
+            |pos_i - mean| + r_i <= size / 2    for every particle i,
+
+        where r_i is half the particle's contact diameter. For a WCA/LJ bead of LJ diameter
+        sigma, the contact diameter is ``WCA_CONTACT_FACTOR * sigma`` (so size = sigma is ~11%
+        too small). For a single bead, `size` is that contact diameter. A Filament with the default
+        spacing splits `size` evenly among its n monomers, so monomers of contact diameter
+        ``size / n`` fill the sphere exactly. Too small a `size` lets placed objects overlap;
+        too large a one only wastes space.
+
+        Nothing enforces this: `set_objects` only warns when a particle centre lies beyond
+        ``size / 2``, since it cannot see particle radii. Some geometries ignore `size` (e.g.
+        Quartet), and several defaults are smaller than the default geometry (Quadriplex,
+        Quartet, TelSeq, and the rigid/raspberry/multicore classes), so set it explicitly.
+        
+        ``size=None`` means the object has no placement sphere and lays itself out (Elastomer,
+        which fills its own slab `box_E`): `set_objects` places it without a lattice, and
+        places nothing else while it owns particles. Such an object is never checked against
+        obstacles: `set_objects` does not compare its placement to other stored objects, and
+        `Elastomer` is the only class this applies to, so only its own empty-`box_E` check in
+        `set_object` guards it, and that check sees particle centres only.
+
+    `sigma` is *not* a common key: only classes that need a bead's LJ sigma (`Filament`,
+    `Elastomer`) declare it in their own `config`. Interactions are set only through
+    `set_steric`/`set_vdW`, so pass them the same sigma.
 
     Methods
     -------
@@ -496,7 +581,7 @@ class ObjectConfigParams(dict):
         Validates the current configuration against the class-level configuration and updates
         the instance with missing values from the class configuration.
     """
-    common_keys = {'sigma': 1, 'espresso_handle': None, 'associated_objects': None, 'size': 1, 'n_parts': 1}
+    common_keys = {'espresso_handle': None, 'associated_objects': None, 'size': 1, 'n_parts': 1}
 
     @staticmethod
     def _detach(value):
