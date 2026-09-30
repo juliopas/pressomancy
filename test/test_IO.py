@@ -1,6 +1,6 @@
 import numpy as np
 import espressomd
-from .create_system import sim_inst, BaseTestCase, BoxTestCase
+from .create_system import sim_inst, BaseTestCase
 from pressomancy.simulation import (Filament, Quartet, Quadriplex, Crowder, Elastomer,
                                     PointDipolePermanent, PointDipoleMagnetizable)
 from pressomancy.infra import BondWrapper, api_agnostic_feature_check
@@ -19,23 +19,26 @@ from unittest.mock import patch
 import pressomancy.io.write as write_module
 from pressomancy.io.bonds import verify_bond_params, write_bonds, read_bonds, read_bond_params
 
-#: Box of the SourceFixture classes and the bond-heavy ones: a cell-grid rebuild costs ~125 ms in 50^3,
-#: ~4 ms here. 16 is the smallest side a SourceFixture filament (size 8) fits: set_objects needs L/2 >= size.
+#: Box of the SourceFixture classes and the bond-heavy ones: a cell-grid rebuild costs ~16 ms in the default
+#: 20^3, ~4 ms here. 16 is the smallest side a SourceFixture filament (size 8) fits: set_objects needs L/2 >= size.
 SMALL_BOX = (16, 16, 16)
 
 
-class IOTestCase(BoxTestCase):
-    """A class tmpdir on top of BoxTestCase's per-class box and per-test reset."""
+class IOTestCase(BaseTestCase):
+    """A class tmpdir on top of BaseTestCase's per-class box and per-test reset."""
 
     @classmethod
     def setUpClass(cls):
         cls.tmpdir = tempfile.TemporaryDirectory()
-        cls.addClassCleanup(cls.tmpdir.cleanup)       # registered first, so it runs after the reset (LIFO)
+        cls.addClassCleanup(cls.tmpdir.cleanup)       # also when setUpClass fails
         super().setUpClass()
 
 
 class CommonH5DataSelectorTests:
+    """A class-scope fixture: setUpClass writes one file that every test reads, so the system is reset once
+    per class (on entry and on exit), never per test; the concrete classes are plain unittest.TestCase."""
 
+    box_dim = BaseTestCase.box_dim  # the default box; a fixture that needs another declares it
     runner_script="repo/project/script.py"
     runner_script_repo ="main@abc1234-dirty"
     library_vers= "main@def5678"
@@ -46,11 +49,13 @@ class CommonH5DataSelectorTests:
 
     @classmethod
     def setUpClass(cls):
-        sim_inst.set_author(cls.author, cls.email)
         super().setUpClass()
-        sim_inst.sys.box_l = cls.box_dim
-        sim_inst.kT = cls.kT            # cleanup() in tearDownClass builds a new Simulation (kT 1.)
+        BaseTestCase.cleanup(cls.box_dim)   # builds a new Simulation: author and kT (1.) are set after it
+        sim_inst.set_author(cls.author, cls.email)
+        sim_inst.kT = cls.kT
         cls.tmpdir = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmpdir.cleanup)
+        cls.addClassCleanup(BaseTestCase.cleanup, cls.box_dim)
         cls.h5_filename = os.path.join(cls.tmpdir.name, "testfile.h5")
         cls.written_steps = [10, 20, 30, 40]
         cls.written_times = []
@@ -85,19 +90,10 @@ class CommonH5DataSelectorTests:
                         np.array([getattr(part, prop) for part in parts], dtype=dtype))
         cls.snapshots = {group: {prop: np.asarray(frames) for prop, frames in snapshot.items()}
                          for group, snapshot in cls.snapshots.items()}
-        cls.reset_io_state()
-
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "tmpdir"):
-            cls.tmpdir.cleanup()
-            cls.tmpdir = None
-        BaseTestCase.cleanup()
-        assert len(sim_inst.sys.part) == 0
-        super().tearDownClass()
+        BaseTestCase.reset_io_state()
 
     def tearDown(self):
-        self.reset_io_state()
+        BaseTestCase.reset_io_state()
         super().tearDown()
 
     def check_selection(self, view, snapshot, time_slice=None, types=None):
@@ -221,7 +217,7 @@ class CommonH5DataSelectorTests:
                         np.testing.assert_allclose(selector.time, self.written_times)
                         np.testing.assert_allclose(selector.value, np.array(self.observable_values))
                 finally:
-                    self.reset_io_state()
+                    BaseTestCase.reset_io_state()
 
     def test_select_particles_by_object(self):
         with h5py.File(self.h5_filename, "r") as h5_file:
@@ -290,15 +286,13 @@ class CommonH5DataSelectorTests:
                             dataview.get_parent_ids(parent_key, child_key, child.who_am_i),
                             expected_parent_ids, err_msg=f"{child_key} {child.who_am_i}")
 
-class ElastomerFixture(CommonH5DataSelectorTests, BaseTestCase):
-    box_dim = [5,5,20]
+class ElastomerFixture(CommonH5DataSelectorTests, unittest.TestCase):
     layer_height = 4
     n_part = 20
     observable_name = "magnetic_dipole_moment"
 
     @classmethod
     def build_fixture(cls):
-        sim_inst.sys.box_l = cls.box_dim
         conf_point_dipole = PointDipolePermanent.config.specify(dipm=1., espresso_handle=sim_inst.sys)
         point_dipoles = [PointDipolePermanent(config=conf_point_dipole) for _ in range(cls.n_part)]
         config_E = Elastomer.config.specify(
@@ -326,11 +320,11 @@ class ElastomerFixture(CommonH5DataSelectorTests, BaseTestCase):
             for frame, want in zip(universe.trajectory, positions):
                 with self.subTest(frame=frame.frame):
                     np.testing.assert_array_equal(frame.positions, want)
-                    np.testing.assert_allclose(frame.dimensions, [*self.box_dim, 90., 90., 90.])
+                    np.testing.assert_allclose(frame.dimensions, [*sim_inst.sys.box_l, 90., 90., 90.])
         finally:
             universe.trajectory.close()
 
-class FilamentFixture(CommonH5DataSelectorTests, BaseTestCase):
+class FilamentFixture(CommonH5DataSelectorTests, unittest.TestCase):
 
     box_dim = (75.6, 75.6, 75.6)
     no_obj=30

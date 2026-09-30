@@ -38,6 +38,6 @@ class SampleScriptTest(BaseTestCase):
                         sys.modules.pop(full_module_name, None)
                         if hasattr(samples, module_name):
                             delattr(samples, module_name)
-                        self.cleanup()
+                        self.cleanup(self.box_dim)
                         self.assertEqual(len(sim_inst.objects), 0)
                         self.assertEqual(len(sim_inst.sys.part), 0)

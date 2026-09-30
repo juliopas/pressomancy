@@ -14,7 +14,7 @@ from pressomancy.magnetodynamics import (MAGNETIZATION_MODELS, MOMENT_CARRIER_PR
                                          susceptibility_from_kT, validate_model)
 from pressomancy.simulation import (Filament, PointDipoleMagnetizable,
                                     PointDipoleSuperparamagnetic)
-from .create_system import sim_inst, BaseTestCase, BoxTestCase
+from .create_system import sim_inst, BaseTestCase
 
 AVAILABLE_MODELS = [name for name in MAGNETIZATION_MODELS
                     if all(api_agnostic_feature_check(f)
@@ -77,10 +77,10 @@ class ValidationTest(unittest.TestCase):
 
 
 @unittest.skipIf(not AVAILABLE_MODELS, 'no magnetization model compiled in this espresso build')
-class ConfigureMagnetizationTest(BoxTestCase):
+class ConfigureMagnetizationTest(BaseTestCase):
     '''`configure_magnetization` on bare anchor + virtual pairs, and through objects and `Simulation`.'''
 
-    box_dim = (20, 20, 20)
+    box_dim = (20, 20, 20)  # literal coordinates up to 15
     m_sat = 1.5
     chi_0 = 0.3
 
@@ -219,10 +219,10 @@ class ConfigureMagnetizationTest(BoxTestCase):
 
 @unittest.skipIf('langevin' not in AVAILABLE_MODELS,
                  'the langevin magnetization model is not compiled in this espresso build')
-class ConvergenceTest(BoxTestCase):
+class ConvergenceTest(BaseTestCase):
     '''`contraction_ratio` measures the fixed-point iteration on moment vectors without advancing time.'''
 
-    box_dim = (20, 20, 20)
+    box_dim = (20, 20, 20)  # literal coordinates up to 15 (the chain at z=5..9, the ring at 10±1)
     m_sat = 1.732
 
     def _chain(self, chi_0):

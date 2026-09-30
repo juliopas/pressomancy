@@ -2,13 +2,13 @@ import unittest
 import numpy as np
 import espressomd
 import espressomd.propagation
-from .create_system import sim_inst, BoxTestCase
+from .create_system import sim_inst, BaseTestCase
 from pressomancy.simulation import MulticorePart
 from pressomancy.infra import api_agnostic_feature_check
 
 Propagation = espressomd.propagation.Propagation
 
-class MulticorePartTest(BoxTestCase):
+class MulticorePartTest(BaseTestCase):
 
     box_dim = (6, 6, 6)  # a single MulticorePart, whose raspberry pattern reaches ~1.5 from its centre
 
@@ -41,7 +41,7 @@ class MulticorePartTest(BoxTestCase):
 
 
 @unittest.skipIf(not api_agnostic_feature_check('EGG_MODEL'), 'requires EGG_MODEL')
-class MulticorePartEggTest(BoxTestCase):
+class MulticorePartEggTest(BaseTestCase):
 
     box_dim = (6, 6, 6)
 

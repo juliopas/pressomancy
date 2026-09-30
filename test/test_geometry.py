@@ -7,7 +7,7 @@ from pressomancy import geometry
 from pressomancy.infra import RoutineWithArgs
 from pressomancy.geometry import get_perpendicular, partition_cuboid_volume, partition_cubic_volume_oriented_rectangles, get_neighbours, get_neighbours_cross_lattice, fcc_lattice, fold_coords, min_img_dist, align_vectors, make_centered_rand_orient_point_array, get_orientation_vec, get_cross_lattice_nonintersecting_volumes, generate_random_unit_vectors, random_nested_3d_vectors_like, check_free_cuboid, calculate_pair_distances, require_min_global_cut
 
-class HelperFunctionsTest(BaseTestCase):
+class HelperFunctionsTest(unittest.TestCase):
 
     def test_get_perpendicular(self):
         """Random phi gives varying unit perpendiculars; phi=0 gives the documented base projection."""
@@ -137,15 +137,12 @@ class RegressionTest(BaseTestCase):
     def test_check_free_cuboid_folds_drifted_positions(self):
         """P4: espresso stores unfolded positions, so a drifted particle read as outside."""
         cuboid = np.array([10.0, 10.0, 10.0])
-        try:
-            probe = sim_inst.sys.part.add(pos=[5.0, 5.0, 5.0], type=99)
-            self.assertFalse(check_free_cuboid(sim_inst.sys, cuboid))
-            probe.pos = np.array([5.0, 5.0, 5.0]) + np.asarray(sim_inst.sys.box_l)
-            self.assertFalse(check_free_cuboid(sim_inst.sys, cuboid))
-            probe.pos = [25.0, 25.0, 25.0]
-            self.assertTrue(check_free_cuboid(sim_inst.sys, cuboid))
-        finally:
-            self.cleanup()
+        probe = sim_inst.sys.part.add(pos=[5.0, 5.0, 5.0], type=99)
+        self.assertFalse(check_free_cuboid(sim_inst.sys, cuboid))
+        probe.pos = np.array([5.0, 5.0, 5.0]) + np.asarray(sim_inst.sys.box_l)
+        self.assertFalse(check_free_cuboid(sim_inst.sys, cuboid))
+        probe.pos = (cuboid + np.asarray(sim_inst.sys.box_l)) / 2  # between the cuboid and the box edge, in any box
+        self.assertTrue(check_free_cuboid(sim_inst.sys, cuboid))
 
     def test_calculate_pair_distances_matches_index_pair_construction(self):
         """3.4.2: broadcasting must reproduce the explicit N*M index list exactly."""
@@ -188,9 +185,9 @@ class RegressionTest(BaseTestCase):
                 np.testing.assert_allclose(axis, expected, atol=1e-12)
 
 
-class PartitioningTest(BaseTestCase):
+class PartitioningTest(unittest.TestCase):
 
-    box_dim=np.array([2.5, 2.5, 2.5])
+    geo_box = np.array([2.5, 2.5, 2.5])  # a geometry input, not the simulation box
     num_vol_side=5
     sph_diam=1
     rect_box = np.array([10.0, 20.0, 30.0])
@@ -198,8 +195,8 @@ class PartitioningTest(BaseTestCase):
     def test_get_neighbours(self):
         """Neighbour pairs of one fcc face of touching spheres."""
         control= {0: [2,], 1: [2,],2: [0, 1, 3, 4,], 3: [2, ], 4: [2,]}
-        sphere_centers_short, _,_=partition_cuboid_volume(self.box_dim,self.num_vol_side,self.sph_diam, flag='norand')
-        neigh=get_neighbours(sphere_centers_short,self.box_dim,cutoff=self.sph_diam)
+        sphere_centers_short, _,_=partition_cuboid_volume(self.geo_box,self.num_vol_side,self.sph_diam, flag='norand')
+        neigh=get_neighbours(sphere_centers_short,self.geo_box,cutoff=self.sph_diam)
         neigh_sets = {key: set(val) for key, val in neigh.items()}
         control_sets = {key: set(val) for key, val in control.items()}
         self.assertEqual(neigh_sets,control_sets)
@@ -302,7 +299,7 @@ class PartitioningTest(BaseTestCase):
                 self.assertTrue(np.all(np.linalg.norm(rod - center, axis=1) <= radius))
 
 
-class FccLatticeTest(BaseTestCase):
+class FccLatticeTest(unittest.TestCase):
     """fcc_lattice produces an FCC arrangement of touching spheres."""
 
     # (radius, box_dim, scalling_factor)

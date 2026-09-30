@@ -2,7 +2,7 @@ import unittest
 from pressomancy.simulation import PointDipolePermanent, PointDipoleMagnetizable, PointDipoleSuperparamagnetic
 from pressomancy.infra import api_agnostic_feature_check
 from pressomancy.magnetodynamics import required_features_for, susceptibility_from_kT
-from .create_system import sim_inst, BoxTestCase
+from .create_system import sim_inst, BaseTestCase
 
 import numpy as np
 import espressomd.propagation
@@ -13,7 +13,7 @@ MODEL = 'langevin'
 _model_missing = [feature for feature in required_features_for(MODEL) if not api_agnostic_feature_check(feature)]
 
 
-class PointDipoleTest(BoxTestCase):
+class PointDipoleTest(BaseTestCase):
     box_dim = (6, 6, 6)  # 11 objects: 10 of default size 1, 1 of size 2; two set_objects calls
 
     config=PointDipolePermanent.config.specify(
@@ -44,7 +44,7 @@ class PointDipoleTest(BoxTestCase):
 
 
 @unittest.skipIf(_model_missing, f"Missing required features: {', '.join(_model_missing)}")
-class PointDipoleMagnetizableTest(BoxTestCase):
+class PointDipoleMagnetizableTest(BaseTestCase):
     box_dim = (6, 6, 6)  # 11 objects: 10 of default size 1, 1 of size 0.5; two set_objects calls
 
     config=PointDipoleMagnetizable.config.specify(
@@ -90,7 +90,7 @@ class PointDipoleMagnetizableTest(BoxTestCase):
 
 
 @unittest.skipIf(_model_missing, f"Missing required features: {', '.join(_model_missing)}")
-class PointDipoleSuperparamagneticTest(BoxTestCase):
+class PointDipoleSuperparamagneticTest(BaseTestCase):
     box_dim = (6, 6, 6)  # 11 objects: 10 of default size 1, 1 of size 0.5; two set_objects calls
 
     config=PointDipoleSuperparamagnetic.config.specify(

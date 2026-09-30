@@ -4,10 +4,13 @@ import unittest
 import gc
 
 class BaseTestCase(unittest.TestCase):
+    """A class that touches the shared system: it resets into its ``box_dim`` before its first test and after
+    every test (``addCleanup``, so also when a subclass setUp fails half-way). There is no class-end restore:
+    the next class resets into its own box. A class that needs no system extends ``unittest.TestCase`` instead."""
 
-    box_dim=(50,50,50)
+    box_dim=(20,20,20)
     min_global_cut=1
-    
+
     @classmethod
     def setUpClass(cls):
         # Configure logging for tests
@@ -23,6 +26,11 @@ class BaseTestCase(unittest.TestCase):
         console_handler.setFormatter(formatter)
 
         logger.addHandler(console_handler)
+        BaseTestCase.cleanup(cls.box_dim)
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(BaseTestCase.cleanup, self.box_dim)
 
     @staticmethod
     def reset_io_state():
@@ -41,36 +49,16 @@ class BaseTestCase(unittest.TestCase):
         sim_inst._h5_writer._slice_cache.clear()
 
     @staticmethod
-    def cleanup(box_dim=None):
-        """Reset the simulation instance after each test, leaving it in ``box_dim``
-        (default: the shared box). A class that works in its own box resets into it
-        between its tests and restores the shared one once, as a class cleanup."""
-        box_dim = BaseTestCase.box_dim if box_dim is None else box_dim
+    def cleanup(box_dim):
+        """Reset the simulation instance, leaving it in ``box_dim`` (pass the class's own, ``self.box_dim``)."""
         BaseTestCase.reset_io_state()
         sim_inst.reinitialize_instance()
-        # Each setter rebuilds the cell grid (~0.1-0.25 s in 50^3) even for an unchanged value.
+        # Each setter rebuilds the cell grid even for an unchanged value.
         if tuple(sim_inst.sys.box_l) != tuple(box_dim):
             sim_inst.sys.box_l=box_dim
         if sim_inst.sys.min_global_cut != BaseTestCase.min_global_cut:
             sim_inst.sys.min_global_cut=BaseTestCase.min_global_cut
         gc.collect()
-
-
-class BoxTestCase(BaseTestCase):
-    """A class that works in its own ``box_dim``: reset into it before its first test and after every
-    test (``addCleanup``, so also when a subclass setUp fails half-way); the shared box comes back once,
-    as a class cleanup (so also when a subclass setUpClass fails). A cell-grid rebuild costs ~125 ms in
-    the shared 50^3 box and a few ms in a small one."""
-
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.addClassCleanup(BaseTestCase.cleanup)
-        BaseTestCase.cleanup(cls.box_dim)
-
-    def setUp(self):
-        super().setUp()
-        self.addCleanup(BaseTestCase.cleanup, self.box_dim)
 
 
 sim_inst = Simulation(box_dim=BaseTestCase.box_dim)

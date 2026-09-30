@@ -1,8 +1,8 @@
-from .create_system import sim_inst, BoxTestCase
+from .create_system import sim_inst, BaseTestCase
 import numpy as np
 
 
-class BoxWallsTest(BoxTestCase):
+class BoxWallsTest(BaseTestCase):
     """Generic walls (all six, or one side), a custom top wall with per-type WCA, and every removal mode."""
 
     box_dim = (16, 16, 16)

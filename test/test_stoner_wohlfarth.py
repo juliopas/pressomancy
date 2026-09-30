@@ -1,7 +1,7 @@
 import unittest
 from pressomancy.simulation import SWPart
 from pressomancy.infra import api_agnostic_feature_check
-from .create_system import sim_inst, BoxTestCase
+from .create_system import sim_inst, BaseTestCase
 
 import numpy as np
 import espressomd
@@ -12,7 +12,7 @@ Propagation = espressomd.propagation.Propagation
 _sw_missing = [feature for feature in SWPart.required_features if not api_agnostic_feature_check(feature)]
 
 @unittest.skipIf(_sw_missing, f"Missing required features: {', '.join(_sw_missing)}")
-class SWPartTest(BoxTestCase):
+class SWPartTest(BaseTestCase):
     box_dim = (6, 6, 6)  # 11 objects of size 1/0.5, placed via two set_objects calls
 
     config = SWPart.config.specify(

@@ -1,12 +1,12 @@
 import signal
 from pressomancy.simulation import Elastomer, PointDipolePermanent
 from pressomancy.geometry import WCA_CONTACT_FACTOR
-from .create_system import sim_inst, BaseTestCase, BoxTestCase
+from .create_system import sim_inst, BaseTestCase
 import numpy as np
 from collections import Counter, defaultdict
 from itertools import combinations
 
-class ElastomerConfigTest(BoxTestCase):
+class ElastomerConfigTest(BaseTestCase):
     box_dim = (8, 8, 16)  # the default Elastomer fills the bottom quarter: ~80 beads here
 
     def test_size_is_refused(self):
@@ -42,7 +42,7 @@ class ElastomerConfigTest(BoxTestCase):
             self.assertEqual(bool(hndl.fix[2]), bool(hndl.pos[2] < z_pin))
 
 
-class ElastomerTest(BoxTestCase):
+class ElastomerTest(BaseTestCase):
     box_E = [3, 3, 9]
     # x and y: twice the default bond_cutoff (5), the neighbour search's minimum-image limit;
     # z: box_E's height

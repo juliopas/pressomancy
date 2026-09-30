@@ -1,4 +1,5 @@
 import types
+import unittest
 
 from .create_system import BaseTestCase, sim_inst
 from pressomancy.infra import (MissingFeature, SimulationExistsException, SimulationType,
@@ -22,7 +23,7 @@ def make_object_class(name, simulation_type):
     })
 
 
-class ObjectConfigParamsTest(BaseTestCase):
+class ObjectConfigParamsTest(unittest.TestCase):
     def test_sigma_only_where_it_is_read(self):
         """`sigma` is no common key: a class that ignores it rejects it."""
         with self.assertRaisesRegex(ValueError, "Invalid keys"):
@@ -30,7 +31,7 @@ class ObjectConfigParamsTest(BaseTestCase):
         self.assertEqual(Filament.config.specify(sigma=2.)['sigma'], 2.)
 
 
-class TypeDictSafeTest(BaseTestCase):
+class TypeDictSafeTest(unittest.TestCase):
     """`part_types` is a strict `str` -> `int` bijection: a typo or a duplicate number must fail loudly instead of reaching espresso as a bogus type."""
 
     def test_entries_and_mapping_are_enforced(self):
@@ -59,7 +60,7 @@ class TypeDictSafeTest(BaseTestCase):
         self.assertEqual(dict(types_), {'real': 1})
 
 
-class SimulationTypeTest(BaseTestCase):
+class SimulationTypeTest(unittest.TestCase):
     """The metaclass owns the uniqueness of `simulation_type` across object classes: the name and the number both end up in HDF5 output, so neither may be reused."""
 
     throwaway = 'ThrowawayObject'
@@ -90,10 +91,6 @@ class SimulationTypeTest(BaseTestCase):
 class ReinitializeCountersTest(BaseTestCase):
     """`reinitialize_instance` must leave the object classes as a fresh interpreter would: `who_am_i` restarts at zero, and so do the metaclass bookkeeping attributes."""
 
-    def tearDown(self):
-        BaseTestCase.cleanup()
-        super().tearDown()
-
     def test_counters_rewind_for_every_registered_class(self):
         filaments = [Filament(config=Filament.config.specify(
             n_parts=3, sigma=1., size=3., espresso_handle=sim_inst.sys))
@@ -104,7 +101,7 @@ class ReinitializeCountersTest(BaseTestCase):
         self.assertEqual(len(Filament.live_instances), 2)
 
         del filaments
-        BaseTestCase.cleanup()
+        BaseTestCase.cleanup(self.box_dim)
 
         for object_class in OBJECT_CLASS_REGISTRY.values():
             with self.subTest(object_class=object_class.__name__):
@@ -117,7 +114,7 @@ class ReinitializeCountersTest(BaseTestCase):
         self.assertEqual(again.who_am_i, 0)
 
 
-class SingletonTest(BaseTestCase):
+class SingletonTest(unittest.TestCase):
     """A second `Simulation(...)` while one is live is refused; the live instance stays exactly what it was."""
 
     def test_second_instance_is_refused(self):
@@ -127,7 +124,7 @@ class SingletonTest(BaseTestCase):
         self.assertIs(sim_inst.instance, instance)
 
 
-class ParticleAttributeCheckTest(BaseTestCase):
+class ParticleAttributeCheckTest(unittest.TestCase):
     """An existing particle attribute passes silently; a missing one raises `MissingFeature`."""
 
     def test_missing_attribute_raises(self):

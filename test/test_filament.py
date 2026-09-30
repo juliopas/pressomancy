@@ -2,9 +2,9 @@ import numpy as np
 import espressomd
 from pressomancy.infra import BondWrapper
 from pressomancy.object_classes import Filament, Quartet, Quadriplex, RaspberrySphere
-from .create_system import sim_inst, BaseTestCase, BoxTestCase
+from .create_system import sim_inst, BaseTestCase
 
-class FilamentTest(BoxTestCase):
+class FilamentTest(BaseTestCase):
 
     # positions used here are literal (not lattice-placed); .pos is never folded, so the
     # topology/np.isclose asserts are box-size independent. BUT: the quadriplex layouts in

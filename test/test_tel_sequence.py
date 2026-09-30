@@ -2,7 +2,7 @@ import unittest
 
 import espressomd
 import numpy as np
-from .create_system import sim_inst, BaseTestCase, BoxTestCase, bonds_using
+from .create_system import sim_inst, BaseTestCase, bonds_using
 from pressomancy.object_classes.tel_sequence import (TELSEQ_RULES, TelSeq,
                                                      _validate_telseq_rules,
                                                      _VALIDATED_TELSEQ_ALIASES)
@@ -43,7 +43,7 @@ class TelSeqRulesGeometryTest(unittest.TestCase):
 
 @unittest.skipIf(not all(api_agnostic_feature_check(feature) for feature in TelSeq.required_features),
                  f'TelSeq needs {TelSeq.required_features}')
-class TelSeqTest(BoxTestCase):
+class TelSeqTest(BaseTestCase):
     box_dim = (12, 12, 12)  # the diag bonds are 5.657 long: under half the box, as minimum image needs
 
     def _build_tel(self, fold_type, alias='quartet', pos=None):

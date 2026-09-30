@@ -5,7 +5,7 @@ import warnings
 from unittest import mock
 import numpy as np
 from espressomd.constraints import HomogeneousMagneticField
-from .create_system import sim_inst, BaseTestCase, BoxTestCase
+from .create_system import sim_inst, BaseTestCase
 from pressomancy.infra import MissingFeature, api_agnostic_feature_check
 from pressomancy.object_classes import Crowder, Elastomer, Filament, Quadriplex
 from pressomancy.geometry import WCA_CONTACT_FACTOR, min_img_dist
@@ -31,7 +31,7 @@ def missing_feature(name):
                       lambda feature: feature != name and api_agnostic_feature_check(feature))
 
 
-class SimulationTest(BoxTestCase):
+class SimulationTest(BaseTestCase):
     box_dim = (16, 16, 16)  # every default config fits; the default Elastomer fills it with 567 particles
 
     def test_every_class_stores_sets_and_deletes(self):
@@ -210,7 +210,7 @@ class SimulationTest(BoxTestCase):
 
     def test_rebind_sys_moves_every_handle(self):
         """Simulation and manager (so reinitialize_instance won't revert) get the handle; the slice cache is dropped."""
-        self.addCleanup(sim_inst.rebind_sys, sim_inst.sys)  # runs before BoxTestCase's reset, even on a failure
+        self.addCleanup(sim_inst.rebind_sys, sim_inst.sys)  # runs before BaseTestCase's reset, even on a failure
         stand_in = object()
         sim_inst._h5_writer._slice_cache['dummy'] = None
         sim_inst.rebind_sys(stand_in)
@@ -249,7 +249,7 @@ class SimulationTest(BoxTestCase):
         self.assertEqual(len(sim_inst.sys.part.select(type=666)), 2)
 
 
-class SetObjectsTest(BoxTestCase):
+class SetObjectsTest(BaseTestCase):
     box_dim = (30, 30, 30)
 
     def test_every_earlier_call_is_avoided(self):

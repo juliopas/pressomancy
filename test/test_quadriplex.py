@@ -1,7 +1,7 @@
 from itertools import product
 import numpy as np
 import espressomd
-from .create_system import sim_inst, BaseTestCase, BoxTestCase, bonds_using
+from .create_system import sim_inst, BaseTestCase, bonds_using
 from pressomancy.object_classes.quadriplex_class import Quartet, Quadriplex
 
 def bonded_energy():
@@ -9,7 +9,7 @@ def bonded_energy():
     sim_inst.sys.integrator.run(0)
     return sim_inst.sys.analysis.energy()['bonded']
 
-class QuadriplexTest(BoxTestCase):
+class QuadriplexTest(BaseTestCase):
     box_dim = (6, 6, 6)  # a quartet's virtual sites sit up to 2.955 from their real (5^3 breaks the relation)
 
     def setUp(self) -> None:
@@ -112,7 +112,7 @@ class QuadriplexTest(BoxTestCase):
                           for quartet in self.instance_ftf.associated_objects], [0, 1, 1])
 
 
-class QuartetTest(BoxTestCase):
+class QuartetTest(BaseTestCase):
     box_dim = QuadriplexTest.box_dim
 
     def test_add_h_bond_patches(self):
