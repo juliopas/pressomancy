@@ -911,6 +911,39 @@ class LoadNewPartTypesTest(SourceFixture):
                 self.inscribe_load_new(path)
             self.assertIn("refusing to append", str(ctx.exception))
 
+    def test_observables_alone_check_the_type_table(self):
+        """Observables resumed alone run the same check: another number refuses, an empty live table takes the file's."""
+        self.build_filaments()
+        value = np.zeros(3)
+        source = os.path.join(self.tmpdir.name, "observables.h5")
+
+        def inscribe(path, mode):
+            return sim_inst.inscribe_observable_group_to_h5(
+                observable_defs=[("probe", 3, np.float64, value)], h5_data_path=path, mode=mode)
+
+        inscribe(source, 'NEW')
+        self.reset_io_state()
+        saved = {name: int(number) for name, number in sim_inst.part_types.items()}
+
+        with self.subTest(case="a name declared with another number"):
+            path = self.edited_copy(source, "observables_mismatch.h5",
+                                    lambda f: f["parameters/pressomancy/part_types"].attrs.create(
+                                        'real', saved['real'] + 100))
+            try:
+                with self.assertRaises(RuntimeError) as ctx:
+                    inscribe(path, 'LOAD_NEW')
+            finally:
+                self.reset_io_state()
+            self.assertIn("part_types mismatch", str(ctx.exception))
+
+        with self.subTest(case="an empty live table"):
+            sim_inst.part_types.clear()
+            try:
+                self.assertEqual(inscribe(source, 'LOAD_NEW'), 0)
+            finally:
+                self.reset_io_state()
+            self.assertEqual({name: int(number) for name, number in sim_inst.part_types.items()}, saved)
+
 
 _SM_FEATURES = sorted(set(required_features_for('langevin')) | set(Elastomer.required_features))
 

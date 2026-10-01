@@ -389,7 +389,9 @@ class H5Writer:
             - 'NEW' : create a fresh observable structure when opening a file.
             - 'LOAD': reopen existing observable datasets and validate them
               against `observable_defs`.
-            - 'LOAD_NEW': same as 'LOAD'.
+            - 'LOAD_NEW': as 'LOAD', after checking the file's ``part_types``
+              table against the live one, as for the particle groups (a name
+              only the file declares is registered).
         force_resize_to_size : int or None, optional
             'LOAD'/'LOAD_NEW' only: truncate every registered observable's
             ``step``, ``time`` and ``value`` to this number of saved frames
@@ -423,7 +425,9 @@ class H5Writer:
             If `rewind_to_step` is not a stored step of every observable.
         RuntimeError
             In load modes, if the file is not in the ``h5md-1`` layout, or the
-            `rewind_to_step` row's time is not the live ``sys.time``.
+            `rewind_to_step` row's time is not the live ``sys.time``; in
+            'LOAD_NEW' mode, if a type name is declared with a different number
+            in the file.
 
         Notes
         -----
@@ -999,8 +1003,14 @@ def _observables_new(writer):
     return 0
 
 def _observables_load(writer, mode):
-    """Reopen the registered observables, checking presence and per-frame shape. Returns the saved frame count."""
+    """Reopen the registered observables, checking presence and per-frame shape. Returns the saved frame count.
+
+    ``LOAD_NEW`` first checks the file's ``part_types`` table, as the particle groups' ``LOAD_NEW`` does,
+    so a script that resumes observables alone still gets the writer's type names.
+    """
     _require_layout(writer.io_dict['h5_file'])
+    if mode == 'LOAD_NEW':
+        writer._check_part_types_against_file(writer.io_dict['h5_file'])
     observables_group = writer.io_dict['h5_file'].require_group("observables")
     candidate_lens = []
     for name, spec in writer.io_dict['registered_observables'].items():
