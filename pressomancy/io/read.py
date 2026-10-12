@@ -15,6 +15,11 @@ Every entry that opens a pressomancy file for its particle data goes through
 ``_particle_group``, which checks ``parameters/pressomancy/layout`` == ``LAYOUT``
 and raises ``RuntimeError`` otherwise: there is one layout in code.
 
+``open_output`` opens a trajectory this run owns read-only even while (or after)
+a writer has it in SWMR mode; seeding sources are opened with a plain
+``h5py.File(path, 'r')``, so a live or crashed source is refused, never read
+half-way (``io/init.py``).
+
 Names: the file uses H5MD element names (``position``, ``species``, ``force``,
 ``image``); pressomancy uses espresso attribute names (``pos``, ``type``, ``f``,
 ``image_box``) everywhere else -- API arguments, ``H5DataSelector`` attributes,
@@ -76,6 +81,40 @@ _TIMELINE = element_name('pos')
 #: A link with k partners is a row (owner, p0..pk-1) of the k-th table; the id
 #: array is row-aligned with it. 1..3 covers every espresso bond.
 LINK_TABLES = {1: ("bonds", "bond_id"), 2: ("angles", "angle_id"), 3: ("dihedrals", "dihedral_id")}
+
+
+#: The HDF5 file signature, at byte 0 (pressomancy writes no user block).
+_HDF5_SIGNATURE = b'\211HDF\r\n\032\n'
+
+
+def superblock_version(path):
+    """The HDF5 superblock version of the file at ``path`` (byte 8), or ``None`` if the
+    file does not start with the HDF5 signature followed by that byte (shorter files too).
+
+    Version 3 (the 1.10 format ``H5Writer`` pins) is what SWMR needs; 0 is the
+    pre-1.10 default (legacy and pre-SWMR pressomancy files). Read without HDF5,
+    so it works on a file whose writer crashed or is still running.
+    """
+    with open(path, 'rb') as handle:
+        head = handle.read(len(_HDF5_SIGNATURE) + 1)
+    if len(head) <= len(_HDF5_SIGNATURE) or head[:len(_HDF5_SIGNATURE)] != _HDF5_SIGNATURE:
+        return None
+    return head[len(_HDF5_SIGNATURE)]
+
+
+def open_output(path):
+    """Open a trajectory this run owns, read-only, whether its writer closed it, crashed, or
+    is still appending (SWMR read for a superblock-v3 file; a plain ``'r'`` for an older one,
+    which SWMR cannot open on every HDF5 version).
+
+    This is for the run's **own** output -- deciding between a fresh start and a restart,
+    counting frames. Seeding sources (a sample, a prior run) are opened with a plain
+    ``h5py.File(path, 'r')`` on purpose: a live or crashed source is then refused loudly
+    instead of seeding from an intermediate frame. A file that is not readable raises
+    h5py's ``OSError``.
+    """
+    version = superblock_version(path)
+    return h5py.File(path, 'r', swmr=version is not None and version >= 3)
 
 
 def _require_layout(h5_file):

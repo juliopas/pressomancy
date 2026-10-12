@@ -7,10 +7,13 @@ from pressomancy.infra import BondWrapper, api_agnostic_feature_check
 from pressomancy.geometry import WCA_CONTACT_FACTOR, min_img_dist
 from pressomancy.magnetodynamics import required_features_for
 from pressomancy.io import (H5DataSelector, H5ObservableSelector, stored_steps,
-                            CHECKPOINT_PROPERTIES, checkpoint_properties)
-from pressomancy.io.read import LAYOUT, element_name
+                            CHECKPOINT_PROPERTIES, checkpoint_properties, LIBVER)
+from pressomancy.io.read import LAYOUT, element_name, superblock_version
 import h5py
 import importlib.util
+import json
+import subprocess
+import sys
 import tempfile
 import os
 import shutil
@@ -1162,8 +1165,8 @@ class SourceBondRestoreTest(SourceFixture):
         # partners through positions: local link -> source link, with its own k and r_0
         src_by_pos = {tuple(p): int(sid) for sid, p in zip(src_ids, src_pos)}
         loc_pos = dict(zip(ids, map(tuple, pos)))
-        mapped = {(src_by_pos[loc_pos[o]], src_by_pos[loc_pos[p]], float(np.float32(k)), float(np.float32(r0)))
-                  for o, p, k, r0, _ in bonds}
+        # the source's pos is float64, so are its bond tables: k and r_0 exact
+        mapped = {(src_by_pos[loc_pos[o]], src_by_pos[loc_pos[p]], float(k), float(r0)) for o, p, k, r0, _ in bonds}
         self.assertEqual(mapped, stored)
 
 
@@ -1172,7 +1175,7 @@ def write_bond_tables(path, group_name, parts, sys):
     with h5py.File(path, "w") as handle:
         handle.create_dataset(f"particles/{group_name}/{element_name('id')}/value",
                               data=np.array([[int(part.id) for part in parts]], dtype=np.int32))
-        return write_bonds(handle, group_name, particles=parts, sys=sys)
+        return write_bonds(handle, group_name, particles=parts, sys=sys, float_dtype=np.float32)
 
 
 class BondVerificationTest(IOTestCase):
@@ -1538,6 +1541,7 @@ class TruncationTest(SourceFixture):
         # and the size check; a bool is an int subclass and is refused explicitly
         # (True would rewind to step 1 / keep one frame).
         cases = {
+            'an unknown mode': (ValueError, self.times[1], 'APPEND', {}),     # would resume silently as LOAD
             'an unknown step': (KeyError, self.times[1], 'LOAD_NEW', dict(rewind_to_step=99)),
             'an unknown numpy-integer step': (KeyError, self.times[1], 'LOAD_NEW',
                                               dict(rewind_to_step=np.int64(99))),
@@ -1566,6 +1570,35 @@ class TruncationTest(SourceFixture):
             for stream, count in self.frames_per_stream(h5_file).items():
                 self.assertEqual(count, 3, msg=stream)
 
+    def test_a_ragged_group_is_refused_without_a_rewind_and_trimmed_by_one(self):
+        """Filament's timeline and positions one row longer (a killed append): a resume raises on the staged copy naming
+        both groups' counts (group-qualified: Crowder's cannot hide Filament's); a size of the long length exceeds
+        the short streams; rewinding to the last complete frame trims it and every stream takes the next frame."""
+        real = os.path.realpath(self.path)
+        # the extra position row stays zeros: the LOAD_NEW column check would refuse it if it ran first
+        with h5py.File(self.path, 'r+', libver=LIBVER) as h5_file:
+            pos = h5_file[f"particles/Filament/{element_name('pos')}"]
+            for dataset in (pos["step"], pos["time"], pos["value"]):
+                dataset.resize((4, *dataset.shape[1:]))
+            pos["step"][3], pos["time"][3] = 3, 1.5
+        sim_inst.sys.time = self.times[2]
+        for mode in ('LOAD_NEW', 'LOAD'):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(RuntimeError, "'Filament/step': 4.*'Crowder/step': 3") as refusal:
+                    self.inscribe('particles', mode)
+                self.assertTrue(str(refusal.exception).startswith(f"{real}.new/particles is ragged"))
+                self.assertEqual(refusal.exception.__notes__,
+                                 [f"found on the staged copy {real}.new (deleted); {real} is unchanged"])
+                self.assertFalse(os.path.exists(real + ".new"))
+        with self.assertRaisesRegex(ValueError, "exceeds .*/particles/Filament:"):     # not Crowder's short timeline
+            self.inscribe('particles', 'LOAD_NEW', force_resize_to_size=4)
+        kept = [self.inscribe(stream, 'LOAD_NEW', rewind_to_step=2) for stream in ('particles', 'observables')]
+        self.assertEqual(kept, [3, 3])
+        sim_inst.sys.time = 1.5
+        sim_inst.write_registered_to_h5(step=3)
+        for stream, count in self.frames_per_stream(sim_inst.io_dict['h5_file']).items():
+            self.assertEqual(count, 4, msg=stream)
+
     def test_a_repeated_step_points_at_rewind(self):
         """A step that does not strictly increase is a RuntimeError on both streams, pointing at rewind_to_step."""
         sim_inst.sys.time = self.times[2]
@@ -1587,7 +1620,9 @@ class CheckpointWriteTest(SourceFixture):
     def setUp(self):
         super().setUp()
         self.build_filaments(bonded=True)
-        sim_inst.io_dict['properties'] = list(self.SOURCE_PROPERTIES) + _FIX_PROPERTY
+        # a float32 trajectory: its bond tables (which follow pos) then differ from the checkpoint's
+        sim_inst.io_dict['properties'] = ([('id', None, np.int32), ('type', None, np.int16), ('pos', 3, np.float32)]
+                                          + list(self.SOURCE_PROPERTIES[3:]) + _FIX_PROPERTY)
         if _FIX_PROPERTY:
             sorted(sim_inst.sys.part.all(), key=lambda part: part.id)[0].fix = [True, False, False]
         sim_inst.io_dict['bonds'] = True
@@ -1634,6 +1669,13 @@ class CheckpointWriteTest(SourceFixture):
                              int(sim_inst.sys.thermostat.langevin.philox_counter))
             self.assertEqual(int(h5_file["connectivity/Filament/bonds"].attrs['n_links']),
                              sim_inst.io_dict['bond_links']['Filament'])
+            # bond-parameter floats follow pos: float64 in the checkpoint, float32 in this trajectory
+            for h5, float_dtype in ((h5_file, np.float64), (sim_inst.io_dict['h5_file'], np.float32)):
+                tables = [d for d in h5["pressomancy/Filament/bond_params"].values() if d.dtype.names]
+                self.assertTrue(tables, msg=h5.filename)
+                for table in tables:
+                    floats = {table.dtype[n] for n in table.dtype.names if table.dtype[n].kind == 'f'}
+                    self.assertEqual(floats, {np.dtype(float_dtype)}, msg=f"{h5.filename}: {table.name}")
         # the throwaway writer left the open trajectory alone
         sim_inst.sys.integrator.run(5)
         sim_inst.write_part_group_to_h5(step=10)
@@ -1681,12 +1723,21 @@ class CheckpointRestartTest(SourceFixture):
             np.testing.assert_allclose(state[attr], reference[attr], rtol=0, atol=1e-10, err_msg=attr)
 
     def test_a_restart_continues_the_uninterrupted_run_and_its_trajectory(self):
-        """The restart restores step, time, Philox counter and extras; the trajectory rewinds; the run matches."""
+        """The restart restores step, time, Philox counter, extras and every bond parameter exactly (k, r_0 not
+        float32-representable); the trajectory rewinds; the run matches."""
         half, past = self.n_steps // 2, 10
         traj, ckpt = self.path("traj"), self.path("ckpt")
         properties = list(self.SOURCE_PROPERTIES) + _FIX_PROPERTY     # the trajectory's list
 
         self.build_filaments(bonded=True)
+        k, r_0 = 1. / 3., 0.1 + 0.2
+        self.assertNotEqual(float(np.float32(r_0)), r_0)
+        exact = espressomd.interactions.HarmonicBond(k=k, r_0=r_0, r_cut=0.)
+        sim_inst.sys.bonded_inter.add(exact)
+        first, second = sorted(sim_inst.sys.part.all(), key=lambda part: part.id)[:2]
+        first.add_bond((exact, second))
+        links = self.live_links(sim_inst.sys.part.all())
+        self.assertIn((int(first.id), (int(second.id),), "HarmonicBond", {'k': k, 'r_0': r_0, 'r_cut': 0.}), links)
         sim_inst.io_dict['properties'] = list(properties)
         if _FIX_PROPERTY:
             sorted(sim_inst.sys.part.all(), key=lambda part: part.id)[0].fix = [True, False, False]
@@ -1714,6 +1765,7 @@ class CheckpointRestartTest(SourceFixture):
         self.assertEqual(step, half)
         self.assertEqual(float(sim_inst.sys.time), checkpoint_time)
         self.assertEqual(int(sim_inst.sys.thermostat.langevin.philox_counter), checkpoint_counter)
+        self.assertEqual(self.live_links(sim_inst.sys.part.all()), links)
         if _FIX_PROPERTY:
             self.assertEqual(list(sorted(sim_inst.sys.part.all(), key=lambda p: p.id)[0].fix),
                              [True, False, False])
@@ -1773,3 +1825,309 @@ class CheckpointRestartTest(SourceFixture):
                 with self.assertRaisesRegex(error, fragment):
                     sim_inst.restart_from_checkpoint(filaments, path, bonds=True, place_from=['real'])
                 self.assertEqual(len(sim_inst.sys.part), 0)
+
+
+def file_metadata(h5_file):
+    """Every link name, its attrs, and for a dataset its dtype, maxshape, chunks, compression and shape
+    (the per-frame shape for an extendable one): everything an append must leave alone."""
+    items = {'/': {name: np.asarray(value).tolist() for name, value in h5_file.attrs.items()}}
+
+    def visit(name):
+        obj = h5_file[name]
+        attrs = {key: np.asarray(value).tolist() for key, value in obj.attrs.items()}
+        if isinstance(obj, h5py.Dataset):
+            shape = obj.shape[1:] if obj.maxshape and obj.maxshape[0] is None else obj.shape
+            items[name] = ('dataset', obj.dtype.str, shape, obj.maxshape, obj.chunks, obj.compression, attrs)
+        else:
+            items[name] = ('group', attrs)
+    h5_file.visit(visit)
+    return items
+
+
+def superblock_flags(path):
+    """The superblock's file-consistency flags byte (offset 11 in a v3 superblock): 0 closed cleanly,
+    5 open for SWMR write (also what a killed writer leaves)."""
+    with open(path, 'rb') as handle:
+        return handle.read(12)[11]
+
+
+class SwmrLifecycleTest(SourceFixture):
+    """The crash-safe trajectory lifecycle: format pinned, SWMR after every inscription, a resume or second
+    stream prepared on a copy and installed atomically beside the real file of a symlink, every write fsynced
+    (ragged tails: `TruncationTest`)."""
+
+    RUN_ATTRS = {'parameters/run': {'H': 0.6, 'TAG': 'swmr'}, 'parameters/run/starts/0': {'host': 'here'}}
+
+    def setUp(self):
+        super().setUp()
+        self.build_filaments(bonded=True)
+        sim_inst.io_dict['bonds'] = True
+        self.path = os.path.join(self.tmpdir.name, f"{self.id().rsplit('.', 1)[-1]}.h5")
+
+    def inscribe(self, mode='NEW', path=None, **kwargs):
+        return sim_inst.inscribe_part_group_to_h5(group_type=[Filament], h5_data_path=path or self.path,
+                                                  mode=mode, **kwargs)
+
+    def write_frames(self, steps):
+        """NEW + one frame per step at time 0.5 * step (exact in float32), closed."""
+        self.inscribe('NEW')
+        for step in steps:
+            sim_inst.sys.time = 0.5 * step
+            sim_inst.write_part_group_to_h5(step=step)
+        self.reset_io_state()
+
+    def symlinked(self, name):
+        """`(link, real, link_dir, real_dir)`: in a fresh directory, a link to a file not yet in another one."""
+        # resolved: the library compares real paths, and the tmpdir itself may sit behind a symlink
+        link_dir, real_dir = (f"{os.path.splitext(os.path.realpath(self.path))[0]}_{kind}" for kind in ("link", "real"))
+        os.makedirs(link_dir), os.makedirs(real_dir)
+        link, real = os.path.join(link_dir, name), os.path.join(real_dir, name)
+        os.symlink(real, link)
+        return link, real, link_dir, real_dir
+
+    @staticmethod
+    def frame_counts(h5_file):
+        return {name: dataset.shape[0]
+                for name, dataset in write_module._stream_datasets(h5_file["particles/Filament"]).items()}
+
+    def test_every_inscription_leaves_the_real_file_v110_and_in_swmr_mode(self):
+        """Through a symlink, NEW, LOAD_NEW over a junk `.new`, LOAD, a second stream: the real file, v1.10, SWMR on
+        (flag 5), the link kept, no `.new`; a resume finds the file as NEW left it (appends wrote frames only),
+        step/time one hard-linked pair; a second stream grows with the first and keeps the run attrs."""
+        self.path, real, link_dir, real_dir = self.symlinked("out.h5")
+        value = np.zeros(3)
+        after_new = {}
+
+        def append_frames(h5_file):         # the snapshot comes before the first frame
+            after_new.update(file_metadata(h5_file))
+            for step in range(3):
+                sim_inst.sys.time = 0.5 * step
+                sim_inst.write_part_group_to_h5(step=step)
+
+        def as_after_new(h5_file):
+            self.assertEqual(file_metadata(h5_file), after_new)
+            data_grp = h5_file["particles/Filament"]
+            for element in [element_name(attr) for attr, _dim, _dtype in sim_inst.io_dict['properties']] + ["box/edges"]:
+                self.assertEqual(data_grp[f"{element}/step"], data_grp["position/step"], msg=element)
+                self.assertEqual(data_grp[f"{element}/time"], data_grp["position/time"], msg=element)
+
+        def grows_both(h5_file):
+            sim_inst.sys.time = 1.5
+            value[:] = [1., 2., 3.]
+            sim_inst.write_registered_to_h5(step=3)
+            np.testing.assert_array_equal(stored_steps(h5_file, "Filament"), [0, 1, 2, 3])
+            np.testing.assert_array_equal(h5_file["observables/probe/value"][...], [[1., 2., 3.]])
+            self.assertEqual(set(self.frame_counts(h5_file).values()), {4})
+            self.assertEqual(dict(h5_file["parameters/run"].attrs), self.RUN_ATTRS['parameters/run'])
+
+        def over_junk():
+            with open(real + ".new", 'wb') as handle:    # what a killed resume can leave
+                handle.write(b"not hdf5 at all")
+            self.inscribe('LOAD_NEW')
+
+        def second_stream():
+            self.inscribe('LOAD')
+            sim_inst.inscribe_observable_group_to_h5(observable_defs=[("probe", 3, np.float64, value)],
+                                                     h5_data_path=self.path, mode='NEW')
+        rows = [   # (label, inscription, then on the open file)
+            ('NEW', lambda: self.inscribe('NEW', attrs=self.RUN_ATTRS), append_frames),
+            ('LOAD_NEW over a junk .new', over_junk, as_after_new),
+            ('LOAD', lambda: self.inscribe('LOAD'), as_after_new),
+            ('a second stream', second_stream, grows_both),
+        ]
+        for label, inscription, then in rows:
+            with self.subTest(label):
+                try:
+                    inscription()
+                    h5_file = sim_inst.io_dict['h5_file']
+                    self.assertEqual((superblock_version(real), h5_file.libver, h5_file.swmr_mode,
+                                      superblock_flags(real)), (3, LIBVER, True, 5))
+                    self.assertEqual((h5_file.filename, os.path.islink(self.path) and os.readlink(self.path)),
+                                     (real, real))
+                    self.assertEqual((os.listdir(link_dir), os.listdir(real_dir)), (["out.h5"], ["out.h5"]))
+                    then(h5_file)
+                finally:
+                    self.reset_io_state()
+
+    def test_an_argument_error_keeps_the_open_stream(self):
+        """Each check site of an inscription into the open file raises before anything is touched: the open file
+        stays the same handle and appends."""
+        def observables(mode='NEW', path=None):
+            return sim_inst.inscribe_observable_group_to_h5(observable_defs=[("probe", 3, np.float64, np.zeros(3))],
+                                                            h5_data_path=path or self.path, mode=mode)
+        self.inscribe('NEW')
+        observables()
+        sim_inst.write_registered_to_h5(step=0)
+        self.reset_io_state()
+        cases = {   # label: (the stream open, error, fragment of the raise, call)
+            'a path other than the open file': ('particles', ValueError, "inscribed and open",
+                                                lambda: observables(path=self.path + "x")),
+            'a second particle inscription': ('particles', RuntimeError, "already has particle groups inscribed",
+                                              lambda: self.inscribe('LOAD_NEW')),
+            'a second observable inscription': ('observables', RuntimeError, "already has observables inscribed",
+                                                lambda: observables(mode='LOAD')),
+        }
+        for step, (label, (stream, error, fragment, call)) in enumerate(cases.items(), start=1):
+            with self.subTest(label):
+                try:
+                    self.inscribe('LOAD') if stream == 'particles' else observables(mode='LOAD')
+                    live = sim_inst.io_dict['h5_file']
+                    with self.assertRaisesRegex(error, fragment):
+                        call()
+                    self.assertIs(sim_inst.io_dict['h5_file'], live)
+                    sim_inst.write_registered_to_h5(step=step)
+                finally:
+                    self.reset_io_state()
+
+    def test_a_failed_inscription_inscribes_nothing_and_notes_a_deleted_new(self):
+        """A failure leaves nothing inscribed and no `.new`; "<real> is unchanged" is noted exactly when a staged
+        `.new` was deleted (a v0 file is refused before any `.new`)."""
+        self.write_frames([0, 1])
+        v0 = os.path.join(self.tmpdir.name, "v0.h5")
+        with h5py.File(self.path, 'r') as src, h5py.File(v0, 'w') as dst:     # h5py's default bounds: v0
+            for name in src:
+                src.copy(src[name], dst, name=name)
+        real_kernel = write_module._observables_new
+
+        def kernel_then_fail(writer):           # after the stream was created
+            real_kernel(writer)
+            raise RuntimeError("forced in the body")
+
+        def second_stream(path):
+            self.inscribe('LOAD_NEW', path=path)
+            with patch.object(write_module, '_observables_new', kernel_then_fail):
+                sim_inst.inscribe_observable_group_to_h5(observable_defs=[("probe", 3, np.float64, np.zeros(3))],
+                                                         h5_data_path=path, mode='NEW')
+
+        def resume_with_another_property(path):
+            sim_inst.io_dict['properties'] = list(self.SOURCE_PROPERTIES) + [('v', 3, np.float64)]
+            self.inscribe('LOAD_NEW', path=path)
+
+        def frames_and_no_observables(path, _before):
+            with h5py.File(path, 'r') as h5_file:
+                np.testing.assert_array_equal(stored_steps(h5_file, "Filament"), [0, 1])
+                self.assertNotIn("observables", h5_file)
+
+        def unchanged(path, before):
+            with open(path, 'rb') as handle:
+                self.assertEqual(handle.read(), before)
+
+        cases = {   # label: (source, call on the copy, error, fragment of the raise, noted, the copy afterwards)
+            'a resume failing in the body': (self.path, resume_with_another_property,
+                                             RuntimeError, "does not match", True, unchanged),
+            'a second stream failing in the body': (self.path, second_stream, RuntimeError, "forced in the body",
+                                                    True, frames_and_no_observables),
+            'a superblock-v0 file': (v0, lambda path: self.inscribe('LOAD_NEW', path=path), RuntimeError,
+                                     "superblock version 0.*Start a fresh NEW file", False, unchanged),
+        }
+        for index, (label, (source, call, error, fragment, noted, check)) in enumerate(cases.items()):
+            with self.subTest(label):
+                path = os.path.realpath(os.path.join(self.tmpdir.name, f"failure_{index}.h5"))
+                shutil.copy2(source, path)
+                with open(path, 'rb') as handle:
+                    before = handle.read()
+                self.pin()
+                try:
+                    with self.assertRaisesRegex(error, fragment) as failure:
+                        call(path)
+                    note = f"found on the staged copy {path}.new (deleted); {path} is unchanged"
+                    self.assertEqual(getattr(failure.exception, '__notes__', []), [note] if noted else [])
+                    io_dict = sim_inst.io_dict
+                    self.assertEqual((io_dict['h5_file'], io_dict['registered_group_type'],
+                                      io_dict['registered_observables'], dict(io_dict['flat_part_view'])),
+                                     (None, None, {}, {}))
+                    self.assertFalse(os.path.exists(path + ".new"))
+                    check(path, before)
+                finally:
+                    self.reset_io_state()
+
+    def test_every_frame_and_checkpoint_is_fsynced(self):
+        """Each frame writer refuses with nothing inscribed, fsyncs the trajectory once and returns `(frame, step)`
+        (write_registered_to_h5 the particle row, here one ahead of the observables'); a symlinked checkpoint
+        fsyncs its frame with `.tmp` open, then the closed `.tmp`, then `os.replace`s the real file, then fsyncs its
+        directory: a node failure leaves a whole file, the link kept."""
+        writes = {'write_part_group_to_h5': (0, 1), 'write_registered_to_h5': (1, 2),
+                  'write_observable_group_to_h5': (1, 3)}       # name: (frame, step)
+        for name in writes:
+            with self.subTest(name), self.assertRaisesRegex(RuntimeError, "have been inscribed in HDF5"):
+                getattr(sim_inst, name)(step=0)
+        self.inscribe('NEW')
+        sim_inst.inscribe_observable_group_to_h5(observable_defs=[("probe", 3, np.float64, np.zeros(3))],
+                                                 h5_data_path=self.path, mode='NEW')
+        inode = lambda path: (os.stat(path).st_dev, os.stat(path).st_ino)
+        calls, real_fsync, real_replace = [], os.fsync, os.replace
+
+        def fsync(fd):          # (event, inode, whether HDF5 holds that file open)
+            status = os.fstat(fd)
+            open_files = {(held.st_dev, held.st_ino) for held in
+                          (os.fstat(fid.get_vfd_handle()) for fid in h5py.h5f.get_obj_ids(types=h5py.h5f.OBJ_FILE))}
+            calls.append(("fsync", (status.st_dev, status.st_ino), (status.st_dev, status.st_ino) in open_files))
+            real_fsync(fd)
+
+        def replace(src, dst):
+            calls.append(("replace", src, dst))
+            real_replace(src, dst)
+
+        link, real, link_dir, real_dir = self.symlinked("ckpt.h5")
+        with patch.object(os, "fsync", fsync), patch.object(os, "replace", replace):
+            for name, (frame, step) in writes.items():
+                with self.subTest(name):
+                    calls.clear()
+                    sim_inst.sys.time = 0.5 * step
+                    self.assertEqual(getattr(sim_inst, name)(step=np.int64(step)), (frame, step))
+                    self.assertEqual(calls, [("fsync", inode(self.path), True)])
+            calls.clear()
+            sim_inst.write_checkpoint([Filament], link, step=3)
+        self.assertEqual(calls, [("fsync", inode(real), True),        # the frame, .tmp still open
+                                 ("fsync", inode(real), False),       # the renamed file keeps its inode
+                                 ("replace", real + ".tmp", real),
+                                 ("fsync", inode(real_dir), False)])
+        self.assertEqual((os.path.islink(link) and os.readlink(link), os.listdir(link_dir)), (real, ["ckpt.h5"]))
+        # a direct caller (SCRIPTS) may pass the link itself: durable_replace replaces the real file, the link stays
+        staged = os.path.join(link_dir, "staged")
+        with open(staged, 'wb') as handle:
+            handle.write(b"replacement")
+        write_module.durable_replace(staged, link)
+        with open(real, 'rb') as handle:
+            self.assertEqual((handle.read(), os.path.islink(link), os.listdir(link_dir)), (b"replacement", True, ["ckpt.h5"]))
+
+
+class SwmrKillTest(unittest.TestCase):
+    """Kills at every `pwrite` of an append (1 and 65 frames, 1 on a NEW-created file) and of a resume, through
+    `test/swmr_kill_harness.py` under the LD_PRELOAD shim `test/killshim.c` (one subprocess, forked children);
+    skipped without a C compiler."""
+
+    @unittest.skipIf(shutil.which("cc") is None, "no C compiler for the kill shim")
+    def test_every_kill_point_resumes(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        with tempfile.TemporaryDirectory() as workdir:
+            shim = os.path.join(workdir, "killshim.so")
+            subprocess.run(["cc", "-shared", "-fPIC", "-O2", "-o", shim, os.path.join(here, "killshim.c")],
+                           check=True)
+            # this checkout first: the subprocess must test the code this suite imports
+            repo = os.path.dirname(here)
+            pythonpath = os.pathsep.join(filter(None, [repo, os.environ.get("PYTHONPATH")]))
+            env = dict(os.environ, LD_PRELOAD=shim, PYTHONPATH=pythonpath)
+            run = subprocess.run([sys.executable, os.path.join(here, "swmr_kill_harness.py"), shim, workdir],
+                                 capture_output=True, text=True, env=env, timeout=600)
+        self.assertEqual(run.returncode, 0, msg=run.stderr[-3000:])
+        report = json.loads(run.stdout.strip().splitlines()[-1])
+        self.assertEqual(os.path.realpath(report['pressomancy_file']),
+                         os.path.realpath(os.path.join(repo, "pressomancy", "__init__.py")))
+        self.assertEqual(report['superblock_version'], 3)
+        self.assertEqual(set(report['append']), {'1', '65'})     # a missing scan must not pass
+        self.assertEqual(set(report['append_new']), {'1'})
+        for kind in ('append', 'append_new'):     # into a resumed (installed) file, into a NEW-created one
+            for n_frames, scan in report[kind].items():
+                with self.subTest(scan=kind, frames=n_frames):
+                    self.assertGreaterEqual(scan['kill_points'], 5, msg="the shim killed too rarely to mean anything")
+                    self.assertEqual(scan['failures'], [])
+                    self.assertEqual(scan['ok'], scan['kill_points'])
+                    self.assertEqual(scan['flags'], {'5': scan['kill_points']})     # every crashed file is flagged
+        scan = report['resume']
+        self.assertGreaterEqual(scan['kill_points'], 1)
+        self.assertEqual(scan['failures'], [])
+        self.assertEqual(scan['ok'], scan['kill_points'])
+        self.assertEqual(scan['intact'] + scan['installed'], scan['kill_points'])
+        self.assertGreater(scan['intact'], 0)       # kills before the replace were hit
+        self.assertGreater(scan['installed'], 0)    # and the reopen's own write

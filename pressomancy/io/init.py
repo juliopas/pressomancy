@@ -694,8 +694,9 @@ class H5Init:
         Notes
         -----
         All links are collected and validated before the system is touched, so a
-        failure leaves no partial topology behind. Stored parameters are float32, so
-        ``k``/``r_0`` round-trip to float32 precision only.
+        failure leaves no partial topology behind. Stored parameters are restored as
+        stored: float32 in trajectories and samples (``k``/``r_0`` round-trip to float32
+        precision only), float64 in checkpoints (exact).
         """
         objs, group_name, frame = self._resolve_frame(registered_objs, frame, step, time,
                                                       'set_bonds_from_src')

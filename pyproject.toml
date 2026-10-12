@@ -12,9 +12,9 @@ authors = [
     { name = "Deniz Mostarac", email = "deniz.mostarac@uniroma1.it" },
     { name = "Júlio P. A. Santos", email = "julio.palma.de.assuncao.santos@univie.ac.at" },
 ]
-# Python floor is set by real usage in the codebase, not an arbitrary choice.
-# Support for oldest version still maintained by python (see https://devguide.python.org/versions/)
-requires-python = ">=3.10"
+# Python floor is set by real usage in the codebase, not an arbitrary choice:
+# BaseException.add_note (3.11, io/write.py); oldest maintained python version (see https://devguide.python.org/versions/)
+requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",

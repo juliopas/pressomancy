@@ -219,7 +219,8 @@ class SimulationTest(BaseTestCase):
         self.assertEqual(sim_inst._h5_writer._slice_cache, {})
 
     def test_set_sys_configures_the_system(self):
-        """set_sys sets periodicity, time_step, skin and min_global_cut; it refuses without VIRTUAL_SITES_RELATIVE."""
+        """set_sys sets periodicity (all periodic by default), time_step, skin and min_global_cut; it refuses without
+        VIRTUAL_SITES_RELATIVE."""
         # cleanup() resets neither time_step nor skin: restore what create_system set
         self.addCleanup(sim_inst.set_sys, min_global_cut=BaseTestCase.min_global_cut)
         system = sim_inst.sys
@@ -228,6 +229,8 @@ class SimulationTest(BaseTestCase):
         sim_inst.set_sys(timestep=0.02, min_global_cut=2.)
         self.assertEqual((list(system.periodicity), system.time_step, system.cell_system.skin, system.min_global_cut),
                          ([True] * 3, 0.02, 0.5, 2.))
+        sim_inst.set_sys(timestep=0.02, min_global_cut=2., periodicity=(True, True, False))
+        self.assertEqual(list(system.periodicity), [True, True, False])
         with missing_feature('VIRTUAL_SITES_RELATIVE'), self.assertRaisesRegex(MissingFeature, 'VirtualSitesRelative'):
             sim_inst.set_sys()
 

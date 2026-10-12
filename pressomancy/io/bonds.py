@@ -13,7 +13,8 @@ Layout, for one particle group ``<Group>``::
     /pressomancy/<Group>/bond_params/angle_id     int32 (N2,)  row-aligned with ``angles``
     /pressomancy/<Group>/bond_params/dihedral_id  int32 (N3,)  row-aligned with ``dihedrals``
     /pressomancy/<Group>/bond_params/<BondClass>  compound, one row per *registered* bond
-                                                  (``bond_id`` + exactly that class's parameters)
+                                                  (``bond_id`` + exactly that class's parameters;
+                                                  bond floats follow the pos dtype)
 
 A link is stored once, on its owner (the particle whose ``part.bonds`` lists it).
 Inside pressomancy a particle is an id; the file's column indices exist only in
@@ -109,8 +110,8 @@ def _param_items(handle):
     return [(n, params[n]) for n in names if n not in _SKIP_PARAMS]
 
 
-def h5_dtype_for(handle):
-    """Compound dtype describing ``handle``'s parameters, plus ``bond_id``."""
+def h5_dtype_for(handle, float_dtype):
+    """Compound dtype describing ``handle``'s parameters, plus ``bond_id``; float parameters as ``float_dtype``."""
     fields = [("bond_id", np.int32)]
     for name, value in _param_items(handle):
         arr = np.asarray(value)
@@ -120,7 +121,7 @@ def h5_dtype_for(handle):
                 " This is currently not supported."
             )
         if arr.dtype.kind == "f":
-            base = np.float32
+            base = float_dtype
         elif arr.dtype.kind in "iu":
             base = np.int32
         elif arr.dtype.kind == "b":
@@ -137,8 +138,8 @@ def h5_dtype_for(handle):
 def _param_signature(bond_cls, params):
     """Hashable identity of ``(bond_cls, params)``, comparable across the file.
 
-    Floats are rounded to ``float32`` because that is what ``h5_dtype_for``
-    stores, so a live ``float64`` parameter and its own stored copy produce the
+    Floats are rounded to ``float32``, the narrowest dtype ``h5_dtype_for``
+    stores (bond floats follow the pos dtype), so a live ``float64`` parameter and its own stored copy produce the
     *same* signature and a lossless round trip compares equal. The class is
     keyed by name rather than by the class object, so a file read in another
     process compares against the live registry all the same.
@@ -185,14 +186,14 @@ def _stored_links_by_particle(h5_file, group_name):
     return stored, by_particle
 
 
-def write_bond_params(params_grp, sys):
-    """Write ``<params_grp>/<BondClass>``, one compound table per registered bond class."""
+def write_bond_params(params_grp, sys, float_dtype):
+    """Write ``<params_grp>/<BondClass>``, one compound table per registered bond class, floats as ``float_dtype``."""
     by_type = defaultdict(list)
     for bond_id, handle in _registered_bonds(sys):
         by_type[type(handle)].append((bond_id, handle))
 
     for bond_cls, entries in by_type.items():
-        dtype = h5_dtype_for(entries[0][1])
+        dtype = h5_dtype_for(entries[0][1], float_dtype)
         names = [n for n in dtype.names if n != "bond_id"]
 
         table = np.empty(len(entries), dtype=dtype)
@@ -231,13 +232,15 @@ def _columns_of(ids, id_rows, group_name, bond_ids):
     return columns
 
 
-def write_bonds(h5_file, group_name, particles, sys):
+def write_bonds(h5_file, group_name, particles, sys, float_dtype):
     """Write the link tables and parameter tables of ``group_name``. Call once, at inscription.
 
     ``particles`` is the flat view for one registered group, in the *same order*
     as the columns of that group's ``<element>/value`` (ascending id); link rows
     are stored as column indices into it. Returns ``n_links``, the number of
-    links over all tables (what ``check_bond_count`` compares).
+    links over all tables (what ``check_bond_count`` compares). ``float_dtype`` is
+    the dtype of the float bond parameters: the group's ``pos`` dtype (float32 for
+    trajectories and samples, float64 for checkpoints: exact restarts).
 
     Raises:
         ValueError: If ``particles`` is not in strictly ascending id order.
@@ -246,7 +249,7 @@ def write_bonds(h5_file, group_name, particles, sys):
     """
     conn_grp = h5_file.require_group(f"connectivity/{group_name}")
     params_grp = h5_file.require_group(f"pressomancy/{group_name}/bond_params")
-    write_bond_params(params_grp, sys)
+    write_bond_params(params_grp, sys, float_dtype)
 
     ids = np.array([int(part.id) for part in particles], dtype=np.int64)
     if not np.all(np.diff(ids) > 0):
@@ -410,7 +413,8 @@ def read_bond_params(h5_file, group_name):
     """``{bond_id: (bond_class, {param: value})}`` from the class tables of ``pressomancy/<group>/bond_params``.
 
     The class tables are the compound datasets there; the ``*_id`` arrays
-    (plain int32) are skipped.
+    (plain int32) are skipped. Float parameters come back as Python floats from
+    either table dtype (bond floats follow the pos dtype).
     """
     table = {}
     for type_name, dset in h5_file[f"pressomancy/{group_name}/bond_params"].items():

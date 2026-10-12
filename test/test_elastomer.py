@@ -208,6 +208,9 @@ class ElastomerTest(BaseTestCase):
                 self.assertAlmostEqual(result["gap_before"], -push, places=6)
                 self.assertTrue(result["converged"])
                 self.assertGreater(result["gap_after"], -1e-4)
+                # 1e-3 is relax_overlaps' default per-step cap; the old bug passed the whole budget as the cap
+                # and cleared in a few steps
+                self.assertGreaterEqual(result["steps"], int(push / 1e-3))
 
     def test_relax_overlaps_budget_is_a_hard_limit(self):
         """A pinned bead under a large force makes steepest descent report 0 steps; relaxing still ends at once."""

@@ -64,8 +64,8 @@ class Simulation():
 
     Methods:
         Setup and system configuration
-            set_sys(timestep, min_global_cut): configure cell system, time step and
-                the virtual-site scheme. NOT called automatically -- callers must invoke it.
+            set_sys(timestep, min_global_cut, periodicity): configure cell system, time step,
+                periodicity and the virtual-site scheme. NOT called automatically -- callers must invoke it.
             set_author(name, email): author metadata for new HDF5 files.
             rebind_sys(new_sys): rebind to a new espresso handle after a checkpoint load.
             modify_system_attribute(requester, attribute_name, action): permissioned mutation hook
@@ -95,16 +95,22 @@ class Simulation():
             init_lb(kT, agrid, dens, visc, gamma, timestep), create_flow_channel(slip_vel).
 
         HDF5 input/output
-            inscribe_part_group_to_h5(group_type, h5_data_path, mode, force_resize_to_size, rewind_to_step) / 
-            inscribe_observable_group_to_h5(observable_defs, h5_data_path, mode, force_resize_to_size,
-                rewind_to_step): register the streams; `io_dict['properties']` (id, type, pos)
-                is validated, and on LOAD/LOAD_NEW compared with the file (mismatch raises). The
-                two truncation forms (frame count / stored step, exclusive) run before the load checks.
-            write_part_group_to_h5(step) / write_observable_group_to_h5(step) / 
-                write_registered_to_h5(step): append one frame; `step` must strictly increase.
+            inscribe_part_group_to_h5(group_type, h5_data_path, mode, force_resize_to_size, rewind_to_step,
+                attrs) / inscribe_observable_group_to_h5(observable_defs, h5_data_path, mode,
+                force_resize_to_size, rewind_to_step, attrs): register the streams, every particle group
+                in one call and every observable in one call (a second call of one kind raises); a
+                further stream goes into the open file by the same path. `io_dict['properties']`
+                (id, type, pos) is validated, and on LOAD/LOAD_NEW compared with the file (mismatch raises).
+                The two truncation forms (frame count / stored step, exclusive) run before the load checks.
+                `attrs` ({group path: {name: value}}) is the caller's metadata, written before the file
+                is switched to SWMR mode (NEW: at the real name; LOAD/LOAD_NEW: in a copy that is then
+                installed atomically and reopened for appends). After the call: frame appends only.
+            write_part_group_to_h5(step) / write_observable_group_to_h5(step) /
+                write_registered_to_h5(step): append one frame (flushed and fsynced) and return
+                `(frame, step)`; `step` is any strictly increasing integer counter.
             write_checkpoint(group_type, path, step): a verified one-frame restart file (full
                 float64 state, bonds, time and thermostat counters), written via `path + '.tmp'`
-                and `os.replace` (corruption safe); `restart_from_checkpoint` reads it back and
+                and `durable_replace` (corruption safe); `restart_from_checkpoint` reads it back and
                 `inscribe_*(..., rewind_to_step=step)` re-aligns the trajectory.
             restart_from_checkpoint(objects, path, src_to_loc, bonds, place_from, r_cut_override):
                 mirrors `load_from_src` over every stored type with the fixed state list
@@ -207,7 +213,7 @@ class Simulation():
         return self._h5_init.get_prop_from_src(objects, src_type, prop,
                                                frame=frame, step=step, time=time)
 
-    def set_sys(self, timestep=0.01, min_global_cut=3.0):
+    def set_sys(self, timestep=0.01, min_global_cut=3.0, periodicity=(True, True, True)):
         '''
         Set espresso cellsystem params, and import virtual particle scheme.
 
@@ -218,11 +224,12 @@ class Simulation():
             attribute is `time_step`, and passing `time_step=` here is silently ignored.
         :param min_global_cut: float (=3.0) | minimum global interaction range. Together with the
             skin (fixed at 0.5) this is not guaranteed optimal and should be tuned per simulation.
+        :param periodicity: (bool, bool, bool) (=all True) | espresso's periodicity per axis.
         :return: None
         '''
         np.random.seed(seed=self.seed)
         logging.info(f'core.seed: {self.seed}')
-        self.sys.periodicity = (True, True, True)
+        self.sys.periodicity = periodicity
         self.sys.time_step = timestep
         self.sys.cell_system.skin = 0.5
         self.sys.min_global_cut = min_global_cut
@@ -807,35 +814,37 @@ class Simulation():
         """Flat preorder list of every object reachable via ``.associated_objects``."""
         return self._h5_writer._collect_instances_recursively(roots)
 
-    def inscribe_part_group_to_h5(self, group_type=None, h5_data_path=None, mode='NEW',
-                                  force_resize_to_size=None, rewind_to_step=None):
-        """Inscribe particle groups into an HDF5 file. See H5Writer.inscribe_part_group_to_h5."""
+    def inscribe_part_group_to_h5(self, group_type, h5_data_path, mode='NEW',
+                                  force_resize_to_size=None, rewind_to_step=None, attrs=None):
+        """Inscribe particle groups into an HDF5 file; `attrs` ({group path: {name: value}}) is written
+        before the file enters SWMR mode. See H5Writer.inscribe_part_group_to_h5."""
         return self._h5_writer.inscribe_part_group_to_h5(
             group_type=group_type, h5_data_path=h5_data_path, mode=mode,
-            force_resize_to_size=force_resize_to_size, rewind_to_step=rewind_to_step)
+            force_resize_to_size=force_resize_to_size, rewind_to_step=rewind_to_step, attrs=attrs)
 
-    def inscribe_observable_group_to_h5(self, observable_defs=None, h5_data_path=None, mode='NEW',
-                                        force_resize_to_size=None, rewind_to_step=None):
+    def inscribe_observable_group_to_h5(self, observable_defs, h5_data_path, mode='NEW',
+                                        force_resize_to_size=None, rewind_to_step=None, attrs=None):
         """Inscribe observable streams into an HDF5 file. See H5Writer.inscribe_observable_group_to_h5."""
         return self._h5_writer.inscribe_observable_group_to_h5(
             observable_defs=observable_defs, h5_data_path=h5_data_path, mode=mode,
-            force_resize_to_size=force_resize_to_size, rewind_to_step=rewind_to_step)
+            force_resize_to_size=force_resize_to_size, rewind_to_step=rewind_to_step, attrs=attrs)
 
     def write_part_group_to_h5(self, step):
-        """Append one particle frame. See H5Writer.write_part_group_to_h5."""
+        """Append one particle frame; returns `(frame, step)`. See H5Writer.write_part_group_to_h5."""
         return self._h5_writer.write_part_group_to_h5(step)
 
-    def write_observable_group_to_h5(self, step=None):
-        """Append one observable frame. See H5Writer.write_observable_group_to_h5."""
-        return self._h5_writer.write_observable_group_to_h5(step=step)
+    def write_observable_group_to_h5(self, step):
+        """Append one observable frame; returns `(frame, step)`. See H5Writer.write_observable_group_to_h5."""
+        return self._h5_writer.write_observable_group_to_h5(step)
 
-    def write_registered_to_h5(self, step=None):
-        """Append one synchronized frame to every registered stream. See H5Writer.write_registered_to_h5."""
-        return self._h5_writer.write_registered_to_h5(step=step)
+    def write_registered_to_h5(self, step):
+        """Append one synchronized frame to every registered stream; returns `(frame, step)`.
+        See H5Writer.write_registered_to_h5."""
+        return self._h5_writer.write_registered_to_h5(step)
 
     def write_checkpoint(self, group_type, path, step):
         """Write a verified one-frame checkpoint of `group_type` to `path` (via `path + '.tmp'` and
-        `os.replace`); returns `step`. See H5Writer.write_checkpoint."""
+        `durable_replace`); returns `step`. See H5Writer.write_checkpoint."""
         return self._h5_writer.write_checkpoint(group_type, path, step)
 
     def rebind_sys(self, new_sys):

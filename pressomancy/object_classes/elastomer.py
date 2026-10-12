@@ -482,7 +482,7 @@ class Elastomer(metaclass=Simulation_Object):
         max_steps = int(np.ceil(max_displacement / max_displacement_per_step))
         max_travel = max_steps * max_displacement_per_step
         fix_the_start = ("Fix the initial configuration (packing, mixing, hand placement) before raising "
-                         "max_steps.")
+                         "max_displacement_factor.")
 
         def _gap():
             zs = [hndl.pos[2] for hndl in self.network_beads()]
@@ -495,8 +495,8 @@ class Elastomer(metaclass=Simulation_Object):
         if gap_before < -max_travel:
             raise RuntimeError(
                 f"relax_overlaps: the initial configuration is too overlapped: a bead sits {-gap_before} below "
-                f"the wall plane, but the relaxation moves a bead at most max_steps * max_displacement = "
-                f"{max_travel} (20% of a bead diameter by default). {fix_the_start}"
+                f"the wall plane, but the relaxation moves a bead at most"
+                f" {max_travel} (20% of a bead diameter by default).\n{fix_the_start}"
             )
 
         types_M = tuple(typ for key, typ in self.part_types.items() if "real" in key)
@@ -515,7 +515,7 @@ class Elastomer(metaclass=Simulation_Object):
             self.sys.integrator.run(0, recalc_forces=True)
             max_f_before = _max_f()
             for _ in range(int(np.ceil(max_steps / steps_per_chunk))):
-                self.sys.integrator.set_steepest_descent(f_max=f_max, gamma=gamma, max_displacement=max_displacement)
+                self.sys.integrator.set_steepest_descent(f_max=f_max, gamma=gamma, max_displacement=max_displacement_per_step)
                 steps += self.sys.integrator.run(steps_per_chunk)
                 self.sys.integrator.set_vv()
                 self.sys.integrator.run(0, recalc_forces=True)

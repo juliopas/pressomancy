@@ -35,18 +35,8 @@ class BaseTestCase(unittest.TestCase):
     @staticmethod
     def reset_io_state():
         """Close whatever HDF5 file is open and clear every field of `io_dict`."""
-        io_dict = sim_inst.io_dict
-        h5_file = io_dict.get('h5_file')
-        if h5_file is not None:
-            h5_file.flush()
-            h5_file.close()
-        io_dict['h5_file'] = None
-        io_dict['flat_part_view'].clear()
-        io_dict['registered_observables'] = {}
-        io_dict['registered_group_type'] = None
-        io_dict['bonds'] = False
-        io_dict['bond_links'] = {}
-        sim_inst._h5_writer._slice_cache.clear()
+        sim_inst._h5_writer._discard()     # closes the file, clears every registration
+        sim_inst.io_dict['bonds'] = False
 
     @staticmethod
     def cleanup(box_dim):

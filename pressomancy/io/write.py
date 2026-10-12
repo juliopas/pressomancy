@@ -21,7 +21,43 @@ Layout (``layout = "h5md-1"``)::
 ``Simulation`` holds one ``H5Writer`` and delegates to it;
 ``Simulation.io_dict`` is a property that points into this object's dict, so
 the public API is unchanged.
+
+The inscription lifecycle (crash safety; ``H5Writer._inscription``). Every file is
+created in the HDF5 1.10 format (``LIBVER``) and, from the end of every inscription
+call on, held in SWMR-write mode, where only frame appends happen: HDF5 orders their
+disk writes so that a kill at any instant leaves a readable file (at worst a ragged
+last frame, which ``rewind_to_step`` trims). Each frame write flushes and fsyncs
+(``_write_frame``). One inscription call:
+
+1. checks its arguments (``_check_inscription``, the stream's own definitions, the
+   ``io_dict['properties']`` list); an error raises with an inscribed stream still
+   open and appendable;
+2. opens the file the stream goes into. A ``NEW`` with nothing inscribed creates the
+   file at its real name (symlinks resolved) and writes the header (``/h5md``,
+   ``/parameters/pressomancy``, ``/pressomancy/system``). Anything else -- a resume
+   (``LOAD``/``LOAD_NEW``) or a second stream into the open file, which is closed
+   first -- never modifies the file at its real name: it is copied (read through
+   ``read.open_output``, so a cleanly closed, crashed or still-flagged file copies
+   alike) into a fresh ``<path>.new`` (a stale one is overwritten, never read). A
+   superblock older than v3 (a file from before the SWMR lifecycle) is refused: the
+   copy would keep its v1 B-tree chunk indices, whose appends are not kill-safe;
+3. adds the stream: creates its datasets (``NEW``), or truncates (``rewind_to_step``
+   / ``force_resize_to_size``) and checks it against the file and the live system;
+4. writes the caller's ``attrs`` (``{group path: {attribute name: value}}``);
+5. switches to SWMR: a created file by ``swmr_mode = True``; ``.new`` is closed,
+   installed by ``durable_replace`` (fsync, rename, fsync of the directory) and
+   reopened directly in SWMR-write mode.
+
+Any failure from step 2 on leaves nothing inscribed (``H5Writer._discard``). A staged
+inscription that fails before its install deletes ``.new``: the real file is untouched
+and the exception carries a note saying so; one that fails after it (the directory
+fsync, the reopen) leaves the real file as the complete copy, without a note. A failed
+first ``NEW`` leaves its partial file at the real name. A kill before the install leaves the real file intact;
+after it only appends happen. Anything written to a file in SWMR mode other
+than frames is not covered by the ordering guarantee (HDF5 2.0 allows it, but a kill
+during that flush can leave the file unrepairable): metadata goes through ``attrs``.
 '''
+import contextlib
 import logging
 import os
 from collections import defaultdict
@@ -32,8 +68,15 @@ import numpy as np
 
 from pressomancy.io.bonds import write_bonds, verify_bond_params, check_bond_count
 from pressomancy.io.read import (LAYOUT, _TIMELINE, _TIME_RTOL, _require_layout, attr_name,
-                                 element_name, frame_of_step, stored_steps)
+                                 element_name, open_output, stored_steps, superblock_version)
 from pressomancy.infra import api_agnostic_feature_check, get_repo_context, get_submission_creator_info
+
+
+#: The on-disk format every file is created with: HDF5 1.10 on both bounds, the oldest
+#: that supports SWMR (extensible-array chunk indices, checksummed metadata), pinned so
+#: the file does not depend on the library that wrote it. ``H5Writer._inscription``'s
+#: SWMR-write reopen repeats it as ``h5py.h5f.LIBVER_V110``.
+LIBVER = ('v110', 'v110')
 
 
 #: Per-particle state a checkpoint carries,
@@ -203,16 +246,17 @@ class H5Writer:
                     f"{h5_file.filename}; appending to that file would store particles of a "
                     "different numeric type than the frames already in it.")
 
-    def _inscribe_h5_stream(self, mode, force_resize_to_size, rewind_to_step, setup, new_kernel,
-                            load_new_kernel, load_kernel, resize_kernel, rewind_kernel):
-        """Run the shared inscription lifecycle: setup, then NEW (metadata + create) or
-        LOAD/LOAD_NEW (truncate, then load).
+    def _check_inscription(self, kind, mode, h5_data_path, force_resize_to_size, rewind_to_step):
+        """The argument checks every inscription runs before it touches anything (so an error keeps
+        an inscribed stream open and appendable); returns the real path (symlinks resolved, so a
+        replace lands beside the real file).
 
-        Truncation (``force_resize_to_size`` -> ``resize_kernel``, ``rewind_to_step``
-        -> ``rewind_kernel``; one at most) runs BEFORE the load kernel, so the
-        kernel's checks (live particles against the file's last frame, frame
-        count) see the frames that will actually be appended to.
+        ``kind`` is the ``io_dict`` registration of the inscribing stream kind
+        (``'registered_group_type'`` or ``'registered_observables'``): a second inscription of one
+        kind into the open file would replace the first one's registration, whose stream would then
+        silently stop getting frames, so it raises.
         """
+        open_file = self.io_dict['h5_file']
         if mode not in ('NEW', 'LOAD', 'LOAD_NEW'):
             raise ValueError(f"Unknown mode: {mode}")
         truncating = force_resize_to_size is not None or rewind_to_step is not None
@@ -223,62 +267,115 @@ class H5Writer:
         for name, value in (('force_resize_to_size', force_resize_to_size), ('rewind_to_step', rewind_to_step)):
             if value is not None and (isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer))):
                 raise TypeError(f'{name} must be an integer, got {value!r}')
+        path = os.path.realpath(os.fspath(h5_data_path))
+        if open_file is not None:
+            if path != os.path.realpath(open_file.filename):
+                raise ValueError(f"{open_file.filename} is inscribed and open; a further stream goes into "
+                                 f"that file (got h5_data_path={h5_data_path!r}).")
+            if self.io_dict[kind]:
+                what, each = (('particle groups', 'group') if kind == 'registered_group_type'
+                              else ('observables', 'observable'))
+                raise RuntimeError(f"{open_file.filename} already has {what} inscribed: inscribe every {each} "
+                                   "in one call (a second inscription would replace the first one's "
+                                   "registration, and its stream would silently stop getting frames).")
+        return path
 
-        # --- Setup ---------------
-        setup()
+    def _discard(self):
+        """Back to nothing inscribed: close the open file (if any) and clear every registration."""
+        if self.io_dict['h5_file'] is not None:
+            self.io_dict['h5_file'].close()
+        self.io_dict['h5_file'] = None
+        self.io_dict['flat_part_view'].clear()
+        self.io_dict['registered_observables'] = {}
+        self.io_dict['registered_group_type'] = None
+        self.io_dict['bond_links'] = {}
+        self._slice_cache.clear()
 
-        # --- Truncate ------------
-        if force_resize_to_size is not None:
-            resize_kernel(force_resize_to_size)
-        elif rewind_to_step is not None:
-            rewind_kernel(rewind_to_step)
-        if truncating:
-            self.io_dict['h5_file'].flush()
-            logging.info(f"{mode}: truncated the registered streams (force_resize_to_size="
-                            f"{force_resize_to_size}, rewind_to_step={rewind_to_step}).")
-
-        # --- Apply mode ----------
-        if mode == 'NEW':
+    @contextlib.contextmanager
+    def _inscription(self, mode, path, attrs):
+        """Steps 2-5 of the lifecycle (module docstring) around the ``with`` body, which adds the
+        stream to ``io_dict['h5_file']``. ``path`` is the real path ``_check_inscription`` returned."""
+        staged = None           # <path>.new, once created
+        try:
+            if self.io_dict['h5_file'] is None and mode == 'NEW':
+                # A first NEW: the file at its real name, with the header.
+                h5_file = self.io_dict['h5_file'] = h5py.File(path, 'w', libver=LIBVER)
+                h5md_group = h5_file.require_group("h5md")
+                h5md_group.attrs["version"] = np.array([1, 1], dtype=np.int32)
+                h5md_group.require_group("author").attrs.update({"name": self.author_name,
+                                                                 "email": self.author_email})
+                creator_name, creator_version = get_submission_creator_info()
+                h5md_group.require_group("creator").attrs.update({"name": creator_name,
+                                                                  "version": creator_version})
+                pressomancy_group = h5_file.require_group("parameters/pressomancy")
+                pressomancy_group.attrs["version"] = get_repo_context(Path(__file__).resolve())[1]
+                pressomancy_group.attrs["layout"] = LAYOUT
+                part_types_group = pressomancy_group.require_group("part_types")
+                for key, value in self.part_types.items():
+                    part_types_group.attrs[str(key)] = int(value)
+                system_group = h5_file.require_group("pressomancy/system")
+                system_group.attrs["box_l"] = self.sys.box_l
+                system_group.attrs["periodicity"] = self.sys.periodicity
+                system_group.attrs["time_step"] = self.sys.time_step
+                system_group.attrs["seed"] = self.seed
+                system_group.attrs["kT"] = self.kT
+            else:
+                # A resume or a second stream: staged on a copy. An open file is closed first, so
+                # that no dataset is ever created in SWMR mode and its frames are never at risk.
+                if self.io_dict['h5_file'] is not None:
+                    self.io_dict['h5_file'].close()
+                version = superblock_version(path)
+                if version is not None and version < 3:
+                    raise RuntimeError(
+                        f"{mode}: {path} has HDF5 superblock version {version} (written before the SWMR "
+                        "lifecycle, or by another writer): it cannot be appended to crash-safely, and a copy "
+                        "keeps its v1 B-tree chunk indices. Start a fresh NEW file.")
+                with open_output(path) as src:
+                    # into io_dict at once, so that _discard closes it before it is deleted
+                    dst = self.io_dict['h5_file'] = h5py.File(path + '.new', 'w', libver=LIBVER)
+                    staged = path + '.new'
+                    dst.attrs.update(src.attrs)
+                    for name in src:
+                        src.copy(src[name], dst, name=name)
+            yield
             h5_file = self.io_dict['h5_file']
-            h5md_group = h5_file.require_group("h5md")
-            author_group = h5md_group.require_group("author")
-            creator_group = h5md_group.require_group("creator")
-            h5md_group.attrs["version"] = np.array([1, 1], dtype=np.int32)
-            author_group.attrs["name"] = self.author_name
-            author_group.attrs["email"] = self.author_email
-            creator_name, creator_version = get_submission_creator_info()
-            creator_group.attrs["name"] = creator_name
-            creator_group.attrs["version"] = creator_version
-            pressomancy_group = h5_file.require_group("parameters/pressomancy")
-            _, pressomancy_version = get_repo_context(Path(__file__).resolve())
-            pressomancy_group.attrs["version"] = pressomancy_version
-            pressomancy_group.attrs["layout"] = LAYOUT
-            part_types_group = pressomancy_group.require_group("part_types")
-            for key, value in self.part_types.items():
-                part_types_group.attrs[str(key)] = int(value)
-            system_group = h5_file.require_group("pressomancy/system")
-            system_group.attrs["box_l"] = self.sys.box_l
-            system_group.attrs["periodicity"] = self.sys.periodicity
-            system_group.attrs["time_step"] = self.sys.time_step
-            system_group.attrs["seed"] = self.seed
-            system_group.attrs["kT"] = self.kT
-            GLOBAL_COUNTER = new_kernel()
-            logging.info(f"Created h5 file with GLOBAL_COUNTER={GLOBAL_COUNTER} ")
-            return GLOBAL_COUNTER
-        elif mode == 'LOAD_NEW':
-            GLOBAL_COUNTER = load_new_kernel()
-            logging.info(f"Loaded h5 file with GLOBAL_COUNTER={GLOBAL_COUNTER}. Ran check. ")
-        elif mode == 'LOAD':
-            GLOBAL_COUNTER = load_kernel()
-            logging.info(f"Loaded h5 file with GLOBAL_COUNTER={GLOBAL_COUNTER}Did not run check. ")
-        return GLOBAL_COUNTER
+            for group_path, values in (attrs or {}).items():
+                h5_file.require_group(group_path).attrs.update(values)
+            if staged is None:
+                h5_file.swmr_mode = True
+            else:
+                h5_file.close()
+                durable_replace(staged, path)
+                # Reopen in ONE step, directly in SWMR-write mode: h5py's 'r+' cannot open in
+                # SWMR-write, and a kill between 'r+' (whose open already writes the "open for
+                # write" flag) and `swmr_mode = True` leaves a file that no reader opens and only
+                # `h5clear -s` repairs (measured). The fapl pins LIBVER again: without it the upper
+                # bound becomes v200. A first NEW is not staged: its file holds nothing yet, and
+                # when there is no checkpoint the run's start rule recreates an unopenable output.
+                fapl = h5py.h5p.create(h5py.h5p.FILE_ACCESS)
+                fapl.set_libver_bounds(h5py.h5f.LIBVER_V110, h5py.h5f.LIBVER_V110)
+                self.io_dict['h5_file'] = h5py.File(h5py.h5f.open(
+                    os.fsencode(path), h5py.h5f.ACC_RDWR | h5py.h5f.ACC_SWMR_WRITE, fapl=fapl))
+        except BaseException as exc:
+            self._discard()
+            if staged is not None:
+                # .new gone = installed: the real file is the complete copy, nothing to say
+                try:
+                    os.remove(staged)
+                except FileNotFoundError:
+                    pass
+                else:
+                    exc.add_note(f"found on the staged copy {staged} (deleted); {path} is unchanged")
+            raise
 
-    def inscribe_part_group_to_h5(self, group_type=None, h5_data_path=None, mode='NEW',
-                                  force_resize_to_size=None, rewind_to_step=None):
+    def inscribe_part_group_to_h5(self, group_type, h5_data_path, mode='NEW',
+                                  force_resize_to_size=None, rewind_to_step=None, attrs=None):
         """
-        Inscribe one or more groups of simulation objects into an HDF5 file.
+        Inscribe the particle groups ``group_type`` into ``h5_data_path`` (the lifecycle:
+        module docstring). When the call returns, the file is in SWMR-write mode and only
+        frame appends happen to it.
 
-        This method creates (or opens) an HDF5 file and, for each `group_type`:
+        For each `group_type`:
         - Builds a flat list of particle handles and their coordinating indices
         - Creates `/particles/<GroupName>` and one `<element>/{step,time,value}` per property
         - Creates `/pressomancy/<GroupName>/ownership/ParticleHandle_to_<OwnerClass>` tables
@@ -287,190 +384,158 @@ class H5Writer:
         Parameters
         ----------
         group_type : list of type
-            A list of `SimulationObject` subclasses. All instances of each
-            class in `self.objects` will be registered and inscribed.
-        h5_data_path : str
-            Path to the HDF5 file to write or append.
+            Simulation object classes; every instance in ``self.objects`` is a column. All groups
+            go in ONE call: a second particle inscription into the open file raises.
+        h5_data_path : str or path-like
+            The file; a symlink is resolved (the file it points at is written and replaced). A
+            further stream (observables) into the open file passes the same path.
         mode : {'NEW', 'LOAD', 'LOAD_NEW'}, optional
-            - 'NEW' : create a fresh file structure (default).
-            - 'LOAD': resume writing, taking the particle view from the live
-            objects.
-            - 'LOAD_NEW': resume writing, rebuilding the particle view from the
-              file's own id columns and checking it against the last frame.
-        force_resize_to_size : int or None, optional
-            'LOAD'/'LOAD_NEW' only: truncate every registered group to this
-            number of saved frames (its step/time pair, every element, the box
-            edges) before the load checks run.
-        rewind_to_step : int or None, optional
-            'LOAD'/'LOAD_NEW' only: truncate every registered group to end
-            at the frame stored at this step value. That frame's time must
-            equal the live ``sys.time`` (relative ``1e-6``), which
-            ``restart_from_checkpoint`` sets -- so the file can only be
-            rewound to the state the system is actually in.
+            - 'NEW': create the streams (default).
+            - 'LOAD': resume them, taking the particle view from the live objects.
+            - 'LOAD_NEW': resume them, rebuilding the particle view from the file's id columns;
+              the live particles are checked against the last frame (type exactly, pos
+              ``isclose``) and the file's ``part_types`` table against the live one (a name only
+              the file declares is registered).
+        force_resize_to_size, rewind_to_step : int or None, optional
+            Load modes only, one at most: cut every group to this many frames, or to end at the
+            frame stored at this step, whose time must equal the live ``sys.time`` (relative
+            ``1e-6``; ``restart_from_checkpoint`` sets it). Runs before the load checks.
+        attrs : dict or None, optional
+            ``{group path: {attribute name: value}}``: the caller's metadata (run parameters,
+            provenance, a per-start record), written after the streams and before the SWMR
+            switch; on a resume into the installed copy. A value h5py cannot store raises h5py's
+            ``TypeError`` after the stream was added: a first 'NEW' leaves its partial file at the
+            real name, a staged inscription deletes ``.new``.
 
         Returns
         -------
         int
-            The starting global counter for writing frames. This is 0 in
-            'NEW' mode; for 'LOAD' and 'LOAD_NEW' it is the number of saved
-            frames after any truncation.
+            The stored frame count: 0 for 'NEW', after the truncation for the load modes.
 
         Raises
         ------
         ValueError
-            If `mode` is unknown, `group_type` is not a list,
-            ``io_dict['properties']`` is malformed (it must start with
-            ``('id', None, int32), ('type', None, int16), ('pos', 3, <floating>)``,
-            attrs unique, dims None or positive, dtypes numpy-resolvable), a
-            truncation argument is given outside load modes or both are given,
-            `force_resize_to_size` exceeds the saved frames, or in load modes
-            different groups have mismatched saved step counts.
+            Before anything is touched: an unknown mode, a truncation argument outside the load
+            modes or both given, a path other than the open file's, `group_type` not a non-empty
+            list, ``io_dict['properties']`` malformed (it must start with ``('id', None, int32),
+            ('type', None, int16), ('pos', 3, <floating>)``; attrs unique, dims None or positive,
+            dtypes numpy-resolvable). Later: `force_resize_to_size` beyond the stored frames,
+            `rewind_to_step` stored twice.
         TypeError
-            If `force_resize_to_size` / `rewind_to_step` is not an integer.
+            A truncation argument that is not an integer (before anything is touched).
         KeyError
-            If `rewind_to_step` is not a stored step.
+            `rewind_to_step` is not stored.
         RuntimeError
-            In load modes, if the file is not in the ``h5md-1`` layout, if
-            ``io_dict['properties']`` does not describe the file's elements
-            exactly (set, dtype and per-particle shape -- edit the list to match
-            the file), if the `rewind_to_step` frame's time is not the live
-            ``sys.time``; in 'LOAD_NEW' mode, if the live particles do not match
-            the file's last-frame columns, or a type name is declared with a
-            different number in the file.
-
-        Notes
-        -----
-        In 'NEW' mode the method writes the H5MD root metadata under ``/h5md``,
-        pressomancy-specific metadata under ``/parameters/pressomancy`` (incl. the
-        ``layout`` attr readers check) and the system attrs under ``/pressomancy/system``.
-        In 'LOAD_NEW' mode the stored ``part_types`` table is *checked* against the live one
-        (``RuntimeError`` if a shared name carries a different number; names only the file
-        declares are registered); a file without that table resumes fine, guarded by the
-        numeric ``type``/``pos`` column check.
+            Before anything is touched: particle groups already inscribed in the open file. Load
+            modes: a superblock older than v3 (start a fresh NEW file), not the ``h5md-1``
+            layout, a ragged file (streams with different frame counts, from a killed writer:
+            resume with ``rewind_to_step``), ``io_dict['properties']`` not describing the file's
+            elements exactly (set, dtype, per-particle shape: edit the list to match the file),
+            the `rewind_to_step` frame's time not the live ``sys.time``; 'LOAD_NEW': the live
+            particles not the last frame's columns, a type name with another number in the file.
         """
-        return self._inscribe_h5_stream(
-            mode, force_resize_to_size, rewind_to_step,
-            setup=lambda: _particles_setup(self, group_type, mode, h5_data_path),
-            new_kernel=lambda: _particles_new(self, group_type),
-            load_new_kernel=lambda: _particles_load_new(self, group_type),
-            load_kernel=lambda: _particles_load(self, group_type),
-            resize_kernel=lambda n: _particles_resize(self, group_type, n),
-            rewind_kernel=lambda step: _particles_rewind(self, group_type, step),
-        )
+        path = self._check_inscription('registered_group_type', mode, h5_data_path,
+                                       force_resize_to_size, rewind_to_step)
+        if not isinstance(group_type, list) or not group_type:
+            raise ValueError("group_type must be a non-empty list of classes.")
+        _validate_properties(self.io_dict['properties'])
+        names = [grp_typ.__name__ for grp_typ in group_type]
+        with self._inscription(mode, path, attrs):
+            self.io_dict['registered_group_type'] = names
+            if mode == 'NEW':
+                n_frames = _particles_new(self, group_type)
+            else:
+                n_frames = _particles_load(self, group_type, mode, force_resize_to_size, rewind_to_step)
+        logging.info("%s: particle groups %s in %s, %d stored frame(s).", mode, names, path, n_frames)
+        return n_frames
 
-    def inscribe_observable_group_to_h5(self, observable_defs=None, h5_data_path=None, mode='NEW',
-                                        force_resize_to_size=None, rewind_to_step=None):
+    def inscribe_observable_group_to_h5(self, observable_defs, h5_data_path, mode='NEW',
+                                        force_resize_to_size=None, rewind_to_step=None, attrs=None):
         """
-        Inscribe one or more observable streams into an HDF5 file.
-
-        This method creates or reopens datasets under ``/observables/<name>/{step,time,value}``. Observable streams may be inscribed
-        independently or after particle groups have already opened the target
-        HDF5 file.
+        Inscribe observable streams, ``/observables/<name>/{step,time,value}``, into
+        ``h5_data_path``; as ``inscribe_part_group_to_h5`` for the lifecycle, the path, the
+        modes ('LOAD_NEW' checks the ``part_types`` table, 'LOAD' does not), the truncation
+        (per observable, by its own ``step``/``time``), ``attrs`` and the errors.
 
         Parameters
         ----------
         observable_defs : list of tuple
-            Non-empty list of observable definitions. Each definition must be
-            ``(name, shape, dtype, observable_value_ref)``:
-
-            - ``name`` is the HDF5 observable group name.
-            - ``shape`` is the per-frame payload shape. Scalars may use
-              ``None`` or ``()``; integer shapes are converted to one-element
-              tuples.
-            - ``dtype`` is converted with ``numpy.dtype`` and used for the
-              ``value`` dataset.
-            - ``observable_value_ref`` is the live Python object or NumPy array
-              written on each observable frame.
-        h5_data_path : str
-            Path to the HDF5 file to write or append. This is required when no
-            HDF5 handle is currently open in ``self.io_dict['h5_file']``. If a
-            file is already open, the observable groups are added to that file.
-        mode : {'NEW', 'LOAD', 'LOAD_NEW'}, optional
-            - 'NEW' : create a fresh observable structure when opening a file.
-            - 'LOAD': reopen existing observable datasets and validate them
-              against `observable_defs`.
-            - 'LOAD_NEW': as 'LOAD', after checking the file's ``part_types``
-              table against the live one, as for the particle groups (a name
-              only the file declares is registered).
-        force_resize_to_size : int or None, optional
-            'LOAD'/'LOAD_NEW' only: truncate every registered observable's
-            ``step``, ``time`` and ``value`` to this number of saved frames
-            before the load checks run.
-        rewind_to_step : int or None, optional
-            'LOAD'/'LOAD_NEW' only: truncate every registered observable
-            to end at the row whose own ``step`` is this value; that row's
-            time must equal the live ``sys.time`` (relative ``1e-6``), as
-            for the particle groups.
+            Non-empty; every observable in ONE call. Each definition is
+            ``(name, shape, dtype, observable_value_ref)``: ``shape`` is the per-frame shape
+            (``None`` or ``()`` for a scalar, an int for one dimension), ``dtype`` the ``value``
+            dataset's, ``observable_value_ref`` the live object or array read at every frame.
 
         Returns
         -------
         int
-            The starting global counter for writing frames. This is 0 in
-            'NEW' mode; for 'LOAD' and 'LOAD_NEW' it is the number of saved
-            observable frames after any truncation.
+            The stored frame count: 0 for 'NEW', after the truncation for the load modes.
 
         Raises
         ------
         ValueError
-            If `observable_defs` is not a non-empty list, if a definition does
-            not contain exactly four entries, if `mode` is unknown, if an
-            observable is missing in load modes, if its stored shape does not
-            match the requested shape, if registered observables have
-            mismatched saved step counts, if a truncation argument is given
-            outside load modes or both are given, or if `force_resize_to_size`
-            exceeds the saved frames.
-        TypeError
-            If `force_resize_to_size` / `rewind_to_step` is not an integer.
-        KeyError
-            If `rewind_to_step` is not a stored step of every observable.
+            Also (before anything is touched) if `observable_defs` is not a non-empty list, a
+            definition is not four entries, or two definitions share a name; in load modes, if
+            an observable is missing or stored with another per-frame shape. 'NEW': if an
+            observable already exists in the file.
         RuntimeError
-            In load modes, if the file is not in the ``h5md-1`` layout, or the
-            `rewind_to_step` row's time is not the live ``sys.time``; in
-            'LOAD_NEW' mode, if a type name is declared with a different number
-            in the file.
-
-        Notes
-        -----
-        In 'NEW' mode the shared HDF5 inscription lifecycle
-        writes H5MD-style root metadata under ``/h5md`` together with
-        pressomancy-specific metadata under ``/parameters/pressomancy`` before
-        the observable datasets are created.
+            Also (before anything is touched) if observables are already inscribed in the open file.
         """
-        return self._inscribe_h5_stream(
-            mode, force_resize_to_size, rewind_to_step,
-            setup=lambda: _observables_setup(self, observable_defs, mode, h5_data_path),
-            new_kernel=lambda: _observables_new(self),
-            load_new_kernel=lambda: _observables_load(self, mode),
-            load_kernel=lambda: _observables_load(self, mode),
-            resize_kernel=lambda n: _observables_resize(self, n),
-            rewind_kernel=lambda step: _observables_rewind(self, step),
-        )
+        path = self._check_inscription('registered_observables', mode, h5_data_path,
+                                       force_resize_to_size, rewind_to_step)
+        if not isinstance(observable_defs, list) or not observable_defs:
+            raise ValueError("observable_defs must be a non-empty list.")
+        registered = {}
+        for obs_def in observable_defs:
+            if len(obs_def) != 4:
+                raise ValueError("Each observable definition must be (name, shape, dtype, observable_value_ref).")
+            name, shape, dtype, observable_value_ref = obs_def
+            name = str(name)
+            if name in registered:
+                raise ValueError(f"observable_defs: duplicate observable name '{name}'.")
+            if shape is None:
+                shape = tuple()
+            elif isinstance(shape, (int, np.integer)):
+                shape = (int(shape),)
+            else:
+                shape = tuple(shape)
+            registered[name] = {'shape': shape, 'dtype': np.dtype(dtype), 'value': observable_value_ref}
+        with self._inscription(mode, path, attrs):
+            self.io_dict['registered_observables'] = registered
+            if mode == 'NEW':
+                n_frames = _observables_new(self)
+            else:
+                n_frames = _observables_load(self, mode, force_resize_to_size, rewind_to_step)
+        logging.info("%s: observables %s in %s, %d stored frame(s).", mode, list(registered), path, n_frames)
+        return n_frames
 
     def write_part_group_to_h5(self, step):
-        """Append one frame at integer ``step`` and the current ESPResSo time.
+        """Append one particle frame; returns ``(frame, step)``, frame = the row just written.
 
-        Every group has ONE ``step``/``time`` pair (hard-linked into each of its
-        elements), so the pair is appended once per group and then every
-        element's ``value`` gets its row -- the box is an element too, so
-        ``box/edges/value`` gets one ``sys.box_l`` row per frame.
+        Every group has ONE ``step``/``time`` pair (hard-linked into each of its elements), so
+        the pair gets one row per group and then every element's ``value`` gets its row -- the
+        box is an element too, so ``box/edges/value`` gets one ``sys.box_l`` row per frame.
+        The whole frame is captured before anything is written, then flushed and fsynced.
 
         step : int
-            Step counter for this frame, e.g. simulation integration step. It
-            must strictly exceed the last written step (H5MD requirement);
-            ``RuntimeError`` otherwise, raised for every group before anything
-            is written. To continue from an earlier frame, truncate the file
-            first (``inscribe_part_group_to_h5(..., rewind_to_step=...)`` or
-            ``force_resize_to_size=...``); frames are never overwritten in place.
+            Any strictly increasing integer counter (e.g. the integration step or a coarser
+            unit); the ``time`` dataset holds the physical time (``sys.time``). ``RuntimeError``
+            unless it exceeds the last written step (H5MD), raised before anything is written; to
+            continue from an earlier frame, inscribe with ``rewind_to_step`` or
+            ``force_resize_to_size`` first: frames are never overwritten in place.
         """
-        if self.io_dict['h5_file'] is None:
-            raise RuntimeError('storage file has not been inscribed!')
+        return _write_frame(self.io_dict['h5_file'], self._particle_frame(step)), int(step)
+
+    def _particle_frame(self, step):
+        """One particle frame as ``[(dataset, row)]``: every guard and every value captured,
+        nothing written (``_write_frame`` writes it), so a raise here leaves no ragged frame."""
+        if not self.io_dict['registered_group_type']:
+            raise RuntimeError('No particle groups have been inscribed in HDF5.')
         if not isinstance(step, (int, np.integer)):
             raise TypeError("step must be provided as an integer frame counter.")
         physical_time = float(self.sys.time)
+        box_l = np.asarray(self.sys.box_l, dtype=np.float64)
         particles_group = self.io_dict['h5_file']["particles"]
-        properties = self.io_dict['properties']
-
-        # Guards first, for every group, so a raise leaves no group half-written.
+        rows = []
         for grp_typ in self.io_dict['registered_group_type']:
             if self.io_dict.get('bonds', False):
                 check_bond_count(
@@ -478,54 +543,44 @@ class H5Writer:
                     self.io_dict['flat_part_view'][grp_typ],
                     group_name=grp_typ,
                 )
-            step_dataset = particles_group[grp_typ][f"{_TIMELINE}/step"]
+            data_grp = particles_group[grp_typ]
+            step_dataset = data_grp[f"{_TIMELINE}/step"]
             if step_dataset.shape[0] > 0 and step <= step_dataset[-1]:
                 raise RuntimeError(
                     f"step must strictly increase (got {step}, last {int(step_dataset[-1])}) "
                     f"for group '{grp_typ}'; to continue from an earlier frame, inscribe with "
                     "rewind_to_step or force_resize_to_size first.")
+            # The timeline once per group (hard-linked into every element); the box is an element too.
+            rows += [(step_dataset, step), (data_grp[f"{_TIMELINE}/time"], physical_time),
+                     (data_grp["box/edges/value"], box_l)]
+            for attr, dim, dtype in self.io_dict['properties']:
+                dataset = data_grp[f"{element_name(attr)}/value"]
+                value = self._capture_frame(grp_typ, attr, dim, dtype)
+                if value.shape != dataset.shape[1:]:
+                    raise ValueError(f"Group '{grp_typ}': '{attr}' captured with shape {value.shape}, "
+                                     f"its dataset holds rows of {dataset.shape[1:]}.")
+                rows.append((dataset, value))
+        return rows
 
-        for grp_typ in self.io_dict['registered_group_type']:
-            data_grp = particles_group[grp_typ]
-            step_dataset = data_grp[f"{_TIMELINE}/step"]
-            time_dataset = data_grp[f"{_TIMELINE}/time"]
-            idx = step_dataset.shape[0]
-            step_dataset.resize((idx + 1,))
-            time_dataset.resize((idx + 1,))
-            step_dataset[idx] = step
-            time_dataset[idx] = physical_time
-            # The box is an element too: one edges row per frame.
-            edges_dataset = data_grp["box/edges/value"]
-            edges_dataset.resize((idx + 1, *edges_dataset.shape[1:]))
-            edges_dataset[idx] = np.asarray(self.sys.box_l, dtype=np.float64)
-            for attr, dim, dtype in properties:
-                dataset_val = data_grp[f"{element_name(attr)}/value"]
-                dataset_val.resize((idx + 1, *dataset_val.shape[1:]))
-                dataset_val[idx] = self._capture_frame(grp_typ, attr, dim, dtype)
+    def write_observable_group_to_h5(self, step):
+        """Append one frame to every registered observable; returns ``(frame, step)``, frame = the
+        row just written.
 
-        logging.debug(f"Successfully wrote timestep for {self.io_dict['registered_group_type']}.")
-        return step
-
-    def write_observable_group_to_h5(self, step=None):
-        """Append one frame for every registered observable.
-
-        The frame counter is stored in each observable ``step`` dataset and the
-        current ESPResSo time is stored in the corresponding ``time`` dataset.
         Values are read from the live references registered by
-        :meth:`inscribe_observable_group_to_h5`.
-
-        :param step: int | frame counter. It must strictly exceed the last
-            written step (``RuntimeError`` otherwise), matching
-            :meth:`write_part_group_to_h5` so the two streams cannot drift apart.
+        :meth:`inscribe_observable_group_to_h5`; ``step`` and the physical time (``sys.time``)
+        go into each observable's own ``step``/``time``. ``step`` is any strictly increasing
+        integer counter, as for :meth:`write_part_group_to_h5`. Flushed and fsynced.
         """
-        if self.io_dict['h5_file'] is None:
-            raise RuntimeError('storage file has not been inscribed!')
-        if not isinstance(step, (int, np.integer)):
-            raise TypeError("step must be provided as an integer frame counter.")
+        return _write_frame(self.io_dict['h5_file'], self._observable_frame(step)), int(step)
 
+    def _observable_frame(self, step):
+        """One observable frame as ``[(dataset, row)]``: every guard and every payload
+        captured (copied, as the dataset's dtype), nothing written; see ``_particle_frame``."""
         registered_observables = self.io_dict['registered_observables']
         if not registered_observables:
-            raise ValueError("No observables have been inscribed in HDF5.")
+            raise RuntimeError("No observables have been inscribed in HDF5.")
+        if not isinstance(step, (int, np.integer)):
+            raise TypeError("step must be provided as an integer frame counter.")
 
         physical_time = float(self.sys.time)
         observables_group = self.io_dict['h5_file']["observables"]
@@ -538,6 +593,7 @@ class H5Writer:
                     f"for observable '{name}'; to continue from an earlier frame, inscribe with "
                     "rewind_to_step or force_resize_to_size first.")
 
+        rows = []
         for name, obs_data in registered_observables.items():
             obs_group = observables_group[name]
             payload = obs_data['value']
@@ -548,42 +604,23 @@ class H5Writer:
                 raise ValueError(
                     f"Observable '{name}' shape mismatch: payload has {payload_shape}, dataset expects {expected_shape}."
                 )
-            step_dataset = obs_group["step"]
-            time_dataset = obs_group["time"]
-            idx = value_dataset.shape[0]
-            step_dataset.resize((idx + 1,))
-            time_dataset.resize((idx + 1,))
-            value_dataset.resize((idx + 1, *value_dataset.shape[1:]))
-            step_dataset[idx] = step
-            time_dataset[idx] = physical_time
-            value_dataset[idx] = payload
+            rows += [(obs_group["step"], step), (obs_group["time"], physical_time),
+                     (value_dataset, np.array(payload, dtype=value_dataset.dtype))]
+        return rows
 
-        logging.debug(f"Successfully wrote timestep for {list(registered_observables)}.")
+    def write_registered_to_h5(self, step):
+        """Append one frame with the same ``step`` and time to every registered stream (particle
+        groups, observables or both); returns ``(frame, step)``, frame = the particle row when
+        groups are registered, else the observables' row (equal when both were inscribed together).
 
-    def write_registered_to_h5(self, step=None):
-        """Append one synchronized frame for all registered HDF5 streams.
-
-        If particle groups are registered, their particle property datasets are
-        extended. If observables are registered, their observable datasets are
-        extended. Both streams receive the same integer `step` and current
-        ESPResSo time.
-
-        :param step: int | frame counter, applied to both streams.
+        Both frames are captured before either is written (a failing capture writes nothing),
+        then flushed and fsynced together, once. ``step`` as for :meth:`write_part_group_to_h5`.
         """
-        if self.io_dict['h5_file'] is None:
-            raise RuntimeError('storage file has not been inscribed!')
-        if not isinstance(step, (int, np.integer)):
-            raise TypeError("step must be provided as an integer frame counter.")
-
-        registered_groups = self.io_dict['registered_group_type'] or []
-        registered_observables = self.io_dict['registered_observables']
-        if not registered_groups and not registered_observables:
-            raise ValueError("No particle groups or observables have been inscribed in HDF5.")
-
-        if registered_groups:
-            self.write_part_group_to_h5(step=step)
-        if registered_observables:
-            self.write_observable_group_to_h5(step=step)
+        groups, observables = self.io_dict['registered_group_type'], self.io_dict['registered_observables']
+        if not groups and not observables:
+            raise RuntimeError("No particle groups or observables have been inscribed in HDF5.")
+        rows = (self._particle_frame(step) if groups else []) + (self._observable_frame(step) if observables else [])
+        return _write_frame(self.io_dict['h5_file'], rows), int(step)
 
     def write_checkpoint(self, group_type, path, step):
         """Write a verified one-frame checkpoint of ``group_type`` to ``path``.
@@ -596,22 +633,26 @@ class H5Writer:
         reads it back and ``inscribe_*(..., rewind_to_step=step)`` then re-aligns
         the trajectory.
 
-        The file goes to ``path + '.tmp'``, is reopened read-only and verified
+        Its bond-parameter tables follow its float64 ``pos`` (a float32 trajectory's are
+        float32), so a ``bonds=True`` restart restores every bond parameter exactly.
+
+        The file goes to ``path + '.tmp'``, is closed, reopened read-only and verified
         (layout, exactly the one step, live-vs-file ``type``/``pos`` columns, bond
-        link count, time) and only then moved onto ``path`` with ``os.replace``.
-        On any failure the ``.tmp`` is left in place for inspection and a previous
-        ``path`` is untouched; the package never deletes.
+        link count, time) and only then installed onto ``path`` by ``durable_replace``
+        (fsync, ``os.replace``, fsync of the directory), so a node failure leaves the
+        old or the new checkpoint, whole. On any failure the ``.tmp`` is left in place
+        for inspection and a previous ``path`` is untouched; the package never deletes.
 
         :param group_type: list of object classes, as for ``inscribe_part_group_to_h5``.
         :param path: the checkpoint file; ``ValueError`` if it is the open trajectory.
-        :param step: int | the step value stored with the frame; returned.
+        :param step: int | the step value stored with the frame (any strictly increasing
+            integer counter, as for ``write_part_group_to_h5``); returned.
         :raises NotImplementedError: if the LB thermostat is active (the fluid
             state is not checkpointed).
         """
-        if not isinstance(group_type, list):
-            raise ValueError("group_type must be a list of classes.")
+        path = os.path.realpath(path)    # a symlinked checkpoint: .tmp and the replace go beside the real file
         trajectory = self.io_dict['h5_file']
-        if trajectory is not None and Path(path).resolve() == Path(trajectory.filename).resolve():
+        if trajectory is not None and path == os.path.realpath(trajectory.filename):
             raise ValueError(f"write_checkpoint: {path} is the open trajectory file; "
                              "a checkpoint needs its own path.")
         lb = getattr(self.sys.thermostat, 'lb', None)   # absent when not compiled in
@@ -620,20 +661,20 @@ class H5Writer:
                                       "fluid state is not checkpointed.")
 
         tmp = str(path) + ".tmp"
+        # The checkpoint group goes in through attrs=, i.e. before the SWMR switch, like
+        # every caller's metadata; nothing structural is written after it.
+        checkpoint_attrs = {'time': np.float64(self.sys.time), 'step': int(step)}
+        for kind in _THERMOSTAT_PHILOX_KINDS:
+            thermostat = getattr(self.sys.thermostat, kind, None)   # absent when not compiled in
+            if thermostat is not None and thermostat.is_active:
+                checkpoint_attrs[f"{kind}_philox_counter"] = int(thermostat.philox_counter)
         ckpt = H5Writer(self._owner)
         ckpt.author_name, ckpt.author_email = self.author_name, self.author_email
         ckpt.io_dict['properties'] = checkpoint_properties(self.io_dict['properties'])
         ckpt.io_dict['bonds'] = True
         try:
-            ckpt.inscribe_part_group_to_h5(group_type, tmp, 'NEW')
+            ckpt.inscribe_part_group_to_h5(group_type, tmp, 'NEW', attrs={'pressomancy/checkpoint': checkpoint_attrs})
             ckpt.write_part_group_to_h5(step)
-            attrs = ckpt.io_dict['h5_file'].require_group("pressomancy/checkpoint").attrs
-            attrs['time'] = np.float64(self.sys.time)
-            attrs['step'] = int(step)
-            for kind in _THERMOSTAT_PHILOX_KINDS:
-                thermostat = getattr(self.sys.thermostat, kind, None)   # absent when not compiled in
-                if thermostat is not None and thermostat.is_active:
-                    attrs[f"{kind}_philox_counter"] = int(thermostat.philox_counter)
         finally:
             if ckpt.io_dict['h5_file'] is not None:
                 ckpt.io_dict['h5_file'].close()
@@ -655,12 +696,57 @@ class H5Writer:
             if stored_time != float(self.sys.time):
                 raise RuntimeError(f"checkpoint {tmp}: stored time {stored_time} is not the live "
                                    f"sys.time {float(self.sys.time)}.")
-        os.replace(tmp, path)
+        durable_replace(tmp, path)
         return int(step)
 
 
+def durable_replace(tmp, path):
+    """Install the finished file ``tmp`` at ``path`` so that a node failure leaves either file, whole.
+
+    The caller closes ``tmp`` first: an HDF5 close rewrites the superblock, so the
+    fsync must come after it. Then ``tmp`` is fsynced, ``os.replace``d onto ``path``,
+    and ``path``'s directory is fsynced so the rename itself reaches the disk. Both
+    paths are resolved first: a symlinked ``path`` keeps its link, and the real file
+    it points at is the one replaced (in its own directory).
+    """
+    tmp, path = os.path.realpath(tmp), os.path.realpath(path)
+    fd = os.open(tmp, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    dir_fd = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _write_frame(h5_file, rows):
+    """Write one captured frame and push it to disk; returns the frame index of its first row.
+
+    Each ``(dataset, row)`` grows by one row and gets it; then ``flush()`` (SWMR orders the
+    disk writes, so the frame survives a kill of the process) and ``fsync`` of the file. The
+    flush alone does not survive a node crash: the kernel writes dirty pages back after ~30 s,
+    in any order. The fsync shrinks that exposure to the ~20 ms of the frame write itself, and
+    keeps the frame at a checkpoint's step (the checkpoint itself is fsynced) durable in the
+    trajectory, so ``rewind_to_step`` finds it. Measured: +0.5 ms per frame (24 000 particles,
+    0.57 MB per frame).
+    """
+    frame = rows[0][0].shape[0]
+    for dataset, row in rows:
+        n = dataset.shape[0]
+        dataset.resize((n + 1, *dataset.shape[1:]))
+        dataset[n] = row
+    h5_file.flush()
+    os.fsync(h5_file.id.get_vfd_handle())
+    return frame
+
+
 # ---------------------------------------------------------------------------
-# Particle-group inscription, one function per mode.
+# Stream inscription: one NEW and one load function per kind, called inside
+# ``H5Writer._inscription`` on the file it opened.
 # ---------------------------------------------------------------------------
 def _validate_properties(properties):
     """``ValueError`` unless ``properties`` is a list of ``(attr, dim, dtype)`` tuples that
@@ -721,17 +807,67 @@ def _check_properties_against_file(writer, group_name, data_grp):
                 f"with {per_particle}; edit the list to match the file.")
 
 
-def _particles_setup(writer, group_type, mode, h5_data_path):
-    """Validate the properties list, open the file and register which groups this run writes."""
-    if not isinstance(group_type, list):
-        raise ValueError("group_type must be a list of classes.")
-    _validate_properties(writer.io_dict['properties'])
-    writer.io_dict['registered_group_type']=[grp_typ.__name__ for grp_typ in group_type]
-    file_mode = "w" if mode == 'NEW' else "a"
-    writer.io_dict['h5_file'] = h5py.File(h5_data_path, file_mode)
+def _stream_datasets(data_grp):
+    """``{name: dataset}`` of everything a particle group appends per frame: the timeline,
+    the box edges and every element's ``value``."""
+    datasets = {'step': data_grp[f"{_TIMELINE}/step"], 'time': data_grp[f"{_TIMELINE}/time"],
+                'box/edges': data_grp["box/edges/value"]}
+    datasets.update({name: member["value"] for name, member in data_grp.items() if name != "box"})
+    return datasets
+
+
+def _frames_stored(datasets, where):
+    """The one frame count all ``datasets`` share; ``RuntimeError`` naming the ragged ones
+    otherwise (a writer killed mid-append leaves some streams one row longer)."""
+    lengths = {name: dataset.shape[0] for name, dataset in datasets.items()}
+    if len(set(lengths.values())) != 1:
+        raise RuntimeError(f"{where} is ragged: its streams hold different frame counts {lengths} "
+                           "(the writer was killed mid-append); resume with rewind_to_step at the last "
+                           "complete frame.")
+    return next(iter(lengths.values()))
+
+
+def _truncate(datasets, where, force_resize_to_size, rewind_to_step, live_time):
+    """Cut the per-frame ``datasets`` of one group or observable (``step`` and ``time`` among
+    them) to ``force_resize_to_size`` frames, or to end at the frame stored at ``rewind_to_step``;
+    nothing when both are None.
+
+    The ``rewind_to_step`` frame's time must be ``live_time`` (relative ``_TIME_RTOL``):
+    ``restart_from_checkpoint`` sets ``sys.time``, so a file can only be rewound to the state the
+    system is in (``RuntimeError`` otherwise). ``KeyError`` if the step is not stored,
+    ``ValueError`` if it is stored twice, or if a dataset holds fewer frames than asked for
+    (resizing it up would fill the frames with zeros).
+    """
+    if rewind_to_step is not None:
+        steps = np.asarray(datasets['step'][...]).reshape(-1)
+        matches = np.flatnonzero(steps == int(rewind_to_step))
+        if matches.size == 0:
+            raise KeyError(f"step {rewind_to_step} is not stored in {where}: it holds {steps.size} frame(s)"
+                           + (f" with steps {int(steps[0])}..{int(steps[-1])}." if steps.size else "."))
+        if matches.size > 1:
+            raise ValueError(f"step {rewind_to_step} is stored in {matches.size} frames of {where} "
+                             f"(indices {matches.tolist()}); the selection is ambiguous.")
+        frame = int(matches[0])
+        stored_time = float(datasets['time'][frame])
+        if not np.isclose(stored_time, live_time, rtol=_TIME_RTOL):
+            raise RuntimeError(
+                f"rewind_to_step={rewind_to_step}: frame {frame} of {where} has time {stored_time}, live "
+                f"sys.time is {live_time} (tolerance: relative {_TIME_RTOL}); restart_from_checkpoint sets it.")
+        n_frames, what = frame + 1, f"rewind_to_step={rewind_to_step} (frame {frame})"
+    elif force_resize_to_size is not None:
+        n_frames, what = force_resize_to_size, f"force_resize_to_size={force_resize_to_size}"
+    else:
+        return
+    short = {name: dataset.shape[0] for name, dataset in datasets.items() if dataset.shape[0] < n_frames}
+    if short:
+        raise ValueError(f"{what} exceeds the frame(s) stored for {where}: {short} hold fewer than {n_frames}.")
+    for dataset in datasets.values():
+        dataset.resize((n_frames, *dataset.shape[1:]))
+    logging.info("%s: %s cut to %d frame(s).", what, where, n_frames)
 
 def _particles_new(writer, group_type):
-    """Create the group/schema tree for a fresh file. Returns the start counter (0)."""
+    """Create the group/schema tree of every group, bond-parameter floats in the ``pos`` dtype
+    (float32 trajectories, float64 checkpoints). Returns the stored frame count (0)."""
     h5_file = writer.io_dict['h5_file']
     part_grp = h5_file.require_group("particles")
     for grp_typ in group_type:
@@ -789,6 +925,7 @@ def _particles_new(writer, group_type):
                 h5_file, group_name,
                 particles=writer.io_dict['flat_part_view'][group_name],
                 sys=writer.sys,
+                float_dtype=writer.io_dict['properties'][2][2],    # pos (_validate_properties)
             )
         # One <element>/{step,time,value} per property,
         # hardlinked from pos (pos must be at position 0)
@@ -825,36 +962,48 @@ def _particles_new(writer, group_type):
 
     return 0
 
-def _particles_load_new(writer, group_type):
-    """Resume from a file, rebuilding the particle view from the file's id columns.
 
-    ``particles/<Group>/id/value[-1]`` lists the particle ids in column order
-    (ascending id, which is ``flat_part_view`` order), so one read and one
-    ``by_ids`` rebuild the view; ``_check_load_new_columns`` then verifies the
-    live particles against the last stored frame.
+def _particles_load(writer, group_type, mode, force_resize_to_size, rewind_to_step):
+    """Resume the particle groups; returns the stored frame count after the truncation.
+
+    Per group: the properties list against the file, then the truncation. Then one ragged
+    check over every per-frame dataset of every group (a killed writer leaves some one row
+    longer; groups with different counts are caught the same way). Then the particle view:
+    ``LOAD`` takes it from the live objects; ``LOAD_NEW`` rebuilds it from the file's last
+    ``id`` row (ascending id, the column order: one read, one ``by_ids``) and checks the live
+    particles against the last frame (``_check_load_new_columns``), after the file's
+    ``part_types`` table against the live one. Bond tables, when on, are verified.
     """
     h5_file = writer.io_dict['h5_file']
     _require_layout(h5_file)
-    writer._check_part_types_against_file(h5_file)
-    particles_group = h5_file["particles"]
-    candidate_lens=[]
+    if mode == 'LOAD_NEW':
+        writer._check_part_types_against_file(h5_file)
+    streams = {}
     for grp_typ in group_type:
         group_name = grp_typ.__name__
-        data_grp = particles_group[group_name]
+        data_grp = h5_file["particles"][group_name]
         _check_properties_against_file(writer, group_name, data_grp)
-        part_ids = [int(x) for x in np.asarray(data_grp[f"{element_name('id')}/value"][-1])]
-        writer.io_dict['flat_part_view'][group_name].extend(writer.sys.part.by_ids(part_ids))
-        _check_load_new_columns(writer, group_name, data_grp)
+        datasets = _stream_datasets(data_grp)
+        _truncate(datasets, f"{h5_file.filename}/particles/{group_name}", force_resize_to_size, rewind_to_step,
+                  float(writer.sys.time))
+        streams.update({f"{group_name}/{name}": dataset for name, dataset in datasets.items()})
+    n_frames = _frames_stored(streams, f"{h5_file.filename}/particles")
+    for grp_typ in group_type:
+        group_name = grp_typ.__name__
+        data_grp = h5_file["particles"][group_name]
+        view = writer.io_dict['flat_part_view'][group_name]
+        if mode == 'LOAD_NEW':
+            part_ids = [int(x) for x in np.asarray(data_grp[f"{element_name('id')}/value"][-1])]
+            view.extend(writer.sys.part.by_ids(part_ids))
+            _check_load_new_columns(writer, group_name, data_grp)
+        else:
+            owned = [part for obj in writer.objects if isinstance(obj, grp_typ) for part in obj.get_owned_part()[0]]
+            view.extend(sorted(owned, key=lambda part: part.id))   # file columns are in ascending id
         if writer.io_dict.get('bonds', False):
             verify_bond_params(h5_file, group_name, writer.sys)
             writer.io_dict['bond_links'][group_name] = int(
                 h5_file[f"connectivity/{group_name}/bonds"].attrs["n_links"])
-        candidate_lens.append(data_grp[f"{_TIMELINE}/value"].shape[0])
-    if len(set(candidate_lens)) != 1:
-        raise ValueError(
-            f"Inconsistent step counts across groups: {candidate_lens}"
-        )
-    return candidate_lens[0]
+    return n_frames
 
 def _check_load_new_columns(writer, group_name, data_grp):
     """Refuse LOAD_NEW unless the live particles are the file's columns, row for row.
@@ -883,104 +1032,6 @@ def _check_load_new_columns(writer, group_name, data_grp):
             f"stored type {file_types[row]} pos {file_pos[row].tolist()}); refusing to append.")
 
 
-def _particles_load(writer, group_type):
-    """Resume from a file, taking the particle view from the live objects."""
-    h5_file = writer.io_dict['h5_file']
-    _require_layout(h5_file)
-    particles_group = h5_file["particles"]
-    candidate_lens=[]
-    for grp_typ in group_type:
-        group_name = grp_typ.__name__
-        _check_properties_against_file(writer, group_name, particles_group[group_name])
-        objects_to_register=[obj for obj in writer.objects if isinstance(obj,grp_typ)]
-        owned = [part for cr in objects_to_register for part in cr.get_owned_part()[0]]
-        owned.sort(key=lambda part: part.id)   # file columns are in ascending id
-        writer.io_dict['flat_part_view'][group_name].extend(owned)
-        if writer.io_dict.get('bonds', False):
-            verify_bond_params(h5_file, group_name, writer.sys)
-            writer.io_dict['bond_links'][group_name] = int(
-                h5_file[f"connectivity/{group_name}/bonds"].attrs["n_links"])
-        candidate_lens.append(particles_group[group_name][f"{_TIMELINE}/value"].shape[0])
-    if len(set(candidate_lens)) != 1:
-        raise ValueError(
-            f"Inconsistent step counts across groups: {candidate_lens}"
-        )
-    return candidate_lens[0]
-
-def _particles_resize(writer, group_type, n_frames):
-    """Truncate every registered group to its first ``n_frames`` (``ValueError`` if it holds fewer)."""
-    particles_group = writer.io_dict['h5_file']["particles"]
-    for grp_typ in group_type:
-        data_grp = particles_group[grp_typ.__name__]
-        stored = data_grp[f"{_TIMELINE}/step"].shape[0]
-        if n_frames > stored:
-            raise ValueError(f"force_resize_to_size={n_frames} exceeds the {stored} frame(s) stored for "
-                             f"'{grp_typ.__name__}' in {data_grp.file.filename}.")
-        data_grp[f"{_TIMELINE}/step"].resize((n_frames,))
-        data_grp[f"{_TIMELINE}/time"].resize((n_frames,))
-        values = [member["value"] for name, member in data_grp.items() if name != "box"]
-        for value in values + [data_grp["box/edges/value"]]:
-            value.resize((n_frames, *value.shape[1:]))
-
-def _particles_rewind(writer, group_type, step):
-    """Truncate every registered group to end at the frame stored at ``step``.
-
-    That frame's time must be the live ``sys.time`` (``restart_from_checkpoint``
-    sets it), so a file can only be rewound to the state the system is in.
-
-    ``RuntimeError`` unless the frame being rewound to was written at the live ``sys.time``.
-    """
-    h5_file = writer.io_dict['h5_file']
-    for grp_typ in group_type:
-        group_name = grp_typ.__name__
-        frame = frame_of_step(h5_file, group_name, step)   # KeyError absent, ValueError duplicated
-        data_grp = h5_file["particles"][group_name]
-        stored_time = float(data_grp[f"{_TIMELINE}/time"][frame])
-        live_time = float(writer.sys.time)
-        if not np.isclose(stored_time, live_time, rtol=_TIME_RTOL):
-            raise RuntimeError(
-                f"rewind_to_step={step}: frame {frame} of {h5_file.filename}/particles/{group_name} has time {stored_time}, live sys.time is "
-                f"{live_time} (tolerance: relative {_TIME_RTOL}); restart_from_checkpoint sets it."
-            )
-        n_frames = frame + 1
-        data_grp[f"{_TIMELINE}/step"].resize((n_frames,))
-        data_grp[f"{_TIMELINE}/time"].resize((n_frames,))
-        values = [member["value"] for name, member in data_grp.items() if name != "box"]
-        for value in values + [data_grp["box/edges/value"]]:
-            value.resize((n_frames, *value.shape[1:]))
-    
-
-
-# ---------------------------------------------------------------------------
-# Observable-stream inscription, one function per mode (same shape as the
-# particle helpers). The normalised definitions live in
-# ``writer.io_dict['registered_observables']``, filled by the setup step, so the
-# kernels share no closure state.
-# ---------------------------------------------------------------------------
-def _observables_setup(writer, observable_defs, mode, h5_data_path):
-    """Validate and normalise the definitions, register them, open the file if none is open."""
-    if not isinstance(observable_defs, list) or not observable_defs:
-        raise ValueError("observable_defs must be a non-empty list.")
-    registered = {}
-    for obs_def in observable_defs:
-        if len(obs_def) != 4:
-            raise ValueError("Each observable definition must be (name, shape, dtype, observable_value_ref).")
-        name, shape, dtype, observable_value_ref = obs_def
-        if shape is None:
-            shape = tuple()
-        elif isinstance(shape, (int, np.integer)):
-            shape = (int(shape),)
-        else:
-            shape = tuple(shape)
-        registered[str(name)] = {'shape': shape, 'dtype': np.dtype(dtype), 'value': observable_value_ref}
-    writer.io_dict['registered_observables'] = registered
-
-    if writer.io_dict['h5_file'] is None:
-        if h5_data_path is None:
-            raise ValueError("h5_data_path must be provided when no HDF5 file is currently open.")
-        file_mode = "w" if mode == 'NEW' else "a"
-        writer.io_dict['h5_file'] = h5py.File(h5_data_path, file_mode)
-
 def _observables_new(writer):
     """Create ``/observables/<name>/{step,time,value}`` for every registered observable. Returns 0."""
     observables_group = writer.io_dict['h5_file'].require_group("observables")
@@ -1002,73 +1053,29 @@ def _observables_new(writer):
         )
     return 0
 
-def _observables_load(writer, mode):
-    """Reopen the registered observables, checking presence and per-frame shape. Returns the saved frame count.
 
-    ``LOAD_NEW`` first checks the file's ``part_types`` table, as the particle groups' ``LOAD_NEW`` does,
-    so a script that resumes observables alone still gets the writer's type names.
-    """
-    _require_layout(writer.io_dict['h5_file'])
-    if mode == 'LOAD_NEW':
-        writer._check_part_types_against_file(writer.io_dict['h5_file'])
-    observables_group = writer.io_dict['h5_file'].require_group("observables")
-    candidate_lens = []
-    for name, spec in writer.io_dict['registered_observables'].items():
-        obs_group = observables_group.get(name)
-        if obs_group is None:
-            raise ValueError(f"Observable '{name}' was not found in HDF5 file during {mode}.")
-        value_dataset = obs_group["value"]
-        if tuple(value_dataset.shape[1:]) != spec['shape']:
-            raise ValueError(
-                f"Observable '{name}' shape mismatch: file has {value_dataset.shape[1:]}, expected {spec['shape']}."
-            )
-        candidate_lens.append(value_dataset.shape[0])
-    if len(set(candidate_lens)) != 1:
-        raise ValueError(f"Inconsistent step counts across observables: {candidate_lens}")
-    return candidate_lens[0]
+def _observables_load(writer, mode, force_resize_to_size, rewind_to_step):
+    """Resume the registered observables; returns the stored frame count after the truncation.
 
-def _observables_resize(writer, n_frames):
-    """Truncate every registered observable to its first ``n_frames`` (``ValueError`` if it holds fewer)."""
-    observables_group = writer.io_dict['h5_file']["observables"]
-    for name in writer.io_dict['registered_observables']:
-        obs_group = observables_group[name]
-        stored = obs_group["value"].shape[0]
-        if n_frames > stored:
-            raise ValueError(f"force_resize_to_size={n_frames} exceeds the {stored} frame(s) stored for "
-                             f"observable '{name}' in {obs_group.file.filename}.")
-        for name in ("step", "time", "value"):
-            dataset = obs_group[name]
-            dataset.resize((n_frames, *dataset.shape[1:]))
-
-def _observables_rewind(writer, step):
-    """Truncate every registered observable to end at the row stored at ``step``.
-
-    Observables keep their own ``step``/``time`` per name, so the lookup is done
-    here (same KeyError/ValueError contract as ``read.frame_of_step``) and the
-    row's time must be the live ``sys.time``, as for the particle groups.
-
-    ``RuntimeError`` unless the frame being rewound to was written at the live ``sys.time``.
+    Per observable: presence and per-frame shape, then the truncation by its own
+    ``step``/``time``; then one ragged check over all of them. ``LOAD_NEW`` first checks the
+    file's ``part_types`` table, as for the particle groups, so a script that resumes
+    observables alone still gets the writer's type names.
     """
     h5_file = writer.io_dict['h5_file']
-    for name in writer.io_dict['registered_observables']:
-        obs_group = h5_file["observables"][name]
-        where = f"{h5_file.filename}/observables/{name}"
-        steps = np.asarray(obs_group["step"][...]).reshape(-1)
-        matches = np.flatnonzero(steps == int(step))
-        if matches.size == 0:
-            raise KeyError(f"step {step} is not stored in {where}: it holds {steps.size} frame(s).")
-        if matches.size > 1:
-            raise ValueError(f"step {step} is stored in {matches.size} frames of {where} "
-                             f"(indices {matches.tolist()}); the selection is ambiguous.")
-        frame = int(matches[0])
-        stored_time = float(obs_group["time"][frame])
-        live_time = float(writer.sys.time)
-        if not np.isclose(stored_time, live_time, rtol=_TIME_RTOL):
-            raise RuntimeError(
-                f"rewind_to_step={step}: frame {frame} of {where} has time {stored_time}, live sys.time is "
-                f"{live_time} (tolerance: relative {_TIME_RTOL}); restart_from_checkpoint sets it."
-            )
-        n_frames = frame + 1
-        for name in ("step", "time", "value"):
-            dataset = obs_group[name]
-            dataset.resize((n_frames, *dataset.shape[1:]))
+    _require_layout(h5_file)
+    if mode == 'LOAD_NEW':
+        writer._check_part_types_against_file(h5_file)
+    streams = {}
+    for name, spec in writer.io_dict['registered_observables'].items():
+        obs_group = h5_file.get(f"observables/{name}")
+        if obs_group is None:
+            raise ValueError(f"Observable '{name}' was not found in HDF5 file during {mode}.")
+        if tuple(obs_group["value"].shape[1:]) != spec['shape']:
+            raise ValueError(f"Observable '{name}' shape mismatch: file has {obs_group['value'].shape[1:]}, "
+                             f"expected {spec['shape']}.")
+        datasets = {key: obs_group[key] for key in ("step", "time", "value")}
+        _truncate(datasets, f"{h5_file.filename}/observables/{name}", force_resize_to_size, rewind_to_step,
+                  float(writer.sys.time))
+        streams.update({f"{name}/{key}": dataset for key, dataset in datasets.items()})
+    return _frames_stored(streams, f"{h5_file.filename}/observables")
