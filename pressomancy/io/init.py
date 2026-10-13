@@ -136,7 +136,6 @@ import numpy as np
 from pressomancy.io.read import (H5DataSelector, frame_of_step, frame_of_time, stored_steps,
                                  element_name, attr_name)
 from pressomancy.io.write import checkpoint_properties
-from pressomancy.geometry import require_min_global_cut
 from pressomancy.io.bonds import read_bond_params, read_bonds
 
 #: Absolute tolerance of the source-vs-local position cross-check in set_bonds_from_src.
@@ -774,6 +773,7 @@ class H5Init:
                     for _, bond_id, partners in pending
                     if len(partners) == 1 and "r_0" in bond_params[bond_id][1]]
         if pair_r_0:
+            from pressomancy.geometry import require_min_global_cut  # local: keeps `import pressomancy.io` espresso-free for readers
             require_min_global_cut(self.sys, max(pair_r_0))
         handle_for_params = {}
         bond_for_id = {}

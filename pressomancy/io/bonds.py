@@ -38,8 +38,6 @@ from collections import defaultdict
 import h5py
 import numpy as np
 
-import espressomd.interactions
-
 from pressomancy.io.read import LINK_TABLES, element_name
 
 _SKIP_PARAMS = frozenset({"bond_id", "_bond_id"})
@@ -416,6 +414,7 @@ def read_bond_params(h5_file, group_name):
     (plain int32) are skipped. Float parameters come back as Python floats from
     either table dtype (bond floats follow the pos dtype).
     """
+    import espressomd.interactions  # local: keeps `import pressomancy.io` espresso-free for readers
     table = {}
     for type_name, dset in h5_file[f"pressomancy/{group_name}/bond_params"].items():
         if dset.dtype.names is None:
