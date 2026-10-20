@@ -8,6 +8,6 @@ doc/sphinx/build
 
 # coding agents
 CLAUDE.md
-.claude/
+.claude
 .claudeignore
 AGENT.md
