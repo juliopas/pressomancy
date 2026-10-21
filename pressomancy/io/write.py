@@ -69,7 +69,6 @@ import numpy as np
 from pressomancy.io.bonds import write_bonds, verify_bond_params, check_bond_count
 from pressomancy.io.read import (LAYOUT, _TIMELINE, _TIME_RTOL, _require_layout, attr_name,
                                  element_name, open_output, stored_steps, superblock_version)
-from pressomancy.infra import api_agnostic_feature_check, get_repo_context, get_submission_creator_info
 
 
 #: The on-disk format every file is created with: HDF5 1.10 on both bounds, the oldest
@@ -101,6 +100,7 @@ def checkpoint_properties(trajectory_properties):
     build has (float64), then the trajectory's remaining entries with floating
     dtypes widened to float64 (bool/int entries such as ``fix``/``image_box`` kept).
     """
+    from pressomancy.infra import api_agnostic_feature_check  # local: keeps `import pressomancy.io` espresso-free for readers
     result = [('id', None, np.int32), ('type', None, np.int16)]
     result += [(attr, dim, np.float64) for attr, dim, feature in CHECKPOINT_PROPERTIES
                if feature is None or api_agnostic_feature_check(feature)]
@@ -117,6 +117,7 @@ class H5Writer:
     """Owns the HDF5 output state and the write path for one :class:`Simulation`."""
 
     def __init__(self, owner):
+        from pressomancy.infra import api_agnostic_feature_check  # local: keeps `import pressomancy.io` espresso-free for readers
         #: The Simulation instance that owns this
         self._owner = owner
         self.author_name = "unknown"
@@ -304,6 +305,7 @@ class H5Writer:
                 h5md_group.attrs["version"] = np.array([1, 1], dtype=np.int32)
                 h5md_group.require_group("author").attrs.update({"name": self.author_name,
                                                                  "email": self.author_email})
+                from pressomancy.infra import get_repo_context, get_submission_creator_info  # local: keeps `import pressomancy.io` espresso-free for readers
                 creator_name, creator_version = get_submission_creator_info()
                 h5md_group.require_group("creator").attrs.update({"name": creator_name,
                                                                   "version": creator_version})

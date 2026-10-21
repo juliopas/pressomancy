@@ -70,7 +70,7 @@ class CommonH5DataSelectorTests:
         if hasattr(cls, "observable_name"):
             cls.observable_value = np.zeros(3, dtype=np.float64)
             cls.observable_values = []
-        with patch.object(write_module, "get_submission_creator_info", return_value=(cls.runner_script, cls.runner_script_repo)), patch.object(write_module, "get_repo_context", return_value=(cls.lib_path, cls.library_vers)):
+        with patch("pressomancy.infra.get_submission_creator_info", return_value=(cls.runner_script, cls.runner_script_repo)), patch("pressomancy.infra.get_repo_context", return_value=(cls.lib_path, cls.library_vers)):
             sim_inst.inscribe_part_group_to_h5(group_type=cls.group_types, h5_data_path=cls.h5_filename)
             if hasattr(cls, "observable_name"):
                 sim_inst.inscribe_observable_group_to_h5(
