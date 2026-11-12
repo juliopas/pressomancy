@@ -1,4 +1,5 @@
 import signal
+import warnings
 from pressomancy.simulation import Elastomer, PointDipolePermanent
 from pressomancy.geometry import WCA_CONTACT_FACTOR
 from .create_system import sim_inst, BaseTestCase
@@ -112,6 +113,37 @@ class ElastomerTest(BaseTestCase):
                 k = [bond.params['k'] for bond, _, _ in bonds]
                 self.assertGreaterEqual(min(k), instance.params['bond_K_lims'][0])
                 self.assertLessEqual(max(k), instance.params['bond_K_lims'][1])
+
+    def _cure_three_beads(self, periodicity):
+        """Cure (with the substrate) three beads on a system of the given periodicity: a-b are 2 apart directly;
+        c is 7 from b and 9 from a directly, but 3 and 1 through the x face. Returns (a, b, c, bond pairs, warnings)."""
+        self.addCleanup(setattr, sim_inst.sys, "periodicity", [bool(x) for x in sim_inst.sys.periodicity])
+        instance = self._elastomer(n_parts=3, associated=False)
+        a, b, c = instance.type_part_dict["real"]
+        for part, pos in zip((a, b, c), ([0.5, 1.5, 2.], [2.5, 1.5, 2.], [9.5, 1.5, 2.])):
+            part.pos = pos
+        sim_inst.sys.periodicity = periodicity
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            instance.cure_elastomer()
+        bonds, _ = self._network_bonds(instance)
+        # bonding switches z periodicity off only while it runs
+        np.testing.assert_array_equal(np.copy(sim_inst.sys.periodicity), periodicity)
+        return a, b, c, {frozenset((hndl.id, partner.id)) for _, hndl, partner in bonds}, [str(w.message) for w in caught]
+
+    def test_cure_keeps_open_xy_faces_open(self):
+        """Curing with a substrate on a system without x/y periodicity bonds by direct distance only:
+        no bond reaches across a face to a minimum image (only z is switched off while bonding)."""
+        a, b, c, pairs, caught = self._cure_three_beads([False, False, False])
+        self.assertEqual(pairs, {frozenset((a.id, b.id))})
+        # c has no partner within bond_cutoff: the retry leaves it lonely and says so
+        self.assertTrue(any("hold no bond at all" in m for m in caught), caught)
+
+    def test_cure_bonds_through_periodic_xy_faces(self):
+        """On a fully periodic system the same three beads bond by minimum image: c, 3 and 1 from b and a
+        through the x face, bonds to both (max_bonds is 6)."""
+        a, b, c, pairs, caught = self._cure_three_beads([True, True, True])
+        self.assertEqual(pairs, {frozenset((a.id, b.id)), frozenset((a.id, c.id)), frozenset((b.id, c.id))})
 
     def test_thermostat_state_is_preserved(self):
         """The mixing run and the snapshot/restore pair hand the thermostat back as it was."""

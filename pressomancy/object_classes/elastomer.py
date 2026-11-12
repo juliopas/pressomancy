@@ -625,9 +625,10 @@ class Elastomer(metaclass=Simulation_Object):
         midpoint of ``bond_k`` with standard deviation
         ``(bond_k[1] - bond_k[0]) / std_scaling``, redrawn until it lands
         inside ``bond_k`` (a degenerate interval therefore gives a fixed k).
-        Distances are computed under PBC, with z periodicity switched off while
-        a substrate is in place. A pair is bonded at most once, and the bond is
-        stored on one of the two particles only.
+        Distances are computed under the system's x/y periodicity, with z
+        periodicity switched off while a substrate is in place. A pair is
+        bonded at most once, and the bond is stored on one of the two
+        particles only.
 
         :param parts: ParticleSlice | beads that may receive new bonds; bonds are only ever added FROM these
         :param candidate_parts: ParticleSlice | pool searched for partners (``parts`` itself for a same-lattice search)
@@ -651,7 +652,7 @@ class Elastomer(metaclass=Simulation_Object):
 
         if self.substrate is not None:
             old_periodicity = np.copy(self.sys.periodicity)
-            self.sys.periodicity = [True, True, False]
+            self.sys.periodicity = [old_periodicity[0], old_periodicity[1], False]
 
         box_dim = self.sys.box_l + 2 * r_catch * ~np.array(self.sys.periodicity)  # pad > r_catch: no pair wraps across an open face
 
