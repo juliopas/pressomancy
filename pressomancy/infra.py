@@ -591,6 +591,17 @@ class BondWrapper:
         """Return the wrapped espresso bond object."""
         return self._bond_handle
 
+def name_token(value):
+    """Return ``value`` as text for a file name or a checkpoint id.
+
+    Floats and integers become alphanumeric (``0.45`` -> ``0p45``, ``-0.5`` -> ``m0p5``,
+    ``1e+16`` -> ``1e16``), since espresso checkpoint ids only allow
+    ``a-z A-Z 0-9 _ -``. Anything else is ``str(value)``.
+    """
+    if isinstance(value, (float, int)):
+        return str(value).replace('.', 'p').replace('-', 'm').replace('+', '')
+    return str(value)
+
 def get_repo_context(path):
     """Return the enclosing git repository root and a provenance version string.
 

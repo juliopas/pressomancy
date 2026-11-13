@@ -2,6 +2,7 @@ from espressomd.io.writer import vtf
 from espressomd import checkpointing
 import time
 from pressomancy.simulation import Simulation, GenericPart
+from pressomancy.infra import name_token
 import argparse
 import sys as sysos
 import os
@@ -26,7 +27,7 @@ args = parser.parse_args()
 parser_dict = vars(args).copy()
 for key, value in parser_dict.items():
     if isinstance(value, list):
-        parser_dict[key] = str(value).strip('[]').replace(', ', '')
+        parser_dict[key] = 'x'.join(map(name_token, value))
 # //////////////////////////////////////////////////////////////////////////////
 
 # //////////////////////////////////////////////////////////////////////////////
@@ -34,7 +35,7 @@ for key, value in parser_dict.items():
 END_OF_TIME = time.time() + 259200  # 72h in seconds
 STANDARD_ARG_DESTINATIONS = {'path_data', 'MODE', 'SRC_PATH'}
 CONTEXT_STRING = '_'.join([
-    str(val) for key, val in parser_dict.items() if key not in STANDARD_ARG_DESTINATIONS
+    name_token(val) for key, val in parser_dict.items() if key not in STANDARD_ARG_DESTINATIONS
 ])
 TRAJ_PATH = os.path.join(args.path_data, f'trajectory_{CONTEXT_STRING}.vtf')
 H5_DATA_PATH = os.path.join(args.path_data, f'custom_data_wip_{CONTEXT_STRING}.h5')
@@ -86,7 +87,7 @@ else:
     # //////////////////////////////////////////////////////////////////////////
     if args.SRC_PATH:
         CONTEXT_STRING_SRC = '_'.join([
-            str(val) for key, val in parser_dict.items() if key not in STANDARD_ARG_DESTINATIONS
+            name_token(val) for key, val in parser_dict.items() if key not in STANDARD_ARG_DESTINATIONS
         ])
         # fill in for the objects/types this script builds, e.g.:
         # src_to_loc={('real', 'yolk'): [('dip', 'dip')]}, place_from=['real']
