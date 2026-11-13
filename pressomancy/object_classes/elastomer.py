@@ -351,13 +351,14 @@ class Elastomer(metaclass=Simulation_Object):
         — and the original epsilon is restored in the same ``finally`` block
         , even if the run raises.
 
+        Without a substrate (a periodic z face) no temporary walls are added.
+
         :param n_iter: int (=100) | number of integrator steps to run
         :param time_step: float (=0.001) | time step to use during mixing
         :param kT: float (=1e-3) | Langevin temperature during mixing
         :param gamma: float (=10) | Langevin friction during mixing
         :param wall_epsilon: float (=10) | WCA epsilon of the temporary top/bottom walls and substrate
         :return: None
-        :raises ValueError: if called before ``create_substrate``
         """
         if isinstance(self, list):
             raise ValueError("Must be used on Elastomer object type")
@@ -367,20 +368,20 @@ class Elastomer(metaclass=Simulation_Object):
 
         self.sys.time_step = time_step
 
-        if self.substrate is None:
-            raise ValueError("Substrate must be created before mix_elastomer_stuff().")
-
         # Add temporary wall (top and bottom only).
         types_M = tuple(typ for key, typ in self.part_types.items() if "real" in key)
-        add_box_constraints_func(
-            sides=['top', 'bottom'],
-            top=self.params['box_E'][2],
-            bottom=self._substrate_size,
-            inter='wca',
-            types_=types_M,
-            wall_epsilon=wall_epsilon,
-            sys=self.sys,
-        )
+        if self.substrate is not None:
+            add_box_constraints_func(
+                sides=['top', 'bottom'],
+                top=self.params['box_E'][2],
+                bottom=self._substrate_size,
+                inter='wca',
+                types_=types_M,
+                wall_epsilon=wall_epsilon,
+                sys=self.sys,
+            )
+        else:
+            logging.info("Elastomer.mix_elastomer_stuff: no substrate, so no temporary walls")
 
         # Soften the substrate/real WCA epsilon (keep sigma) while mixing, if asked.
         substrate_epsilon_snapshot = {}
@@ -396,7 +397,8 @@ class Elastomer(metaclass=Simulation_Object):
             self.sys.integrator.run(n_iter)
         finally:
             # Remove temporary box particles
-            remove_box_constraints_func(sys=self.sys)
+            if self.substrate is not None:
+                remove_box_constraints_func(sys=self.sys)
             self._restore_thermostat_state(thermostat_snapshot)
             self.sys.time_step = old_time_step
             for typ, epsilon in substrate_epsilon_snapshot.items():
@@ -459,6 +461,7 @@ class Elastomer(metaclass=Simulation_Object):
             ``WCA_CONTACT_FACTOR * sigma`` (200 for a diameter of 1)
         :param gap_tol: float (=1e-4) | tolerance on the substrate gap convergence criterion
         :return: dict with keys ``steps``, ``converged``, ``max_f_before``, ``max_f_after``, ``gap_before``, ``gap_after``
+            (without a substrate: no walls, no gap test, ``gap_before`` and ``gap_after`` None)
         :raises ValueError: if a network-bead type's own WCA sigma is not the Elastomer's ``sigma``
         :raises RuntimeError: if a network-bead type has no WCA interaction with itself, if the initial
             gap is deeper than ``max_displacement_factor``, or if the gap is still negative or the
@@ -491,23 +494,29 @@ class Elastomer(metaclass=Simulation_Object):
         def _max_f():
             return float(max(np.linalg.norm(hndl.f) for hndl in self.network_beads()))
 
-        gap_before = _gap()  # positions only: checked before the temporary walls go in
-        if gap_before < -max_travel:
-            raise RuntimeError(
-                f"relax_overlaps: the initial configuration is too overlapped: a bead sits {-gap_before} below "
-                f"the wall plane, but the relaxation moves a bead at most"
-                f" {max_travel} (20% of a bead diameter by default).\n{fix_the_start}"
-            )
+        # The gap and the walls go together: without a substrate there are neither (a periodic z face).
+        walls = self.substrate is not None
+        gap_before = None
+        if walls:
+            gap_before = _gap()  # positions only: checked before the temporary walls go in
+            if gap_before < -max_travel:
+                raise RuntimeError(
+                    f"relax_overlaps: the initial configuration is too overlapped: a bead sits {-gap_before} below "
+                    f"the wall plane, but the relaxation moves a bead at most"
+                    f" {max_travel} (20% of a bead diameter by default).\n{fix_the_start}"
+                )
 
-        types_M = tuple(typ for key, typ in self.part_types.items() if "real" in key)
-        add_box_constraints_func(
-            sides=['top', 'bottom'],
-            top=self.params['box_E'][2],
-            bottom=self._substrate_size,
-            inter='wca',
-            types_=types_M,
-            sys=self.sys,
-        )
+            types_M = tuple(typ for key, typ in self.part_types.items() if "real" in key)
+            add_box_constraints_func(
+                sides=['top', 'bottom'],
+                top=self.params['box_E'][2],
+                bottom=self._substrate_size,
+                inter='wca',
+                types_=types_M,
+                sys=self.sys,
+            )
+        else:
+            logging.info("Elastomer.relax_overlaps: no substrate, so no temporary walls and no gap test")
 
         steps = 0
         converged = False
@@ -519,25 +528,27 @@ class Elastomer(metaclass=Simulation_Object):
                 steps += self.sys.integrator.run(steps_per_chunk)
                 self.sys.integrator.set_vv()
                 self.sys.integrator.run(0, recalc_forces=True)
-                if _gap() > -gap_tol and _max_f() < f_max:
+                if (not walls or _gap() > -gap_tol) and _max_f() < f_max:
                     converged = True
                     break
         finally:
             # Remove temporary box particles
-            remove_box_constraints_func(sys=self.sys)
+            if walls:
+                remove_box_constraints_func(sys=self.sys)
             self.sys.integrator.set_vv()
 
         self.sys.integrator.run(0, recalc_forces=True)
         max_f_after = _max_f()
-        gap_after = _gap()
-
-        if gap_after <= -gap_tol:
-            raise RuntimeError(
-                f"relax_overlaps: the gap {gap_after} is still negative after "
-                f"relaxation (was {gap_before} before). The bottom layer of beads "
-                "still overlaps the substrate: the initial configuration overlaps more than the "
-                f"relaxation clears. {fix_the_start}"
-            )
+        gap_after = None
+        if walls:
+            gap_after = _gap()
+            if gap_after <= -gap_tol:
+                raise RuntimeError(
+                    f"relax_overlaps: the gap {gap_after} is still negative after "
+                    f"relaxation (was {gap_before} before). The bottom layer of beads "
+                    "still overlaps the substrate: the initial configuration overlaps more than the "
+                    f"relaxation clears. {fix_the_start}"
+                )
 
         if max_f_after >= f_max:
             raise RuntimeError(

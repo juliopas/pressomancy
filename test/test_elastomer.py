@@ -260,6 +260,42 @@ class ElastomerTest(BaseTestCase):
         with self.assertRaisesRegex(RuntimeError, "residual force"):
             instance.relax_overlaps()
 
+    def test_mixing_without_substrate_has_no_walls(self):
+        """Without a substrate the mixing adds no walls: a bead driven down crosses the z face of the periodic box."""
+        instance = self._elastomer(associated=False)
+        instance.remove_substrate()
+        sim_inst.set_steric(("real",), sigma=self.sigma)
+        # the lowest bead, pulled straight down: nothing below it, and the bottom wall (z = 1) would stop it
+        # at one contact radius above that; Langevin drift F / gamma = 2 per time unit for 2 time units
+        lowest = min(instance.network_beads(), key=lambda hndl: hndl.pos[2])
+        lowest.ext_force = [0., 0., -20.]
+        instance.mix_elastomer_stuff(n_iter=200, time_step=0.01, gamma=10)
+        self.assertEqual(len(sim_inst.sys.constraints), 0)
+        self.assertLess(lowest.pos[2], 0.)  # unfolded: below the z face
+
+    def test_relax_overlaps_without_substrate_has_no_walls(self):
+        """Without a substrate relax_overlaps adds no walls and makes no gap test: an overlap through the z face
+        of the periodic box relaxes, from a bead the bottom wall would reject, and both gaps are None."""
+        instance = self._elastomer(associated=False)
+        instance.remove_substrate()
+        sim_inst.set_steric(("real",), sigma=self.sigma)
+        # the highest bead lifted to the box top (z 8.5, clear of the others), the lowest one put 0.85 bead
+        # above its periodic z image: at z 0.35, below the bottom wall (z = 1) and 1.15 deeper than the
+        # wall plane (the gap test's 'too overlapped')
+        lowest = min(instance.network_beads(), key=lambda hndl: hndl.pos[2])
+        highest = max(instance.network_beads(), key=lambda hndl: hndl.pos[2])
+        highest.pos = [highest.pos[0], highest.pos[1], self.box_dim[2] - self.part_size / 2]
+        lowest.pos = [highest.pos[0], highest.pos[1], highest.pos[2] + 0.85 * self.part_size - self.box_dim[2]]
+        self.assertLess(lowest.pos[2], instance._substrate_size)
+
+        result = instance.relax_overlaps()
+
+        self.assertEqual(len(sim_inst.sys.constraints), 0)
+        self.assertTrue(result["converged"])
+        self.assertGreater(result["max_f_before"], 10.)   # a real overlap, relaxed below f_max
+        self.assertIsNone(result["gap_before"])
+        self.assertIsNone(result["gap_after"])
+
     def test_bond_arguments_are_validated(self):
         """random_harmonic_bonds refuses a negative r_cut, an r_cut inside r_catch and a single bond_k."""
         instance = self._elastomer()
